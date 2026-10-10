@@ -4,7 +4,7 @@
 
 - 输入：桌子场景默认机位 frontview 的 RGB 图，再加上一条指令
 - 指令：夹爪不在方块正上方时，先移动到目标上方，再抬剩余高度；已经对准后只写还要抬多少
-- 输出：一条抓取计划。target 是这一帧方块中心的整数像素，subtasks 是从这一帧接着做的步骤
+- 输出：一条抓取计划。subtasks 是从这一帧接着做的步骤，要动位置的步骤各自带方块中心像素
 
 方块中心来自观测 cube_pos。投到 frontview 上得到像素，x 向右、y 向下，原点在图像左上角。
 评测时再用现场的方块深度把预测像素反投影回世界坐标，采集不存深度图。
@@ -16,18 +16,23 @@
 
 输出例子：
 
-    {"task": "grasp", "target": "[282 311]", "subtasks": [{"type": "move_above"}, {"type": "move_down"}, {"type": "close_gripper"}, {"type": "lift", "delta_z": 0.14}, {"type": "stabilize", "duration": 0.5}]}
+    {"subtasks": [{"type": "move_above", "target": "[282 311]"}, {"type": "move_down", "target": "[282 311]"}, {"type": "close_gripper"}, {"type": "lift", "target": "[282 311]", "delta_z": 0.14}, {"type": "stabilize", "duration": 0.5}]}
 
 为了拉开画面差异，方块会撒在桌面一块更大的区域里，每条抓取开始前
 手臂还会先移到随机的水平位置、高度和绕竖直轴的朝向。相机仍是 frontview。
 
     python collect_lift_mllm.py --episodes 50 --out data/lift_mllm
+
+多个任务可以写进同一个 --out。样本 id 和图片名带 lift_ 前缀，
+samples.jsonl 按任务合并，后跑的采集不会盖掉已经写下的其他任务。
 """
 
 import argparse
 import json
 import os
 from pathlib import Path
+
+from mllm_dataset import make_sample_id, publish_task
 
 # mjpython 会在子线程建窗口，采集时不要用它。渲染后端要在 import robosuite 之前定好。
 import gl_backend
@@ -236,28 +241,29 @@ def matrix_to_list(matrix):
     return [[float(value) for value in row] for row in np.asarray(matrix, dtype=float)]
 
 
-def build_subtasks(phase, above, eef_z, cube_z, delta_z):
-    """从当前画面接着做的步骤。已经做完的不再写入。"""
+def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixel_xy):
+    """从当前画面接着做的步骤。已经做完的不再写入。像素写在要动位置的步骤上。"""
+    target = format_pixel(pixel_xy)
     subtasks = []
     if phase != "lift":
         if not above:
-            subtasks.append({"type": "move_above"})
+            subtasks.append({"type": "move_above", "target": target})
         if (not above) or (float(eef_z) - float(cube_z) > GRASP_Z_TOL):
-            subtasks.append({"type": "move_down"})
+            subtasks.append({"type": "move_down", "target": target})
         subtasks.append({"type": "close_gripper"})
     if float(delta_z) >= 0.005:
-        subtasks.append({"type": "lift", "delta_z": round(float(delta_z), 2)})
+        subtasks.append({"type": "lift", "target": target, "delta_z": round(float(delta_z), 2)})
     if subtasks:
         subtasks.append({"type": "stabilize", "duration": STABILIZE_DURATION})
     return subtasks
 
 
 def format_answer(pixel_xy, cube_pos, eef_pos, phase, above, delta_z):
-    """MLLM 要生成的抓取计划。target 是方块中心的像素，delta_z 是还要抬的高度。"""
+    """MLLM 要生成的抓取计划。要动位置的步骤带方块中心像素，delta_z 是还要抬的高度。"""
     plan = {
-        "task": "grasp",
-        "target": format_pixel(pixel_xy),
-        "subtasks": build_subtasks(phase, above, eef_pos[2], np.asarray(cube_pos, dtype=float)[2], delta_z),
+        "subtasks": build_subtasks(
+            phase, above, eef_pos[2], np.asarray(cube_pos, dtype=float)[2], delta_z, pixel_xy
+        ),
     }
     return json.dumps(plan, ensure_ascii=False, separators=(", ", ": "))
 
@@ -291,8 +297,10 @@ class DatasetWriter:
         self.image_size = image_size
         self.env = env
         self.world_to_pixel = world_to_pixel_matrix(env, image_size)
+        self.task = "lift"
         self.samples = []
         self.episodes = []
+        self.merged_count = 0
 
     def add(self, episode, step, phase, obs, instruction, lift_height, target_lift, lifted, above, success):
         cube_pos, eef_pos = positions_from_obs(obs)
@@ -300,11 +308,12 @@ class DatasetWriter:
         pixel_xy = round_pixel(pixel)
         cube_pos = [round(float(value), 4) for value in cube_pos]
         eef_pos = [round(float(value), 4) for value in eef_pos]
-        sample_id = "ep{:04d}_{}_{:04d}".format(episode, phase, step)
+        sample_id = make_sample_id(self.task, episode, phase, step)
         image_name = "{}.png".format(sample_id)
         save_rgb(self.image_dir / image_name, obs[DEFAULT_CAMERA + "_image"])
         record = {
             "id": sample_id,
+            "task": self.task,
             "episode": episode,
             "step": int(step),
             "phase": phase,
@@ -334,9 +343,6 @@ class DatasetWriter:
         )
 
     def close(self):
-        with self.jsonl_path.open("w", encoding="utf-8") as handle:
-            for record in self.samples:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         meta = {
             "env": "Lift",
             "robot": "Panda",
@@ -344,14 +350,14 @@ class DatasetWriter:
             "image_size": [self.image_size, self.image_size],
             "inputs": ["image", "instruction"],
             "output": {
-                "answer": "JSON 字符串。task 固定为 grasp；target 是方块中心的整数像素，形如 \"[x y]\"，x 向右、y 向下，原点在图像左上角；subtasks 是从这一帧还要做的步骤，按顺序可能包含 move_above、move_down、close_gripper、lift（delta_z 为剩余抬升，米）、stabilize（duration 0.5 秒）。已经完成的步骤不写。抬到目标高度后 subtasks 为空。",
+                "answer": "JSON 字符串，只有 subtasks。要动位置的步骤各自带 target，是方块中心的整数像素，形如 \"[x y]\"，x 向右、y 向下，原点在图像左上角。按顺序可能包含 move_above、move_down、close_gripper、lift（delta_z 为剩余抬升，米）、stabilize（duration 0.5 秒）。已经完成的步骤不写。抬到目标高度后 subtasks 为空。",
             },
-            "coordinate_frame": "target 是 frontview 像素；cube_pos 仍是世界坐标，单位米",
+            "coordinate_frame": "subtasks 里的 target 是 frontview 像素；cube_pos 仍是世界坐标，单位米",
             "units": {"target": "pixel", "cube_pos": "meter"},
             "camera_world_to_pixel": matrix_to_list(self.world_to_pixel),
             "position_source": {
                 "cube_pos": "obs['cube_pos']，世界坐标，米",
-                "cube_pixel": "方块中心经 camera_world_to_pixel 投到图像的整数像素 [x, y]，和 answer.target 一致",
+                "cube_pixel": "方块中心经 camera_world_to_pixel 投到图像的整数像素 [x, y]，和 subtasks 里的 target 一致",
                 "eef_pos": "obs['robot0_eef_pos']",
             },
             "instruction": "夹爪不在方块正上方时，指令是先移动到目标上方，再抬剩余高度。对准之后只写剩余高度。lift_height_m 是还要抬的高度，lifted_m 是已经抬起的高度，target_lift_m 是总目标。above_cube 表示末端是否已在方块正上方。方块位置、手臂出发位置、悬停高度和夹爪绕竖直轴的朝向每条抓取都会变。",
@@ -359,17 +365,22 @@ class DatasetWriter:
             "num_samples": len(self.samples),
             "episodes": self.episodes,
         }
-        self.meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
 
 
 def arm_controller(env):
     return env.robots[0].part_controllers["right"]
 
 
-def step_toward(env, target_pos, hold_ori, grip):
+def step_toward(env, target_pos, hold_ori, grip, max_speed=None):
+    """max_speed 是每个控制步最多走多少米，不给就按控制器缩放走。"""
     arm = arm_controller(env)
     arm.update(force=True)
     delta_pos = target_pos - arm.ref_pos
+    if max_speed is not None:
+        dist = float(np.linalg.norm(delta_pos))
+        if dist > float(max_speed):
+            delta_pos = delta_pos * (float(max_speed) / dist)
     pos_action = np.clip(delta_pos / POS_SCALE, -1.0, 1.0)
     delta_rot = hold_ori @ arm.ref_ori_mat.T
     ori_action = np.clip(quat2axisangle(mat2quat(delta_rot)) / ORI_SCALE, -1.0, 1.0)
@@ -382,11 +393,11 @@ def step_toward(env, target_pos, hold_ori, grip):
     return env.step(action)
 
 
-def move_until(env, target_pos, hold_ori, grip, pos_tol, max_steps, on_step):
+def move_until(env, target_pos, hold_ori, grip, pos_tol, max_steps, on_step, max_speed=None):
     obs = None
     pos_err = None
     for _ in range(max_steps):
-        obs, _, _, _ = step_toward(env, target_pos, hold_ori, grip)
+        obs, _, _, _ = step_toward(env, target_pos, hold_ori, grip, max_speed)
         on_step(obs)
         pos_err = np.linalg.norm(arm_controller(env).ref_pos - target_pos)
         if pos_err < pos_tol:
@@ -531,7 +542,7 @@ def collect_episode(env, writer, episode, target_lift, style, rng):
 def main():
     parser = argparse.ArgumentParser(description="采集 Lift / Panda 的 MLLM 图文抓取计划")
     parser.add_argument("--episodes", type=int, default=50, help="采集多少条抓取")
-    parser.add_argument("--out", type=str, default="data/lift_mllm", help="输出目录")
+    parser.add_argument("--out", type=str, default="data/lift_mllm", help="输出目录。可以和 Stack 共用，按 task 合并")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--height-min", type=float, default=0.06, help="抬升高度下限，米")
@@ -553,8 +564,8 @@ def main():
         env.close()
 
     print(
-        "saved {} samples from {} episodes ({} succeeded) to {}".format(
-            len(writer.samples), args.episodes, successes, writer.out_dir
+        "saved {} samples from {} episodes ({} succeeded); {} samples in {}".format(
+            len(writer.samples), args.episodes, successes, writer.merged_count, writer.out_dir
         )
     )
 

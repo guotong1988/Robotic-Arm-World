@@ -106,7 +106,7 @@ def parse_pixel(value, image_size):
     return pixel
 
 
-def normalize_subtasks(items):
+def normalize_subtasks(items, image_size):
     if not isinstance(items, list):
         raise ValueError("subtasks 应为数组")
     steps = []
@@ -117,6 +117,10 @@ def normalize_subtasks(items):
         if kind not in SUBTASK_TYPES:
             raise ValueError("未知子任务 {}".format(kind))
         step = {"type": kind}
+        if kind in ("move_above", "move_down", "lift"):
+            if "target" not in item:
+                raise ValueError("{} 缺少 target".format(kind))
+            step["pixel"] = parse_pixel(item["target"], image_size)
         if kind == "lift":
             if "delta_z" not in item:
                 raise ValueError("lift 缺少 delta_z")
@@ -155,18 +159,15 @@ def _load_object(text):
 
 
 def _plan_from_object(obj, image_size):
-    task = obj.get("task")
-    if task != "grasp":
-        raise ValueError("task 应为 grasp，收到 {}".format(task))
-    if "target" not in obj:
-        raise ValueError("缺少 target")
     if "subtasks" not in obj:
         raise ValueError("缺少 subtasks")
-    return {
-        "task": "grasp",
-        "target": parse_pixel(obj["target"], image_size),
-        "subtasks": normalize_subtasks(obj["subtasks"]),
-    }
+    steps = normalize_subtasks(obj["subtasks"], image_size)
+    target = None
+    for step in steps:
+        if "pixel" in step:
+            target = step["pixel"]
+            break
+    return {"target": target, "subtasks": steps}
 
 
 def _parse_plan(text, image_size):
@@ -180,7 +181,7 @@ def _parse_plan(text, image_size):
 
 
 def parse_answer(text, image_size=None):
-    """从模型回答里取出 task、像素 target 和 subtasks。"""
+    """从模型回答里取出 subtasks。target 是第一个带像素的步骤，抬到目标后可以为空。"""
     if not text or not str(text).strip():
         raise ParseError("模型没有返回文本")
     raw = str(text).strip()
@@ -414,7 +415,7 @@ def lift_pixel(pixel, cube_pos, matrix):
     return world, gt_pixel, depth
 
 
-def predict(client, env, obs, instruction, oracle, phase, above, delta_z):
+def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episode):
     size = camera_size(env)
     image = camera_image(obs, size)
     gt_cube, gt_eef = positions_from_obs(obs)
@@ -425,13 +426,16 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z):
         text = format_answer(round_pixel(gt_pixel), gt_cube, gt_eef, phase, above, delta_z)
     else:
         text = client.complete(image, instruction)
+    print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
+    print("episode {:02d} answer ({:.3f}s):\n{}".format(episode, time.perf_counter() - started, text), flush=True)
     plan = parse_answer(text, image_size=size)
+    if plan["target"] is None:
+        raise ParseError("缺少 target")
     world, gt_pixel, cube_depth = lift_pixel(plan["target"], gt_cube, matrix)
     elapsed = time.perf_counter() - started
     return {
         "answer": text,
         "plan": {
-            "task": "grasp",
             "pixel": plan["target"],
             "target": world,
             "subtasks": plan["subtasks"],
@@ -567,6 +571,7 @@ def run_episode(env, client, rng, episode, height_min, height_max, oracle, video
                 "initial",
                 above,
                 opening_spoken,
+                episode,
             )
             cube = pred["plan"]["target"]
             print(
@@ -642,7 +647,10 @@ def pack_query(stage, instruction, pred, reached, pos_err):
         "instruction": instruction,
         "answer": pred["answer"],
         "seconds": pred["seconds"],
-        "subtasks": pred["plan"]["subtasks"],
+        "subtasks": [
+            {key: round_pixel(value) if key == "pixel" else value for key, value in step.items()}
+            for step in pred["plan"]["subtasks"]
+        ],
         "target": [round(float(v), 4) for v in target],
         "gt_cube_pos": [round(float(v), 4) for v in pred["gt_cube_pos"]],
         "gt_eef_pos": [round(float(v), 4) for v in pred["gt_eef_pos"]],
@@ -825,6 +833,9 @@ def probe_dataset(client, dataset, count, seed):
         if gt_pixel is None:
             gt_pixel, _ = project_world(row["cube_pos"], matrix)
             gt_pixel = round_pixel(gt_pixel)
+        if plan["target"] is None:
+            print("{} 没有像素".format(row["id"]), flush=True)
+            continue
         try:
             world = unproject_pixel(plan["target"], cube_depth, matrix)
         except ValueError as exc:
@@ -834,7 +845,6 @@ def probe_dataset(client, dataset, count, seed):
             print("{} 反投影超出工作空间 {}".format(row["id"], np.round(world, 4).tolist()), flush=True)
             continue
         plan = {
-            "task": "grasp",
             "pixel": plan["target"],
             "target": world,
             "subtasks": plan["subtasks"],
@@ -957,19 +967,6 @@ def print_episode(record):
         print("  error: {}".format(record["error"]), flush=True)
     if record.get("video"):
         print("  video {}".format(record["video"]), flush=True)
-    if record["episode"] == 0 or not record["success"]:
-        for query in record["queries"]:
-            answer = query["answer"].replace("\n", " ")
-            if len(answer) > 180:
-                answer = answer[:180] + "..."
-            print(
-                "  [{}] {} {}".format(
-                    query["stage"],
-                    format_axis_cm(query.get("cube_x_err_m"), query.get("cube_y_err_m"), query.get("cube_z_err_m")),
-                    answer,
-                ),
-                flush=True,
-            )
 
 
 def print_summary(summary):
@@ -1117,8 +1114,8 @@ def self_test():
     assert np.allclose(unproject_pixel(round_pixel(pixel), depth_z, matrix), world, atol=1e-2)
     text = format_answer([251.4, 188.6], [-0.0974, 0.0752, 0.8216], [-0.0840, 0.0895, 0.9939], "initial", False, 0.14)
     plan = parse_answer("<think>先看图</think>\n" + text, image_size=512)
-    assert plan["task"] == "grasp"
     assert np.allclose(plan["target"], [251, 189])
+    assert np.allclose(plan["subtasks"][0]["pixel"], [251, 189])
     assert '"[251 189]"' in text
     assert [step["type"] for step in plan["subtasks"]] == [
         "move_above",
@@ -1130,11 +1127,13 @@ def self_test():
     assert plan["subtasks"][3]["delta_z"] == 0.14
     assert plan["subtasks"][4]["duration"] == 0.5
     assert subtasks_match(plan, text)
-    comma = '{"task": "grasp", "target": "[320, 180]", "subtasks": []}'
+    comma = '{"subtasks": [{"type": "move_down", "target": "[320, 180]"}]}'
     plan = parse_answer("```json\n" + comma + "\n```", image_size=512)
     assert np.allclose(plan["target"], [320.0, 180.0])
-    assert plan["subtasks"] == []
-    prose = '计划：\n{"task": "grasp", "target": "[200 180]", "subtasks": [{"type": "lift", "delta_z": 0.1}, {"type": "stabilize", "duration": 0.5}]}'
+    assert plan["subtasks"][0]["type"] == "move_down"
+    empty = '{"subtasks": []}'
+    assert parse_answer(empty, image_size=512)["target"] is None
+    prose = '计划：\n{"subtasks": [{"type": "lift", "target": "[200 180]", "delta_z": 0.1}, {"type": "stabilize", "duration": 0.5}]}'
     plan = parse_answer(prose)
     assert steps_to_run(plan["subtasks"])[0]["type"] == "lift"
     assert steps_to_run(plan["subtasks"])[1]["type"] == "stabilize"
@@ -1153,12 +1152,15 @@ def self_test():
     holding = format_answer([200.0, 180.0], [0.0, 0.0, 0.90], [0.0, 0.0, 0.90], "lift", True, 0.09)
     assert [step["type"] for step in parse_answer(holding, image_size=512)["subtasks"]] == ["lift", "stabilize"]
     try:
-        parse_answer('{"task": "place", "target": "[200 180]", "subtasks": []}', image_size=512)
-        raise AssertionError("非 grasp 任务应拒绝")
+        parse_answer('{"subtasks": [{"type": "move_down"}]}', image_size=512)
+        raise AssertionError("空间步骤缺少 target 应拒绝")
     except ParseError:
         pass
     try:
-        parse_answer('{"task": "grasp", "target": "[0.1 -0.2 0.82]", "subtasks": []}', image_size=512)
+        parse_answer(
+            '{"subtasks": [{"type": "move_down", "target": "[0.1 -0.2 0.82]"}]}',
+            image_size=512,
+        )
         raise AssertionError("三维 target 应拒绝")
     except ParseError:
         pass
@@ -1194,6 +1196,7 @@ def self_test():
     assert packed["cube_x_err_m"] == 0.01 and packed["cube_y_err_m"] == -0.02 and packed["cube_z_err_m"] == 0.01
     assert packed["pixel"] == [251, 189] and packed["gt_pixel"] == [250, 188]
     assert packed["pixel_err"] > 0.0
+    json.dumps(packed)
     assert query_pos_error(packed)["y"] == -0.02
     assert completion_text({"choices": [{"message": {"content": text}}]}) == text
     assert completion_text({"response": comma}) == comma
