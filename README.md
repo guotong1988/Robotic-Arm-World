@@ -39,12 +39,6 @@ Lift 评测只取模型给出的方块像素，后面的「到上方、下降、
 ~/.pyenv/versions/3.11.13/bin/python3 collect_stack_mllm.py --episodes 50 --out data/stack_mllm
 ```
 
-不加载模型，直接执行初始画面生成的步骤，用来确认计划本身能叠成功：
-
-```
-~/.pyenv/versions/3.11.13/bin/python3 eval_stack_oracle.py --episodes 20
-```
-
 用模型测 Stack：初始画面只问一次，模型给出全部步骤（两个方块的像素、抬升量、放置高度等）。像素换世界坐标只用深度相机：像素定视线，深度图估物体中心离桌面多高，取视线与该水平面的交点。仿真里的物体位置只用于事后统计误差，不进模型输入，也不参与控制。`--oracle` 用真值步骤代替模型，其余流程不变。
 
 ```
@@ -83,7 +77,7 @@ PickPlace、NutAssembly、Door、Wipe 共用 `collect_common.py` 的采集流程
 不加载模型、只执行真值步骤，检查计划本身能不能做成：
 
 ```
-~/.pyenv/versions/3.11.13/bin/python3 eval_task_oracle.py --env NutAssembly --episodes 20
+~/.pyenv/versions/3.11.13/bin/python3 eval_nut_mllm_vllm.py --oracle --env NutAssembly --episodes 20
 ```
 
 ToolHang 没有做：先要把挂架抓起来竖直插进底座（这一步加上插入时降低控制器刚度已经能做成），再把扳手翻过来挂到挂架的横杆上。横杆朝向被底座方孔限定，扳手挂上去时夹爪离机器人底座太近，Panda 的肘关节和腕关节都会顶到极限，按这套笛卡尔空间的步骤做不出来。
