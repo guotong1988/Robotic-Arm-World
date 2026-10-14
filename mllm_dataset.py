@@ -6,7 +6,11 @@ image 是相对这个目录的路径。task 用来区分任务，也用来重跑
 两个任务都在时，各自的统计和相机矩阵放在 meta.json 的 tasks 下面。
 """
 
+import fcntl
+import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -55,10 +59,33 @@ def _prune_images(out_dir, task, merged, dropped_images):
                 path.unlink()
 
 
+def _lock_path(out_dir):
+    """锁放在本地文件系统。--out 常常是 OSS/FUSE 挂载，不支持 flock（Errno 95）。
+
+    采集进程都在同一台机器上跑，按输出目录的绝对路径做哈希，同一目录的写仍然互斥。
+    带上 uid，避免 /tmp 下不同用户的锁文件互相没权限。
+    """
+    digest = hashlib.sha1(os.path.abspath(str(out_dir)).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / "mllm_publish_{}_{}.lock".format(os.getuid(), digest)
+
+
 def publish_task(out_dir, task, samples, task_meta):
-    """写入本任务样本，保留目录里其他任务。返回合并后的样本数。"""
+    """写入本任务样本，保留目录里其他任务。返回合并后的样本数。
+
+    多个采集进程并行写同一个 --out，先拿文件锁再读改写，
+    避免 samples.jsonl / meta.json 被并发覆盖丢样本。
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    with _lock_path(out_dir).open("w") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            print("publish_task: 锁文件不支持 flock（{}），不加锁写入".format(exc), flush=True)
+        return _publish_task(out_dir, task, samples, task_meta)
+
+
+def _publish_task(out_dir, task, samples, task_meta):
     jsonl_path = out_dir / "samples.jsonl"
     meta_path = out_dir / "meta.json"
     existing_meta = _read_json(meta_path)

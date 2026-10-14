@@ -4,17 +4,16 @@
 
 1. 按 collect_common 的方式摆好场景，手臂移到随机出发点（和采集同一个 prepare_scene）
 2. 只把一张 frontview RGB 和一句指令放进对话，模型写出从这一帧起还要做的全部步骤
-3. 计划里的像素配上「离该像素最近的真值点」的相机深度，反投影成世界坐标，
-   和 eval_lift_core 一个思路。像素由模型出，深度用真值点的：这些任务的标注点
-   在细长几何内部（门把手被自己的安装座挡着）、箱壁后面（PickPlace 的格子底面）、
-   或会被其他物体挡住（螺母在柱子后面时），深度图的可见表面和标注点沿视线
-   差十几厘米，用不上。真值只给深度这一个数，不进模型输入，也不直接参与控制
-4. 交给 task_plan.execute_plan，末端用世界坐标 OSC 跟踪，执行中不再看图、不再问模型
+3. 计划里的像素只用深度相机换成世界坐标（depth_locate）：按像素在计划里的角色
+   （要抓的物体、格子底面、柱顶、门板上的点……）从附近的深度点量出它所在的平面，
+   取视线和平面的交点。标注点常被挡住或在物体内部，所以不直接读该像素的深度
+4. 交给 task_plan.execute_plan，末端用世界坐标 OSC 跟踪，执行中不再问模型；
+   多物体时每抓下一个之前用当前帧的深度重量它（开局挡在它前面的物体可能已经搬走）
 5. 没做成且任务允许多轮（Wipe 会漏几个点），按当前画面重新问一次，只做剩下的
 6. 以 env._check_success 判定成功
 
-仿真真值还用于事后统计像素和世界误差。--oracle 用真值步骤代替模型回答，
-其余流程不变，用来确认执行器本身够用。
+仿真真值只用于事后统计像素和世界误差，不进模型输入，也不参与定位和控制。
+--oracle 用真值步骤代替模型回答，其余流程不变，用来确认深度定位和执行器本身够用。
 """
 
 import time
@@ -28,6 +27,7 @@ import numpy as np
 
 from collect_common import eef_pose, make_env, prepare_scene, render_plan
 from collect_lift_mllm import format_pixel, project_world, round_pixel, world_to_pixel_matrix
+from depth_locate import locate_plan, pick_starts, real_depth, relocate
 from eval_lift_core import (
     ServerError,
     camera_image,
@@ -41,7 +41,7 @@ from eval_lift_core import (
 )
 from eval_lift_mllm_vllm import VLLMClient
 from eval_stack_mllm_vllm import VIDEO_FPS, mean_or_none, plan_matches, write_results
-from task_plan import ParseError, check_parser, execute_plan, format_plan, parse_plan, resolve_pixel
+from task_plan import ParseError, check_parser, execute_plan, format_plan, parse_plan
 
 
 def plan_pixels(subtasks):
@@ -70,7 +70,7 @@ def plan_pixels(subtasks):
 
 
 def gt_points(task, env, matrix):
-    """任务的真值点和它们的像素、相机深度。只给深度和事后统计用，不进模型。"""
+    """任务的真值点和它们的像素、相机深度。只给事后统计用，不进模型，不参与定位。"""
     out = []
     for name, world in task.points(env).items():
         pixel, depth = project_world(world, matrix)
@@ -78,19 +78,17 @@ def gt_points(task, env, matrix):
     return out
 
 
-def perceive(subtasks, gt, landmarks, matrix):
-    """计划里每个像素配「离它最近的真值点」的相机深度，反投影成世界坐标。
-
-    返回的点就是 execute_plan 的 landmarks：每个点正好落在自己像素的视线上，
-    深度和给它深度的真值点相同，所以 execute_plan 的 resolve_pixel 取最近
-    landmark 反投影，回到的就是为该像素定出的点。
-    """
-    points = []
-    for pixel in plan_pixels(subtasks):
-        world = resolve_pixel(pixel, landmarks, matrix)
-        nearest = min(gt, key=lambda item: float(np.linalg.norm(pixel - item["pixel"])))
-        points.append({"pixel": pixel, "world": world, "info": {"gt": nearest["name"], "gt_depth_m": round(nearest["depth"], 4)}})
-    return points
+def gt_pool(gt, role):
+    """统计误差时，按角色只和同类的真值点配对。螺母中心和柱顶在画面里可能只差一两个像素。"""
+    if role == "bin":
+        pool = [item for item in gt if item["name"].endswith("_bin")]
+    elif role == "peg":
+        pool = [item for item in gt if item["name"].endswith("_peg")]
+    elif role in ("object", "nut"):
+        pool = [item for item in gt if not item["name"].endswith(("_bin", "_peg"))]
+    else:
+        pool = []
+    return pool or gt
 
 
 def point_group(name):
@@ -99,10 +97,11 @@ def point_group(name):
 
 
 def match_targets(points, gt):
-    """每个定位点配像素距离最近的真值点，记录像素和世界误差。"""
+    """每个定位点配像素距离最近的同类真值点，记录像素和世界误差。"""
     targets = []
     for point in points:
-        nearest = min(gt, key=lambda item: float(np.linalg.norm(point["pixel"] - item["pixel"])))
+        pool = gt_pool(gt, point["role"])
+        nearest = min(pool, key=lambda item: float(np.linalg.norm(point["pixel"] - item["pixel"])))
         dist = float(np.linalg.norm(point["pixel"] - nearest["pixel"]))
         err = pos_error(point["world"], nearest["world"])
         targets.append(
@@ -123,8 +122,11 @@ def match_targets(points, gt):
 
 def run_episode(env, task, client, rng, episode, image_size, matrix, oracle, style, video_path=None):
     frames = []
+    latest = {}
 
     def on_step(obs):
+        if obs is not None:
+            latest["obs"] = obs
         if video_path is not None and obs is not None:
             frames.append(grab_frame(obs, image_size))
 
@@ -142,8 +144,9 @@ def run_episode(env, task, client, rng, episode, image_size, matrix, oracle, sty
                 break
             gt_answer = format_plan(gt_subtasks)
             image = camera_image(obs, image_size)
+            depth = real_depth(env, obs)
+            # 真值只用来统计误差，不进模型，不进定位和控制。
             gt = gt_points(task, env, matrix)
-            landmarks = [item["world"] for item in gt]
             started = time.perf_counter()
             answer = gt_answer if oracle else client.complete(image, instruction)
             round_rec = {
@@ -162,7 +165,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrix, oracle, sty
                 subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
                 round_rec["steps"] = [step["type"] for step in subtasks]
                 round_rec["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-                points = perceive(subtasks, gt, landmarks, matrix)
+                points = locate_plan(task.task, subtasks, depth, matrix, image_size)
                 round_rec["targets"] = match_targets(points, gt)
                 for target in round_rec["targets"]:
                     print(
@@ -177,6 +180,17 @@ def run_episode(env, task, client, rng, episode, image_size, matrix, oracle, sty
                         ),
                         flush=True,
                     )
+                starts = set(pick_starts(task.task, subtasks))
+                relocated = []
+
+                def on_progress(index, _step):
+                    if index in starts and "obs" in latest:
+                        point = relocate(
+                            task.task, subtasks, index, real_depth(env, latest["obs"]), matrix, image_size
+                        )
+                        if point is not None:
+                            relocated.extend(match_targets([point], gt_points(task, env, matrix)))
+
                 final, trace = execute_plan(
                     env,
                     subtasks,
@@ -185,8 +199,11 @@ def run_episode(env, task, client, rng, episode, image_size, matrix, oracle, sty
                     matrix,
                     grip=-1.0,
                     on_step=on_step,
+                    on_progress=on_progress,
                 )
                 round_rec["trace"] = trace
+                if relocated:
+                    round_rec["relocated"] = relocated
                 if final is not None:
                     obs = final
                 hold_ori = eef_pose(env)[1]
@@ -334,7 +351,7 @@ def make_client(args):
 def run_eval(task, args, client):
     check_parser()
     rng = np.random.default_rng(args.seed)
-    env = make_env(task, args.image_size, args.seed, use_camera=True)
+    env = make_env(task, args.image_size, args.seed, use_camera=True, camera_depths=True)
     image_size = camera_size(env)
     matrix = world_to_pixel_matrix(env, image_size)
     video_dir = None if args.no_video else Path(args.out) / "videos"

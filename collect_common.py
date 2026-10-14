@@ -234,7 +234,7 @@ def plan_signature(subtasks):
     return tuple(items)
 
 
-def make_env(task, image_size, seed, use_camera=True):
+def make_env(task, image_size, seed, use_camera=True, camera_depths=False):
     kwargs = dict(
         env_name=task.env_name,
         robots="Panda",
@@ -248,6 +248,7 @@ def make_env(task, image_size, seed, use_camera=True):
         camera_names=DEFAULT_CAMERA,
         camera_heights=image_size,
         camera_widths=image_size,
+        camera_depths=bool(use_camera and camera_depths),
         reward_shaping=False,
         control_freq=20,
         horizon=4000,

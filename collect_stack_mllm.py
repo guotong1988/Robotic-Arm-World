@@ -4,8 +4,8 @@
 红块还在桌上时，步骤是移到红块上方、下降、合爪、抬高、移到绿块上方、下降、松爪、抬开、停住。
 已经抓住并且对准绿块时，前面的步骤不再写。叠好之后 subtasks 为空。
 
-空间步骤各自带像素。评测用提问那一帧离该像素最近的物体中心深度做反投影，
-再交给 task_plan.execute_plan。执行器不认识 Stack，只按步骤走。
+空间步骤各自带像素。评测用提问那一帧的深度图量出像素处物块的高度再反投影，
+交给 task_plan.execute_plan。执行器不认识 Stack，只按步骤走。
 
     python collect_stack_mllm.py --episodes 50 --out data/stack_mllm
 

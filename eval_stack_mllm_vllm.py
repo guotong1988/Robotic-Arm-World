@@ -27,14 +27,11 @@ import gl_backend
 gl_backend.configure()
 
 import numpy as np
-from robosuite.utils.camera_utils import get_real_depth_map
 
 from collect_lift_mllm import (
-    DEFAULT_CAMERA,
     format_pixel,
     project_world,
     round_pixel,
-    unproject_pixel,
     world_to_pixel_matrix,
 )
 from collect_stack_mllm import (
@@ -57,6 +54,7 @@ from eval_lift_core import (
     pos_error,
     write_mp4,
 )
+from depth_locate import backproject_disk, ray_at_height, real_depth
 from eval_lift_mllm_vllm import VLLMClient
 from task_plan import SPATIAL, ParseError, check_parser, execute_plan, parse_plan, plausible, resolve_pixel
 
@@ -70,42 +68,6 @@ TOP_PERCENTILE = 95
 MIN_HEIGHT = 0.005
 MAX_HEIGHT = 0.12
 VIDEO_FPS = 20
-
-
-def real_depth(env, obs):
-    raw = np.asarray(obs[DEFAULT_CAMERA + "_depth"], dtype=float)
-    depth = np.asarray(get_real_depth_map(env.sim, raw), dtype=float)
-    return depth.reshape(depth.shape[0], depth.shape[1])
-
-
-def backproject_disk(depth, matrix, pixel, radius):
-    """深度图上以 pixel 为圆心、radius 为半径的像素，反投影成世界坐标点。"""
-    height, width = depth.shape
-    u0, v0 = int(np.rint(pixel[0])), int(np.rint(pixel[1]))
-    if not (0 <= u0 < width and 0 <= v0 < height):
-        raise ParseError("像素不在画面里：{}".format(format_pixel(pixel)))
-    us = np.arange(max(0, u0 - radius), min(width, u0 + radius + 1))
-    vs = np.arange(max(0, v0 - radius), min(height, v0 + radius + 1))
-    uu, vv = np.meshgrid(us, vs)
-    keep = (uu - u0) ** 2 + (vv - v0) ** 2 <= radius * radius
-    uu, vv = uu[keep], vv[keep]
-    z = depth[vv, uu]
-    # 深度图第 (v, u) 格对应的是像素中心 (u + 0.5, v + 0.5)。
-    cu, cv = uu + 0.5, vv + 0.5
-    cam = np.stack([cu * z, cv * z, z, np.ones_like(z)])
-    world = np.linalg.inv(np.asarray(matrix, dtype=float)) @ cam
-    return world[:3].T
-
-
-def ray_at_height(pixel, height_z, matrix):
-    """像素对应的视线和水平面 z=height_z 的交点。"""
-    near = unproject_pixel(pixel, 0.5, matrix)
-    far = unproject_pixel(pixel, 3.0, matrix)
-    direction = far - near
-    if abs(float(direction[2])) < 1e-6:
-        raise ParseError("视线接近水平，无法求交")
-    t = (float(height_z) - float(near[2])) / float(direction[2])
-    return near + t * direction
 
 
 def locate(pixel, depth, matrix, image_size):
