@@ -4,9 +4,9 @@
 带位置的步骤各自有一个像素，不共用同一个目标。所有任务都只写 subtasks。
 Lift 的每一步指向同一个方块，Stack 先指向红块再指向绿块，执行器不用知道是哪个任务。
 
-评测时把计划里的像素配上「提问这一帧、离该像素最近的物体中心」的相机深度，
-反投影成世界坐标，之后不再改。物体随后被抓起来，也不能改用新的位置，
-否则后半段会指到已经搬走的物体上。
+评测时用提问这一帧的深度图把计划里的像素换成世界坐标（depth_locate），之后不再改。
+物体随后被抓起来，也不能改用新的位置，否则后半段会指到已经搬走的物体上。
+采集时没有深度图，像素配「离它最近的物体中心」的相机深度反投影。
 
 步骤：
 
@@ -326,8 +326,19 @@ def held_offset(held, grasp_point, grasp_ori, ori):
     return (np.asarray(ori, dtype=float) @ np.asarray(grasp_ori, dtype=float).T) @ rel
 
 
+def step_point(step, key, landmarks, matrix):
+    """step 里 key 像素的世界坐标。评测已经按角色定好的（step["world"]）优先，
+    否则用离像素最近的 landmark 的深度反投影。wipe 的 path 返回一串点。"""
+    placed = step.get("world", {}).get(key)
+    if placed is not None:
+        return placed
+    if key == "path":
+        return [resolve_pixel(pixel, landmarks, matrix) for pixel in step["path"]]
+    return resolve_pixel(step[key], landmarks, matrix)
+
+
 def _dest_for(step, landmarks, matrix, grasp_point, grasp_ori, ori):
-    world = clip_workspace(resolve_pixel(step["pixel"], landmarks, matrix))
+    world = clip_workspace(step_point(step, "pixel", landmarks, matrix))
     kind = step["type"]
     if kind == "move_above":
         extra = float(step["clearance"])
@@ -337,7 +348,7 @@ def _dest_for(step, landmarks, matrix, grasp_point, grasp_ori, ori):
         extra = float(step["delta_z"])
     dest = world + np.array([0.0, 0.0, extra])
     if "held" in step:
-        held = resolve_pixel(step["held"], landmarks, matrix)
+        held = step_point(step, "held", landmarks, matrix)
         dest = dest - held_offset(held, grasp_point, grasp_ori, ori)
     return clip_workspace(dest)
 
@@ -359,7 +370,8 @@ def _turn(env, pivot, axis, angle_deg, ori, grip, on_step):
 
 
 def execute_plan(env, steps, hold_ori, landmarks, matrix, grip=-1.0, on_step=None, on_progress=None):
-    """按步骤顺序执行。landmarks 是提问那一帧的物体中心，执行过程中不更新。
+    """按步骤顺序执行。步骤带 world（评测按深度图定好的坐标）时直接用；
+    否则用 landmarks（采集时提问那一帧的物体中心）反投影。执行过程中都不更新。
 
     on_progress(index, step) 在每一步开始前调用，采集用它知道正在做第几步。
     """
@@ -394,18 +406,17 @@ def execute_plan(env, steps, hold_ori, landmarks, matrix, grip=-1.0, on_step=Non
             grip = command
         elif kind == "reach":
             ori = approach_ori(step["approach"])
-            target = resolve_pixel(step["pixel"], landmarks, matrix)
+            target = step_point(step, "pixel", landmarks, matrix)
             dest = clip_workspace(target - np.asarray(step["approach"]) * float(step["standoff"]))
             obs, ok, err = goto(env, dest, ori, grip, REACH_TOL, REACH_STEPS, on_step)
             anchor = dest
         elif kind == "turn":
-            pivot = resolve_pixel(step["pivot"], landmarks, matrix)
+            pivot = step_point(step, "pivot", landmarks, matrix)
             obs, ok, err, ori, anchor = _turn(env, pivot, step["axis"], step["angle"], ori, grip, on_step)
         elif kind == "wipe":
             ok, err = True, 0.0
-            for pixel in step["path"]:
-                point = resolve_pixel(pixel, landmarks, matrix)
-                anchor = clip_workspace(point + np.array([0.0, 0.0, float(step["offset_z"])]))
+            for point in step_point(step, "path", landmarks, matrix):
+                anchor = clip_workspace(np.asarray(point) + np.array([0.0, 0.0, float(step["offset_z"])]))
                 obs, reached, err = move_until(
                     env, anchor, ori, grip, WIPE_TOL, WIPE_STEPS, on_step, max_speed=WIPE_SPEED
                 )
