@@ -4,11 +4,11 @@ https://space.bilibili.com/447278957/lists
 
 ## Hello World
 
-~/.pyenv/versions/3.11.13/bin/mjpython demo_random_action.py
-
-~/.pyenv/versions/3.11.13/bin/mjpython lift_xarm7_ik.py
-
-~/.pyenv/versions/3.11.13/bin/python3 lift_xarm7_ik.py --headless
+```
+~/.pyenv/versions/3.11.13/bin/mjpython hello_world/demo_random_action.py
+~/.pyenv/versions/3.11.13/bin/mjpython hello_world/lift_xarm7_ik.py
+~/.pyenv/versions/3.11.13/bin/python3 hello_world/lift_xarm7_ik.py --headless
+```
 
 ## 准备MLLM训练数据
 
