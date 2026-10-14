@@ -4,7 +4,7 @@ https://space.bilibili.com/447278957/lists
 
 robosuite + Panda 上的单臂操作。微调后的 Qwen 只看一张 frontview RGB 和一句指令，输出 `subtasks` 步骤列表，空间步骤带像素；评测时只用深度相机把像素换成世界坐标，交给 `task_plan.py` 的执行器去做。
 
-采集、评测、步骤原语和深度定位的说明见 [quick_start.md](quick_start.md)。
+采集、评测、步骤原语和深度定位的说明见 [QUICK_START.md](QUICK_START.md)。
 
 ## 测评结果
 
