@@ -23,6 +23,8 @@
 
     python collect_lift_mllm.py --episodes 50 --out data/lift_mllm
 
+抓取失败（没抓住或没抬到目标高度）的轨迹整条丢掉，图片和样本都不写盘。
+
 多个任务可以写进同一个 --out。样本 id 和图片名带 lift_ 前缀，
 samples.jsonl 按任务合并，后跑的采集不会盖掉已经写下的其他任务。
 """
@@ -300,9 +302,12 @@ class DatasetWriter:
         self.task = "lift"
         self.samples = []
         self.episodes = []
+        self.pending = []
+        self.discarded = 0
         self.merged_count = 0
 
-    def add(self, episode, step, phase, obs, instruction, lift_height, target_lift, lifted, above, success):
+    def add(self, episode, step, phase, obs, instruction, lift_height, target_lift, lifted, above):
+        """先缓存在内存里，等这条轨迹成功了才写盘。"""
         cube_pos, eef_pos = positions_from_obs(obs)
         pixel, _ = project_world(cube_pos, self.world_to_pixel)
         pixel_xy = round_pixel(pixel)
@@ -310,7 +315,6 @@ class DatasetWriter:
         eef_pos = [round(float(value), 4) for value in eef_pos]
         sample_id = make_sample_id(self.task, episode, phase, step)
         image_name = "{}.png".format(sample_id)
-        save_rgb(self.image_dir / image_name, obs[DEFAULT_CAMERA + "_image"])
         record = {
             "id": sample_id,
             "task": self.task,
@@ -328,17 +332,25 @@ class DatasetWriter:
             "cube_pixel": pixel_xy,
             "eef_pos": eef_pos,
             "answer": format_answer(pixel_xy, cube_pos, eef_pos, phase, above, lift_height),
-            "success": bool(success),
+            "success": False,
         }
-        self.samples.append(record)
+        self.pending.append((record, np.array(obs[DEFAULT_CAMERA + "_image"], copy=True)))
         return record
 
     def finish_episode(self, episode, target_lift, success):
+        pending, self.pending = self.pending, []
+        if not success:
+            self.discarded += 1
+            return
+        for record, rgb in pending:
+            save_rgb(self.image_dir / Path(record["image"]).name, rgb)
+            record["success"] = True
+            self.samples.append(record)
         self.episodes.append(
             {
                 "episode": episode,
                 "target_lift_m": round(float(target_lift), 4),
-                "success": bool(success),
+                "success": True,
             }
         )
 
@@ -362,6 +374,7 @@ class DatasetWriter:
             },
             "instruction": "夹爪不在方块正上方时，指令是先移动到目标上方，再抬剩余高度。对准之后只写剩余高度。lift_height_m 是还要抬的高度，lifted_m 是已经抬起的高度，target_lift_m 是总目标。above_cube 表示末端是否已在方块正上方。方块位置、手臂出发位置、悬停高度和夹爪绕竖直轴的朝向每条抓取都会变。",
             "num_episodes": len(self.episodes),
+            "num_discarded_episodes": self.discarded,
             "num_samples": len(self.samples),
             "episodes": self.episodes,
         }
@@ -455,7 +468,6 @@ def collect_episode(env, writer, episode, target_lift, style, rng):
             target_lift,
             lifted,
             above,
-            success=False,
         )
         state["last_key"] = key
         state["last_step"] = state["step"]
@@ -513,9 +525,6 @@ def collect_episode(env, writer, episode, target_lift, style, rng):
     )
     success = bool(env._check_success()) and grasped
     record(obs, "lift", force=True)
-    for sample in writer.samples:
-        if sample["episode"] == episode:
-            sample["success"] = success
 
     cube_pos, _ = positions_from_obs(obs)
     _, remaining = remaining_lift(cube_pos[2], rest_z, target_lift)
@@ -564,8 +573,8 @@ def main():
         env.close()
 
     print(
-        "saved {} samples from {} episodes ({} succeeded); {} samples in {}".format(
-            len(writer.samples), args.episodes, successes, writer.merged_count, writer.out_dir
+        "saved {} samples from {} succeeded episodes ({} failed, discarded); {} samples in {}".format(
+            len(writer.samples), successes, writer.discarded, writer.merged_count, writer.out_dir
         )
     )
 

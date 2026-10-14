@@ -6,12 +6,13 @@
 2. 按当前画面重算指令，和采集时一样：没对准就先移动到目标上方，对准后只写还要抬多少
 3. 只把一张 RGB 和这条指令放进对话
 4. 只在初始画面问一次模型，从回答里取出方块中心的像素坐标。抬升高度用指令里已经写明的数字
-5. 用这一帧方块中心的相机深度，把像素反投影成世界坐标。之后不再问模型。按固定规则走到该位置上方、下降、合爪、抬起并稳住。末端用世界坐标 OSC 跟踪
+5. 只用这一帧的深度图把像素换成世界坐标（depth_locate 的 object：量桌面和方块顶面的高度，
+   中心取中间，求视线和这个水平面的交点）。之后不再问模型。按固定规则走到该位置上方、下降、合爪、抬起并稳住。末端用世界坐标 OSC 跟踪
 6. 抓住方块，并且方块抬过桌面 4 厘米，才算成功
 
 每条测评的 frontview 会按控制频率收成 mp4，写到输出目录的 videos/。--no-video 可以关掉。
 
-模型给的是像素，不是世界坐标。反投影用的深度是方块中心沿视线的 z，像素准了，机械臂拿到的就是方块中心。
+模型给的是像素，不是世界坐标。仿真里的方块位置只用于 --oracle 出答案和事后统计误差，不参与定位和控制。
 move_above 在其上方 12 厘米，这个高度落在采集时的悬停范围内。
 """
 
@@ -50,6 +51,7 @@ from collect_lift_mllm import (
     unproject_pixel,
     world_to_pixel_matrix,
 )
+from depth_locate import locate, real_depth
 
 # 采集时悬停高度在 8 到 15 厘米之间随机，这里取中间附近的固定值。
 HOVER_CLEARANCE = 0.12
@@ -403,16 +405,13 @@ def write_mp4(path, frames, fps=VIDEO_FPS):
     return path
 
 
-def lift_pixel(pixel, cube_pos, matrix):
-    """预测像素配上方块中心的相机深度，得到交给机械臂的世界坐标。"""
-    gt_pixel, depth = project_world(cube_pos, matrix)
+def lift_pixel(pixel, depth, matrix, image_size):
+    """预测像素只用深度图换成方块中心的世界坐标，见 depth_locate 的 object。"""
     try:
-        world = unproject_pixel(pixel, depth, matrix)
+        world, info = locate("object", pixel, depth, matrix, image_size)
     except ValueError as exc:
         raise ParseError(str(exc)) from exc
-    if not plausible(world):
-        raise ParseError("反投影超出工作空间：{}".format(np.round(world, 4).tolist()))
-    return world, gt_pixel, depth
+    return world, info
 
 
 def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episode):
@@ -420,6 +419,7 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episod
     image = camera_image(obs, size)
     gt_cube, gt_eef = positions_from_obs(obs)
     matrix = world_to_pixel_matrix(env, size)
+    # 真值只用来出 oracle 答案和事后统计，不进定位和控制。
     gt_pixel, cube_depth = project_world(gt_cube, matrix)
     started = time.perf_counter()
     if oracle:
@@ -431,7 +431,7 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episod
     plan = parse_answer(text, image_size=size)
     if plan["target"] is None:
         raise ParseError("缺少 target")
-    world, gt_pixel, cube_depth = lift_pixel(plan["target"], gt_cube, matrix)
+    world, located = lift_pixel(plan["target"], real_depth(env, obs), matrix, size)
     elapsed = time.perf_counter() - started
     return {
         "answer": text,
@@ -444,6 +444,7 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episod
         "gt_eef_pos": gt_eef,
         "gt_pixel": gt_pixel,
         "cube_depth_m": cube_depth,
+        "located": located,
         "cube_err": pos_error(world, gt_cube),
         "seconds": round(elapsed, 3),
     }
@@ -1042,7 +1043,7 @@ def run_eval(args, client, backend, extra_summary=None):
         return
 
     rng = np.random.default_rng(args.seed)
-    env = make_env(args.image_size, args.seed)
+    env = make_env(args.image_size, args.seed, camera_depths=True)
     video_dir = None if args.no_video else Path(args.out) / "videos"
     records = []
     try:
