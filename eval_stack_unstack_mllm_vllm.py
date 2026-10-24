@@ -8,12 +8,13 @@
 
 1. 指令是叠上去再拿下来。两个方向随机选：红叠绿再拿下、绿叠红再拿下，
    也可以用 --direction 固定一个方向、用 --instruction 固定一句话
-2. 真值计划分两段：先按 eval_stack_mllm_vllm.py 的方式叠上去，再下降抓住被叠的块、
-   抬起来放回它原来在桌上的位置、松爪、抬开
+2. 真值计划分两段：先按 eval_stack_mllm_vllm.py 的方式叠上去（抓的步骤写两指落点对），
+   再降回垫底块两侧重新抓住被叠的块、抬起来放回它原来在桌上的位置、松爪、抬开；
+   指令和采集一样以每台相机一个 <image> 占位开头
 3. 成功分两步看：执行过程中曾经叠起来过（被叠的块离开桌面、和另一块接触、已经松开），
    并且结束时被叠的块回到桌面高度、没被抓着、两块不再接触。放回位置误差单独记录
 4. 按每次合爪、松爪前指的像素各自离哪个方块近，判断它两次分别抓了哪块、放到哪块上面
-5. --oracle 用真值步骤代替模型，先确认叠上去再拿下来这套动作本身能做成
+5. --oracle 用真值像素和真值步骤代替模型，先确认叠上去再拿下来这套动作本身能做成
 """
 
 import argparse
@@ -26,38 +27,50 @@ gl_backend.configure()
 
 import numpy as np
 
-from collect_lift_mllm import format_pixel, project_world, round_pixel, world_to_pixel_matrix
+from collect_lift_mllm import (
+    BACK_CAMERA,
+    DEFAULT_CAMERA,
+    MASK,
+    add_camera_arg,
+    apply_cameras,
+    format_pixel,
+    grip_view_pixels,
+    project_world,
+    view_pixel,
+    with_views,
+    world_to_pixel_matrices,
+)
+from collect_common import order_landings_at
 from collect_stack_mllm import (
     TRANSPORT_DZ,
-    lift_step,
+    grip_step,
+    half_z,
     make_env,
-    move_above,
-    move_down,
     place_offset,
+    place_step,
+    plan_desc,
     positions_from_obs,
     prepare_scene,
     remaining_subtasks,
 )
-from eval_lift_core import (
+from eval_lift_mllm_vllm import (
     ServerError,
-    camera_image,
+    VLLMClient,
+    camera_images,
     camera_size,
     format_cm,
-    format_err_axes,
-    format_xyz,
     grab_frame,
-    pos_error,
     write_mp4,
 )
-from eval_lift_mllm_vllm import VLLMClient
+from depth_locate import make_views
 from eval_stack_mllm_vllm import (
     VIDEO_FPS,
     mean_or_none,
     nearest_object,
     perceive,
     plan_matches,
+    point_target,
     print_summary,
-    real_depth,
     summarize,
     write_results,
 )
@@ -117,44 +130,90 @@ def unstack_success(env, obs, direction, orig_moved, stacked_seen):
     return bool(stacked_seen and on_table and released and separated)
 
 
-def unstack_plan(obs, offset, matrix, direction):
+def unstack_plan(env, obs, offset, matrices, direction, half, axis, camera_pos):
     """叠上去再拿下来的真值步骤。
 
     前半段复用正向的步骤生成，只把要抓的块和垫底的块按方向对调，去掉结尾的 stabilize；
-    后半段降回叠好的块上重新抓住、抬高、放回它原来在桌上的位置。
+    后半段降到垫底块两侧（被叠的块此刻正压在垫底块上，贴垫底块两侧就是贴它两侧）
+    重新抓住、抬高、放回它原来在桌上的位置。
     像素都来自提问这一帧：叠好的块在垫底块的像素上，原位的像素还空着。
+    被相机挡住、看不到的点写 "mask"；两台相机都看不到时 frontview 保留像素兜底。
     """
     cube_a, cube_b, eef = positions_from_obs(obs)
     moved, base = (cube_a, cube_b) if direction == "red_on_green" else (cube_b, cube_a)
-    pix_moved, _ = project_world(moved, matrix)
-    pix_base, _ = project_world(base, matrix)
-    steps = remaining_subtasks(moved, base, eef, pix_moved, pix_base, float(moved[2]), offset, False, False)
+    moved_body = env.cubeA_body_id if direction == "red_on_green" else env.cubeB_body_id
+    base_body = env.cubeB_body_id if direction == "red_on_green" else env.cubeA_body_id
+    side = np.asarray(axis, dtype=float) * float(half)
+
+    def center_pixel(point, own_body):
+        pixel = view_pixel(env, point, DEFAULT_CAMERA, matrices[DEFAULT_CAMERA], own_body=own_body)
+        pixel_back = None
+        if BACK_CAMERA in matrices:
+            pixel_back = view_pixel(env, point, BACK_CAMERA, matrices[BACK_CAMERA], own_body=own_body)
+            if pixel == MASK and pixel_back == MASK:
+                pixel = format_pixel(project_world(point, matrices[DEFAULT_CAMERA])[0])
+        return pixel, pixel_back
+
+    # 第一次抓取：两指落点贴被叠块两侧，朝 frontview 的一侧写 target_1。
+    land_1, land_2 = order_landings_at(moved, camera_pos, (moved + side, moved - side))
+    grip_pixels = grip_view_pixels(env, land_1, land_2, matrices)
+    pix_base, pix_base_back = center_pixel(base, base_body)
+    # 第二次抓取：落点贴垫底块两侧，两指落到垫底块上那个被叠块的两侧。
+    land_3, land_4 = order_landings_at(base, camera_pos, (base + side, base - side))
+    grip_re = grip_view_pixels(env, land_3, land_4, matrices)
+    # 放回桌上原来的位置：写空位的中心像素，目标中心加距离。
+    pix_moved, pix_moved_back = center_pixel(moved, moved_body)
+    steps = remaining_subtasks(
+        moved, base, eef, grip_pixels, pix_base, float(moved[2]), offset, False, False, pix_base_back
+    )
     steps = steps[:-1]  # 去掉叠好后的 stabilize，接着做拿下来
-    steps.append(move_down(pix_base, offset))  # 降到被叠块的中心高度，重新抓住
-    steps.append({"type": "close_gripper"})
-    steps.append(lift_step(pix_base, TRANSPORT_DZ))
-    steps.append(move_above(pix_moved, DEFAULT_CLEARANCE))
-    steps.append(move_down(pix_moved, 0.0))  # 放回桌上原来的位置
-    steps.append({"type": "open_gripper"})
-    steps.append(move_above(pix_moved, DEFAULT_CLEARANCE))
-    steps.append({"type": "stabilize", "duration": STABILIZE_DURATION})
+    # 降到被叠块的中心高度，重新抓住；第二次抓取的两指落点贴垫底块两侧。
+    steps.append(grip_step("move_down", "降到叠好的块上", grip_re, {"offset_z": round(float(offset), 3)}))
+    steps.append({"type": "close_gripper", "desc": "合爪夹住叠好的块"})
+    steps.append(grip_step("lift", "把叠好的块抬起来", grip_re, {"delta_z": TRANSPORT_DZ}))
+    steps.append(place_step(
+        "move_above", "移回它原来的位置上方", pix_moved,
+        {"clearance": round(float(DEFAULT_CLEARANCE), 2)}, pix_moved_back,
+    ))
+    steps.append(place_step("move_down", "把块放回桌面", pix_moved, {"offset_z": 0.0}, pix_moved_back))
+    steps.append({"type": "open_gripper", "desc": "松爪放下"})
+    steps.append(place_step(
+        "move_above", "向上抬开夹爪", pix_moved,
+        {"clearance": round(float(DEFAULT_CLEARANCE), 2)}, pix_moved_back,
+    ))
+    steps.append({"type": "stabilize", "desc": "停在原地保持稳定", "duration": STABILIZE_DURATION})
+    # format_plan 直接返回模型输出格式的 JSON 文本，oracle 时喂给 parse_plan。
     return format_plan(steps)
 
 
 def pixels_before(subtasks, kind):
-    """每次 kind 这一步之前，最近一个带像素的步骤的像素。返回和出现次数一样长的列表。"""
+    """每次 kind 这一步之前，最近一个带像素的步骤的 (像素, 视图)。返回和出现次数一样长的列表。
+
+    front 被 mask 时回退 backview 的像素，视图用来选对应的真值列表。
+    """
     out = []
     pixel = None
+    view = None
     for step in subtasks:
         if step["type"] == kind:
-            out.append(pixel)
+            out.append((pixel, view))
         if "pixel" in step:
-            pixel = step["pixel"]
+            if step["pixel"] is not None:
+                pixel, view = step["pixel"], DEFAULT_CAMERA
+            elif step.get("pixel_back") is not None:
+                pixel, view = step["pixel_back"], BACK_CAMERA
     return out
 
 
-def classify(pixels, gt_pix):
-    return [None if p is None else OBJECT_NAMES[nearest_object(p, gt_pix)[0]] for p in pixels]
+def classify(pixels, gt_pix, gt_pix_back):
+    out = []
+    for pixel, view in pixels:
+        if pixel is None:
+            out.append(None)
+            continue
+        gt = gt_pix if view == DEFAULT_CAMERA else gt_pix_back
+        out.append(OBJECT_NAMES[nearest_object(pixel, gt)[0]])
+    return out
 
 
 def run_episode(env, client, rng, episode, image_size, oracle, direction, instruction=None, video_path=None):
@@ -181,17 +240,31 @@ def run_episode(env, client, rng, episode, image_size, oracle, direction, instru
             direction = DIRECTIONS[int(rng.integers(len(DIRECTIONS)))]
         chosen["direction"] = direction
         styles = INSTRUCTION_STYLES[direction]
-        instruction = instruction or styles[int(rng.integers(len(styles)))]
-        matrix = world_to_pixel_matrix(env, image_size)
-        image = camera_image(obs, image_size)
-        depth = real_depth(env, obs)
+        styled = instruction or styles[int(rng.integers(len(styles)))]
+        # 和采集一致：指令以每台相机一个 <image> 占位开头、话术后面带字段说明，图走 image_url 后占位被剥掉。
+        instruction = with_views(styled, plan_desc())
+        matrices = world_to_pixel_matrices(env, image_size)
+        images = camera_images(obs, image_size)
+        views = make_views(env, obs, matrices)
+        matrix = matrices[DEFAULT_CAMERA]
+        # 评测执行保持 hold_ori，两指合拢轴就是它的第一列。
+        axis = np.asarray(hold_ori, dtype=float)[:, 0].copy()
+        cam_pos = env.sim.data.cam_xpos[env.sim.model.camera_name2id(DEFAULT_CAMERA)]
 
         # 以下真值只用来统计，不进模型，不进控制。
         gt_a, gt_b, _ = positions_from_obs(obs)
         orig_moved = np.array(gt_a if direction == "red_on_green" else gt_b, dtype=float)
         orig_base = np.array(gt_b if direction == "red_on_green" else gt_a, dtype=float)
         gt_pix = [project_world(gt_a, matrix)[0], project_world(gt_b, matrix)[0]]
-        gt_answer = unstack_plan(obs, place_offset(env), matrix, direction)
+        gt_pix_back = [None, None]
+        if BACK_CAMERA in matrices:
+            gt_pix_back = [
+                project_world(gt_a, matrices[BACK_CAMERA])[0],
+                project_world(gt_b, matrices[BACK_CAMERA])[0],
+            ]
+        gt_answer = unstack_plan(
+            env, obs, place_offset(env), matrices, direction, half_z(env.cubeA, 0.02), axis, cam_pos
+        )
 
         record = {
             "episode": episode,
@@ -203,7 +276,7 @@ def run_episode(env, client, rng, episode, image_size, oracle, direction, instru
             "stacked": False,
         }
         started = time.perf_counter()
-        answer = gt_answer if oracle else client.complete(image, instruction)
+        answer = gt_answer if oracle else client.complete(images, instruction)
         record["seconds"] = round(time.perf_counter() - started, 3)
         record["answer"] = answer
         print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
@@ -212,40 +285,16 @@ def run_episode(env, client, rng, episode, image_size, oracle, direction, instru
             subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
             record["steps"] = [step["type"] for step in subtasks]
             record["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-            record["picked_list"] = classify(pixels_before(subtasks, "close_gripper"), gt_pix)
-            record["placed_list"] = classify(pixels_before(subtasks, "open_gripper"), gt_pix)
+            record["picked_list"] = classify(pixels_before(subtasks, "close_gripper"), gt_pix, gt_pix_back)
+            record["placed_list"] = classify(pixels_before(subtasks, "open_gripper"), gt_pix, gt_pix_back)
             record["picked"] = record["picked_list"][0] if record["picked_list"] else None
             record["placed_on"] = record["placed_list"][0] if record["placed_list"] else None
-            points = perceive(subtasks, depth, matrix, image_size)
+            points = perceive(subtasks, views, image_size, axis=axis)
             targets = []
             for point in points:
-                index, dists = nearest_object(point["pixel"], gt_pix)
-                gt = gt_a if index == 0 else gt_b
-                err = pos_error(point["world"], gt)
-                targets.append(
-                    {
-                        "object": OBJECT_NAMES[index],
-                        "pixel": round_pixel(point["pixel"]),
-                        "gt_pixel": round_pixel(gt_pix[index]),
-                        "pixel_err": round(dists[index], 2),
-                        "world": [round(float(v), 4) for v in point["world"]],
-                        "gt_world": [round(float(v), 4) for v in gt],
-                        "err_m": {k: round(v, 4) for k, v in err.items()},
-                        "depth": point["info"],
-                    }
-                )
-                print(
-                    "episode {:02d} {} pixel gt={} pred={} pos gt={} pred={} {}".format(
-                        episode,
-                        targets[-1]["object"],
-                        format_pixel(gt_pix[index]),
-                        format_pixel(point["pixel"]),
-                        format_xyz(gt),
-                        format_xyz(point["world"]),
-                        format_err_axes(err),
-                    ),
-                    flush=True,
-                )
+                target, line = point_target(point, gt_pix, gt_pix_back, gt_a, gt_b)
+                targets.append(target)
+                print("episode {:02d} {}".format(episode, line), flush=True)
             record["targets"] = targets
             track["enabled"] = True
             try:
@@ -254,7 +303,7 @@ def run_episode(env, client, rng, episode, image_size, oracle, direction, instru
                     subtasks,
                     hold_ori,
                     [point["world"] for point in points],
-                    matrix,
+                    matrices,
                     grip=-1.0,
                     on_step=on_step,
                 )
@@ -386,6 +435,7 @@ def main():
     parser.add_argument("--out", default="data/stack_unstack_eval")
     parser.add_argument("--no-video", action="store_true", help="不把每条测评的 frontview 录成 mp4")
     parser.add_argument("--oracle", action="store_true", help="用真值步骤代替模型，检查叠上去再拿下来能否做成")
+    add_camera_arg(parser)
     args = parser.parse_args()
 
     check_parser()
@@ -404,6 +454,7 @@ def main():
         )
         print("api {} model {}".format(client.api_base, client.resolve_model()), flush=True)
 
+    apply_cameras(args)
     rng = np.random.default_rng(args.seed)
     env = make_env(args.image_size, args.seed, use_camera=True, camera_depths=True)
     image_size = camera_size(env)

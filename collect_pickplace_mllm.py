@@ -11,7 +11,29 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
 抓靠上的位置，move_down 的 offset_z 是相对物品中心的高度，顶面按碰撞网格算。
 四样都放时，先拿离其他物品最远的那样。
 
-    python collect_pickplace_mllm.py --env PickPlaceCan --episodes 50 --out data/mllm
+输入例子。每台相机一张 RGB，默认 frontview 加 backview，对应样本的 image、image_back 字段；
+指令开头的 <image> 每行一个，和图片一一对应，多张图时占位后面注明每张来自哪台相机；话术后面带 answer 各字段的说明：
+
+    <image>
+    <image>
+    第一张图是正面相机（frontview），第二张图是背面相机（backview）。把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，target_1 是要对准的点在正面相机图上的像素，target_1_back 是同一点在背面相机图上的像素；某台相机看不到那个点时对应字段写 "mask"，不要猜它的像素。
+
+单目只开 frontview，一个占位后面接话术和字段说明：
+
+    <image>
+    把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，target_1 是要对准的点在正面相机图上的像素。
+
+输出例子（易拉罐单独一个、还没抓住时，不带 yaw；物品中心就是要对准的点，不写两指落点。
+双目时每个空间字段各给两台相机的像素，某台相机看不到那个点时对应字段写 "mask"）：
+
+    {"subtasks": [{"type": "move_above", "desc": "移到易拉罐上方", "target_1": "[180 290]", "target_1_back": "mask", "target_kind": "object", "clearance": 0.12}, {"type": "move_down", "desc": "降到易拉罐处准备夹", "target_1": "[180 290]", "target_1_back": "mask", "target_kind": "object", "offset_z": 0.02}, {"type": "close_gripper", "desc": "合爪夹住易拉罐"}, {"type": "lift", "desc": "抬起易拉罐", "delta_z": 0.17, "target_1": "[180 290]", "target_1_back": "mask", "target_kind": "object"}, {"type": "move_above", "desc": "移到格子正上方", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "clearance": 0.22}, {"type": "move_down", "desc": "把易拉罐放进格子", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "offset_z": 0.1}, {"type": "open_gripper", "desc": "松爪放下易拉罐"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "clearance": 0.22}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+
+每条成功轨迹只存开局那一帧。左边箱子里的物品会换位置和朝向，
+右边格子里的半透明目标也会在格子内部挪开中心。中途画面不存。
+
+例如固定采易拉罐，凑满 50 条成功轨迹再停，图片和样本写到 data/mllm：
+
+python collect_pickplace_mllm.py --env PickPlaceCan --episodes 50 --out data/mllm
 """
 
 import argparse
@@ -19,10 +41,12 @@ import argparse
 import numpy as np
 
 from collect_common import add_common_args, body_yaw_deg, choose_yaws, is_grasping, run_collection, wrist_yaw
+from collect_lift_mllm import set_free_xyaw
 from task_plan import DEFAULT_CLEARANCE
 
 ENVS = ("PickPlace", "PickPlaceSingle", "PickPlaceMilk", "PickPlaceBread", "PickPlaceCereal", "PickPlaceCan")
 OBJECT_CN = {"Milk": "牛奶", "Bread": "面包", "Cereal": "麦片盒", "Can": "易拉罐"}
+# 先验知识：哪条边夹得下、指尖停多深、要抬过多高的箱壁。只决定末端到哪、朝哪，不解关节角。
 # 物品绕竖直轴的对称周期，度；None 表示圆柱，两指朝哪个方向合拢都行。
 YAW_PERIOD = {"Milk": 90.0, "Bread": 180.0, "Cereal": 180.0, "Can": None}
 # 两指能夹住的物品边长上限，米。夹爪最大张开约 8 厘米。
@@ -75,6 +99,73 @@ class PickPlaceTask:
     def env_kwargs(self):
         return {}
 
+    def _bin_center(self, env, index):
+        """右边箱子第 index 个格子的底面中心。和环境里 target_bin_placements 的算法一致。"""
+        bin_x = float(env.bin2_pos[0])
+        bin_y = float(env.bin2_pos[1])
+        if index == 0 or index == 2:
+            bin_x -= float(env.bin_size[0]) / 2.0
+        if index < 2:
+            bin_y -= float(env.bin_size[1]) / 2.0
+        bin_x += float(env.bin_size[0]) / 4.0
+        bin_y += float(env.bin_size[1]) / 4.0
+        return np.array([bin_x, bin_y, float(env.bin2_pos[2])])
+
+    def vary_initial(self, env, rng):
+        """物品在左箱里换位置，右箱格子里的目标影子离开格子中心。影子和标注用同一个点。"""
+        for name in self.active(env):
+            index = self._index(env, name)
+            center = self._bin_center(env, index)
+            center[0] += float(rng.uniform(-0.025, 0.025))
+            center[1] += float(rng.uniform(-0.03, 0.03))
+            env.target_bin_placements[index] = center
+            visual = env.obj_body_id["Visual" + name]
+            pos = np.array(env.sim.model.body_pos[visual], dtype=float)
+            pos[:2] = center[:2]
+            env.sim.model.body_pos[visual] = pos
+        names = self.active(env)
+        if len(names) == 1:
+            self._place_one(env, rng, names[0])
+        else:
+            self._shift_group(env, rng, names)
+
+    def _place_one(self, env, rng, name):
+        """单件物品放到左箱的九宫格之一，再随机转一个朝向。"""
+        bin1 = np.asarray(env.bin1_pos, dtype=float)
+        slot = np.array(
+            [
+                float(rng.choice([-0.07, 0.0, 0.07])),
+                float(rng.choice([-0.10, 0.0, 0.10])),
+            ]
+        )
+        slot += rng.uniform(-0.015, 0.015, size=2)
+        obj = env.objects[self._index(env, name)]
+        set_free_xyaw(env, obj, bin1[:2] + slot, yaw=float(rng.uniform(0.0, 2.0 * np.pi)))
+
+    def _shift_group(self, env, rng, names):
+        """多件物品保持彼此间距，整组挪到左箱的另一处，避免重新摆放时叠在一起。"""
+        bin1 = np.asarray(env.bin1_pos, dtype=float)
+        x_lim, y_lim = 0.125, 0.165
+        pts = []
+        for name in names:
+            obj = env.objects[self._index(env, name)]
+            qpos = np.array(env.sim.data.get_joint_qpos(obj.joints[0]), dtype=float)
+            pts.append(qpos[:2])
+        pts = np.stack(pts)
+        desired = bin1[:2] + np.array([rng.uniform(-0.05, 0.05), rng.uniform(-0.07, 0.07)])
+        shift = desired - pts.mean(axis=0)
+        low = bin1[:2] - np.array([x_lim, y_lim])
+        high = bin1[:2] + np.array([x_lim, y_lim])
+        shift_low = low - pts.min(axis=0)
+        shift_high = high - pts.max(axis=0)
+        for axis in (0, 1):
+            if shift_low[axis] <= shift_high[axis]:
+                shift[axis] = np.clip(shift[axis], shift_low[axis], shift_high[axis])
+            else:
+                shift[axis] = 0.0
+        for name, xy in zip(names, pts):
+            set_free_xyaw(env, env.objects[self._index(env, name)], xy + shift)
+
     def _index(self, env, name):
         return env.object_to_id[name.lower()]
 
@@ -96,6 +187,16 @@ class PickPlaceTask:
 
     def landmarks(self, env):
         return list(self.points(env).values())
+
+    def point_kind(self, name):
+        """物品中心走桌面上物体的量法，格子底面走箱格的量法。"""
+        return "bin" if name.endswith("_bin") else "object"
+
+    def point_body(self, env, name):
+        """遮挡判定：物品中心属于物品自己（命中它自己不算挡）；格子底面不豁免，箱壁挡住就是真被挡。"""
+        if name.endswith("_bin"):
+            return None
+        return env.obj_body_id[name]
 
     def record_points(self, env):
         return list(self.points(env).keys())
@@ -120,7 +221,8 @@ class PickPlaceTask:
         return self._extents[name]
 
     def grasp_yaw(self, env, name, points, neighbors):
-        """两指合拢方向尽量和最近的邻居方向垂直，免得手指碰到旁边的物品。
+        """先验知识，不是逆运动学：只给出目标 yaw，关节角留给后面的控制器。
+        两指合拢方向尽量和最近的邻居方向垂直，免得手指碰到旁边的物品。
         方的物品只能沿自身 x 或 y 合拢，而且那条边要夹得下；易拉罐是圆的，方向随意，没有邻居时不写 yaw。
         topdown yaw 为 0 时两指沿世界 y 合拢，所以 yaw 是合拢方向的角度减 90 度。"""
         near = None
@@ -144,6 +246,7 @@ class PickPlaceTask:
         return float(np.degrees(angle)) - 90.0
 
     def order(self, env):
+        """先验知识：先拿离其他物品最远的那样，给后面的抓取留出空隙。"""
         points = self.points(env)
         done = set(self.placed(env))
         left = [name for name in self.active(env) if name not in done]
@@ -172,22 +275,26 @@ class PickPlaceTask:
             rest = float(points[name][2]) - floor
             grasp = max(0.0, top - GRASP_DEPTH)
             carry_z = bin_z + WALL_HEIGHT + CARRY_MARGIN + grasp + rest
-            above = {"type": "move_above", "ref": name, "clearance": max(DEFAULT_CLEARANCE, top + 0.06), "obj": name}
+            label = OBJECT_CN[name]
+            above = {"type": "move_above", "ref": name, "clearance": max(DEFAULT_CLEARANCE, top + 0.06), "obj": name, "desc_hint": "移到{}上方".format(label)}
             if yaw is not None:
                 above["yaw"] = yaw
             target = name + "_bin"
             plan += [
                 above,
-                {"type": "move_down", "ref": name, "offset_z": grasp, "obj": name},
-                {"type": "close_gripper", "obj": name},
-                {"type": "lift", "ref": name, "goal_z": carry_z, "obj": name},
-                {"type": "move_above", "ref": target, "clearance": carry_z - bin_z, "obj": name},
-                {"type": "move_down", "ref": target, "offset_z": rest + grasp + DROP_HEIGHT, "obj": name},
-                {"type": "open_gripper", "obj": name},
-                {"type": "move_above", "ref": target, "clearance": carry_z - bin_z, "obj": name},
+                {"type": "move_down", "ref": name, "offset_z": grasp, "obj": name, "desc_hint": "降到{}处准备夹".format(label)},
+                {"type": "close_gripper", "obj": name, "desc_hint": "合爪夹住{}".format(label)},
+                {"type": "lift", "ref": name, "goal_z": carry_z, "obj": name, "desc_hint": "抬起{}过箱壁".format(label)},
+                {"type": "move_above", "ref": target, "clearance": carry_z - bin_z, "obj": name, "desc_hint": "移到格子正上方"},
+                {"type": "move_down", "ref": target, "offset_z": rest + grasp + DROP_HEIGHT, "obj": name, "desc_hint": "把{}放进格子".format(label)},
+                {"type": "open_gripper", "obj": name, "desc_hint": "松爪放下{}".format(label)},
+                {"type": "move_above", "ref": target, "clearance": carry_z - bin_z, "obj": name, "desc_hint": "向上抬开夹爪"},
             ]
-        plan.append({"type": "stabilize"})
+        plan.append({"type": "stabilize", "desc_hint": "停在原地保持稳定"})
         return plan
+
+    def step_desc(self, env, step):
+        return step.get("desc_hint")
 
     def holding(self, env, plan, index):
         """正在处理的物品，以及是不是已经抓在手里。"""

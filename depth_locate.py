@@ -6,11 +6,14 @@
 量出标注点所在的那个平面（多数是某个高度的水平面），再加上物体形状的常识
 （放在桌上的方块，中心在桌面和顶面中间），取视线和这个平面的交点。
 
-每个像素按它在计划里的角色定位，角色只看计划的结构（比如 lift 指向的是要抓的物体），
-不看真值：
+每个像素按角色定位。模型认得指的是哪类东西时，在计划里用 target_kind、held_kind、
+pivot_kind、path_kind 写明角色（取值就是 LOCATORS 的名字），优先按它选量法，
+depth_locate 不用按任务名硬编码；没写或写了不认识的类别时，退回按任务名和计划结构推断
+（比如 lift 指向的是要抓的物体）。不看真值：
 
 - object：放在桌面或箱底的物体中心。支撑面是附近最低的一层水平面，顶面取物体竖直上方
   那一小柱里的最高处，中心在两者中间
+- cube_center：方块的中心（Stack 里被叠的那块）。量法和 object 相同
 - bin：PickPlace 右箱格子底面的中心。底面被箱壁挡住看不到，量箱壁顶面再减去壁高
 - nut：平放在桌上的螺母，中心和把手上的抓取点一样高。桌面高度加螺母半厚
 - peg：柱顶中心。柱顶是像素附近最高的水平面
@@ -18,13 +21,38 @@
 - door_axis、door_handle：Door 的门锁转轴、铰链在门板中面上，把手抓取点在中面前方。
   门几乎侧对相机，水平面求交很不稳（高度差 1 毫米，水平位置差 5 毫米），改用竖直的门板平面。
   门板法向就是模型给的 approach（门锁转轴方向），沿法向投影后最密的一层点是门板朝相机的那面
+- grip：两指落点是一对，不按平面量，用 recover_landings 成对还原：
+  双目时每台相机用自己的深度还原它看得到的那个落点；单目（或落点在背面相机被 mask）时
+  朝后的落点被物体挡住，用落点附近点云沿两落点连线方向的远端估计深度。执行时取两点的中点
+
+每个标注点有两个视图：frontview（平视）和 backview（在 frontview 正对面）。
+模型在两个视图里各给一个像素，被遮挡的视图写 "mask"（解析成 None），定位只用看得到的视图。
+两个视图都有像素时，定位分两层：
+
+- 测量级融合（bin、nut、peg、table）：两个视图的邻域点云都反投影到世界坐标系合成一片，
+  在这片合并点云上量支撑面、顶面、中位数。单个视图被手臂等遮挡时，污染点是少数，
+  被多数派统计自动投出去。模型在两个视图里指的不是同一个点（视线最近距离超过 1 厘米）
+  时不合并，退回逐视图融合。
+- 决策级融合（object、door_axis、door_handle）：各视图独立定位再融合。
+  object 的顶面沿主视线窄柱搜索，柱内遮挡不会被多数派投出；门板是竖直平面。
+  两台相机平视对称，主视图统一是 frontview，分歧超过 3 厘米时
+  取 z 低的那一路（遮挡物都在桌面上方，被挡的视图量出来的点偏高）。
+
+视线求交用主视图的像素；主视图量不出来或被 mask 时用另一视图兜底。
+disagreement_m（两视图独立定位的距离）和 ray_gap_m（两条视线的距离）记进 info 作一致性校验。
 """
 
 import numpy as np
 from robosuite.utils.camera_utils import get_real_depth_map
 
-from collect_lift_mllm import DEFAULT_CAMERA, unproject_pixel
-from task_plan import ParseError, plausible
+from collect_lift_mllm import (
+    BACK_CAMERA,
+    CAMERAS,
+    DEFAULT_CAMERA,
+    project_world,
+    unproject_pixel,
+)
+from task_plan import ParseError, plausible, topdown_ori
 
 UP = np.array([0.0, 0.0, 1.0])
 # 圈的半径按 512 边长定，单位像素，其他边长按比例缩放。
@@ -54,10 +82,16 @@ PANEL_HALF_THICKNESS = 0.02
 HANDLE_OFFSET = 0.085
 
 
-def real_depth(env, obs):
-    raw = np.asarray(obs[DEFAULT_CAMERA + "_depth"], dtype=float)
+def real_depth(env, obs, camera=DEFAULT_CAMERA):
+    """指定相机的深度图，米。默认 frontview。"""
+    raw = np.asarray(obs[camera + "_depth"], dtype=float)
     depth = np.asarray(get_real_depth_map(env.sim, raw), dtype=float)
     return depth.reshape(depth.shape[0], depth.shape[1])
+
+
+def make_views(env, obs, matrices, cameras=CAMERAS):
+    """{相机名: (深度图, 世界到像素矩阵)}，locate_plan / relocate 的输入。"""
+    return {name: (real_depth(env, obs, name), matrices[name]) for name in cameras if name in matrices}
 
 
 def backproject_disk(depth, matrix, pixel, radius):
@@ -130,14 +164,16 @@ def densest_layer(values):
     return float(np.median(values[start : ends[start]]))
 
 
-def locate_object(pixel, depth, matrix, image_size, _params):
+def locate_object(pixel, disk, matrix, image_size, _params):
     """中心高度 h 要自洽：视线在高度 h 处的那一柱里，顶面 top 满足 h = (support + top) / 2。
     从像素处可见表面的高度往低扫，取第一个自洽的 h。更低的 h 在视线上更远，那里的柱子常常
-    落在物体后面的别的东西上；物体本身是视线先碰到的那个。"""
-    points = backproject_disk(depth, matrix, pixel, _radius(SUPPORT_RADIUS, image_size))
+    落在物体后面的别的东西上；物体本身是视线先碰到的那个。
+
+    disk(radius) 取像素周围的点云（多视图时已合并）；disk(1, merged=False) 只取主视线那一路。"""
+    points = disk(_radius(SUPPORT_RADIUS, image_size))
     support = lowest_surface(points)
     above = points[(points[:, 2] > support + MIN_HEIGHT) & (points[:, 2] < support + MAX_HEIGHT)]
-    visible_z = float(np.median(backproject_disk(depth, matrix, pixel, 1)[:, 2]))
+    visible_z = float(np.median(disk(1, merged=False)[:, 2]))
     highest = min(support + 0.5 * MAX_HEIGHT, visible_z + VISIBLE_TOLERANCE)
     best = None
     for center_z in np.arange(highest, support + 0.5 * MIN_HEIGHT, -SCAN_STEP):
@@ -159,33 +195,33 @@ def locate_object(pixel, depth, matrix, image_size, _params):
     return UP, 0.5 * (support + top), {"support_z": round(support, 4), "top_z": round(top, 4)}
 
 
-def locate_bin(pixel, depth, matrix, image_size, _params):
-    points = backproject_disk(depth, matrix, pixel, _radius(SUPPORT_RADIUS, image_size))
+def locate_bin(pixel, disk, matrix, image_size, _params):
+    points = disk(_radius(SUPPORT_RADIUS, image_size))
     support = lowest_surface(points)
     rims = points[(points[:, 2] > support) & (points[:, 2] < support + 2.0 * BIN_WALL_HEIGHT)]
     rim = float(np.percentile(rims[:, 2], TOP_PERCENTILE)) if len(rims) else support
     return UP, rim - BIN_WALL_HEIGHT, {"rim_z": round(rim, 4)}
 
 
-def locate_nut(pixel, depth, matrix, image_size, _params):
-    points = backproject_disk(depth, matrix, pixel, _radius(SUPPORT_RADIUS, image_size))
+def locate_nut(pixel, disk, matrix, image_size, _params):
+    points = disk(_radius(SUPPORT_RADIUS, image_size))
     support = lowest_surface(points)
     return UP, support + NUT_HALF_THICKNESS, {"support_z": round(support, 4)}
 
 
-def locate_peg(pixel, depth, matrix, image_size, _params):
-    points = backproject_disk(depth, matrix, pixel, _radius(LOCAL_RADIUS, image_size) // 2)
+def locate_peg(pixel, disk, matrix, image_size, _params):
+    points = disk(_radius(LOCAL_RADIUS, image_size) // 2)
     top = float(np.percentile(points[:, 2], TOP_PERCENTILE))
     return UP, top, {"top_z": round(top, 4)}
 
 
-def locate_table(pixel, depth, matrix, image_size, _params):
-    points = backproject_disk(depth, matrix, pixel, _radius(LOCAL_RADIUS, image_size))
+def locate_table(pixel, disk, matrix, image_size, _params):
+    points = disk(_radius(LOCAL_RADIUS, image_size))
     table = float(np.median(points[:, 2]))
     return UP, table, {"table_z": round(table, 4)}
 
 
-def _door_plane(pixel, depth, matrix, image_size, params, offset):
+def _door_plane(pixel, disk, matrix, image_size, params, offset):
     """门板朝相机那面是附近沿法向投影后最密的一层；中面再往里半个板厚，offset 是相对中面朝相机一侧的距离。"""
     normal = params.get("normal")
     if normal is None:
@@ -193,23 +229,25 @@ def _door_plane(pixel, depth, matrix, image_size, params, offset):
     normal = np.asarray(normal, dtype=float)
     normal = normal - float(np.dot(normal, UP)) * UP
     normal = normal / np.linalg.norm(normal)
-    points = backproject_disk(depth, matrix, pixel, _radius(DOOR_RADIUS, image_size))
+    points = disk(_radius(DOOR_RADIUS, image_size))
     face = densest_layer(points @ normal)
     toward = 1.0 if float(np.dot(normal, camera_center(matrix))) > face else -1.0
     middle = face - toward * PANEL_HALF_THICKNESS
     return normal, middle + toward * offset, {"face": round(face, 4)}
 
 
-def locate_door_axis(pixel, depth, matrix, image_size, params):
-    return _door_plane(pixel, depth, matrix, image_size, params, 0.0)
+def locate_door_axis(pixel, disk, matrix, image_size, params):
+    return _door_plane(pixel, disk, matrix, image_size, params, 0.0)
 
 
-def locate_door_handle(pixel, depth, matrix, image_size, params):
-    return _door_plane(pixel, depth, matrix, image_size, params, HANDLE_OFFSET)
+def locate_door_handle(pixel, disk, matrix, image_size, params):
+    return _door_plane(pixel, disk, matrix, image_size, params, HANDLE_OFFSET)
 
 
+# 每个角色一种量法。模型在计划里写的 *_kind 类别，取值就是这里的名字。
 LOCATORS = {
     "object": locate_object,
+    "cube_center": locate_object,
     "bin": locate_bin,
     "nut": locate_nut,
     "peg": locate_peg,
@@ -218,15 +256,277 @@ LOCATORS = {
     "door_handle": locate_door_handle,
 }
 
+# 两指落点对的合理宽度，米。太近是两个像素指到了同一个点，太远是有一个指飞了。
+PAIR_MIN_WIDTH = 0.015
+PAIR_MAX_WIDTH = 0.08
+# 单目恢复背面落点时，落点附近点云的取样半径，按 512 边长定，单位像素。
+PAIR_RADIUS = 36
+# 朝后落点深度估计失败时，退回朝前落点沿 axis 再往回这么多，米。
+PAIR_FALLBACK = 0.04
+
+
+def depth_median(depth, pixel, radius=4):
+    """像素附近一圈深度的中位数，米。躲开单个像素打到缝上或背景上。"""
+    depth = np.asarray(depth, dtype=float)
+    height, width = depth.shape
+    u, v = int(np.rint(pixel[0])), int(np.rint(pixel[1]))
+    if not (0 <= u < width and 0 <= v < height):
+        raise ParseError("像素不在画面里：[{:.0f} {:.0f}]".format(pixel[0], pixel[1]))
+    patch = depth[max(0, v - radius) : v + radius + 1, max(0, u - radius) : u + radius + 1]
+    valid = patch[np.isfinite(patch) & (patch > 0.05) & (patch < 4.0)]
+    if len(valid) == 0:
+        raise ParseError("像素附近没有深度")
+    return float(np.median(valid))
+
+
+def surface_point(pixel, depth, matrix, radius=4):
+    """像素配上附近的深度，得到视线碰到的那个表面点。"""
+    world = unproject_pixel(pixel, depth_median(depth, pixel, radius), matrix)
+    if not plausible(world):
+        raise ParseError("反投影超出工作空间：{}".format(np.round(world, 4).tolist()))
+    return world
+
+
+def landing_pair_ok(front, back):
+    """两个落点的水平间距是否在一个物体的宽度范围内。"""
+    delta = np.asarray(back, dtype=float) - np.asarray(front, dtype=float)
+    delta[2] = 0.0
+    width = float(np.linalg.norm(delta))
+    return PAIR_MIN_WIDTH <= width <= PAIR_MAX_WIDTH
+
+
+def grip_axis(step):
+    """两落点的连线方向，世界系。带 yaw 的步骤按执行时的朝向算
+    （夹爪竖直朝下时两指合拢方向就是朝向矩阵第一列），不带 yaw 的默认世界 x 轴。"""
+    yaw = step.get("yaw")
+    if yaw is None:
+        return np.array([1.0, 0.0, 0.0])
+    ori = np.asarray(topdown_ori(float(yaw)), dtype=float)
+    return ori[:, 0] / float(np.linalg.norm(ori[:, 0]))
+
+
+def recover_landings(pixels, views, image_size, axis=None):
+    """两个落点像素换成世界坐标，返回 (朝前的点, 朝后的点, 记录)。
+
+    pixels 里 front 是朝前落点的 frontview 像素（被 mask 时 front_back 是它在 backview 的像素）；
+    back 是朝后落点的 backview 像素（双目且这台相机看得到）；
+    same 是朝后落点在 frontview 的像素（backview 被 mask 或单目，挡住也照写）。
+    双目：每台相机用自己的深度还原它看得到的那个落点。
+    same 分支：朝前的落点直接读深度；朝后的那个被物体挡住，视线先打到正面，
+    改用落点附近点云里物体顶面沿 axis 的远端当作背面的深度。
+    axis 是两落点的连线方向（世界系，默认世界 x 轴，lift 的合拢方向），
+    方向不限：same 分支会把它规范成指向相机（back 比 front 远离相机，
+    在 axis 的负侧），调用方给执行朝向的第一列也不怕符号反。
+    """
+    if axis is None:
+        axis = np.array([1.0, 0.0, 0.0])
+    axis = np.asarray(axis, dtype=float).reshape(3)
+    front_px = pixels.get("front")
+    front_cam = DEFAULT_CAMERA
+    if front_px is None:
+        front_px = pixels.get("front_back")
+        front_cam = BACK_CAMERA
+    if front_px is None or front_cam not in views:
+        raise ParseError("朝前落点在所有视图都被 mask")
+    front_depth, front_matrix = views[front_cam]
+    front = surface_point(front_px, front_depth, front_matrix)
+    back_px = pixels.get("back")
+    if back_px is not None and BACK_CAMERA in views:
+        back = surface_point(back_px, *views[BACK_CAMERA])
+        return front, back, {"mode": "stereo"}
+    same = pixels.get("same")
+    if same is None:
+        raise ParseError("缺少第二个落点")
+    # same 像素指向背落点：两个像素各自的视线和同一水平面（front 的高度）的交点差
+    # 就是 front 指向 back 的水平方向。axis 规范成指向相机（back 比 front 远离相机，
+    # 在 axis 的负侧），调用方给执行朝向的第一列也不怕符号反。
+    same_depth, same_matrix = views[DEFAULT_CAMERA]
+    p_front = ray_at_height(front_px, float(front[2]), front_matrix)
+    p_same = ray_at_height(np.asarray(same, dtype=float), float(front[2]), same_matrix)
+    delta = p_same - p_front
+    if float(np.linalg.norm(delta)) > 1e-6 and float(axis @ delta) > 0.0:
+        axis = -axis
+    radius = max(8, int(round(PAIR_RADIUS * float(image_size) / 512.0)))
+    disk = backproject_disk(front_depth, front_matrix, front_px, radius)
+    top = disk[(disk[:, 2] > front[2] + 0.008) & (disk[:, 2] < front[2] + 0.045)]
+    if len(top) >= 8:
+        s_back = float(np.percentile(top @ axis, 10))
+    else:
+        s_back = float(front @ axis - PAIR_FALLBACK)
+    try:
+        back = ray_at_plane(same, axis, s_back, same_matrix)
+    except ValueError:
+        back = None
+    if back is None or not plausible(back) or not landing_pair_ok(front, back):
+        back = front - axis * PAIR_FALLBACK
+    if not landing_pair_ok(front, back):
+        back = np.array([front[0] - PAIR_FALLBACK, front[1], front[2]], dtype=float)
+    return front, back, {"mode": "mono", "s_back": round(float(s_back), 4)}
+
 
 def locate(role, pixel, depth, matrix, image_size, params=None):
-    """按角色量出标注点所在的平面，返回视线和它的交点，以及量测记录。"""
+    """单视图定位：按角色量出标注点所在的平面，返回视线和它的交点，以及量测记录。"""
     pixel = np.asarray(pixel, dtype=float)
-    normal, offset, info = LOCATORS[role](pixel, depth, matrix, image_size, params or {})
+
+    def disk(radius, merged=True):
+        return backproject_disk(depth, matrix, pixel, radius)
+
+    normal, offset, info = LOCATORS[role](pixel, disk, matrix, image_size, params or {})
     world = ray_at_plane(pixel, normal, offset, matrix)
     if not plausible(world):
         raise ParseError("反投影超出工作空间：{}".format(np.round(world, 4).tolist()))
     return world, dict(info, role=role)
+
+
+def locate_merged(role, pixels, views, image_size, params=None):
+    """测量级融合：各视图像素周围的点云都反投影到世界坐标系、合成一片，在这上面量平面。
+
+    单个视图被手臂等遮挡时，它的污染点在合并点云里是少数，被 lowest_surface / 中位数
+    这类多数派统计自动投出去，不用事后的分歧规则兜底。视线求交用主视图的像素
+    （没有主视图像素就用仅有的那路）。返回 (world, info)。
+    """
+    usable = {camera: np.asarray(pixels[camera], dtype=float) for camera in views if pixels.get(camera) is not None}
+    if not usable:
+        raise ParseError("模型没给出任何视图的像素")
+    primary = primary_camera(role)
+    ray_cam = primary if primary in usable else sorted(usable)[0]
+    ray_pixel = usable[ray_cam]
+    ray_depth, ray_matrix = views[ray_cam]
+
+    def disk(radius, merged=True):
+        if not merged or len(usable) == 1:
+            return backproject_disk(ray_depth, ray_matrix, ray_pixel, radius)
+        clouds = [backproject_disk(views[cam][0], views[cam][1], pixel, radius) for cam, pixel in usable.items()]
+        return np.concatenate(clouds)
+
+    normal, offset, info = LOCATORS[role](ray_pixel, disk, ray_matrix, image_size, params or {})
+    world = ray_at_plane(ray_pixel, normal, offset, ray_matrix)
+    if not plausible(world):
+        raise ParseError("反投影超出工作空间：{}".format(np.round(world, 4).tolist()))
+    tag = "+".join(sorted(usable)) if len(usable) > 1 else ray_cam
+    return world, dict(info, role=role, view=tag)
+
+
+def _ray(pixel, matrix):
+    near = unproject_pixel(pixel, 0.5, matrix)
+    far = unproject_pixel(pixel, 3.0, matrix)
+    return near, far - near
+
+
+def ray_gap(pixels, views):
+    """两个视图像素对应的视线的最近距离，米。大说明模型在两个视图里指的不是同一个点。"""
+    usable = [(pixels[cam], views[cam][1]) for cam in sorted(views) if pixels.get(cam) is not None]
+    if len(usable) < 2:
+        return None
+    (p1, d1), (p2, d2) = [_ray(pixel, matrix) for pixel, matrix in usable[:2]]
+    w0 = p1 - p2
+    a, b, c = float(np.dot(d1, d1)), float(np.dot(d1, d2)), float(np.dot(d2, d2))
+    d, e = float(np.dot(d1, w0)), float(np.dot(d2, w0))
+    denom = a * c - b * b
+    if denom < 1e-12:
+        return None
+    s = (b * e - c * d) / denom
+    t = (a * e - b * d) / denom
+    return float(np.linalg.norm((p1 + s * d1) - (p2 + t * d2)))
+
+
+# 门板是竖直平面，侧向的视线接近和门板平行，求交很不稳；这两个角色不做测量级融合，
+# 各视图独立定位再融合（见 measure_views）。
+FRONT_PRIMARY_ROLES = ("door_axis", "door_handle")
+# 两个视图的分歧超过这个距离，说明至少一路被污染（手臂、箱壁挡在标注点上方），
+# 污染都把估计往高拉，取 z 低的那个。
+DISAGREE_TOL = 0.03
+# 这些角色的平面量测是对整片邻域点云的多数派统计（最低层、中位数、分位数），
+# 两个视图的点云合并后，单视图里的遮挡点被投出去，可以做测量级融合。
+# object 的顶面沿主视线的窄柱搜索，柱内遮挡不会被投出，仍走逐视图融合；门板见上。
+MERGED_ROLES = ("bin", "nut", "peg", "table")
+# 两条视线的最近距离超过这个值，说明模型在两个视图里指的不是同一个点，不合并点云。
+RAY_CONSISTENCY_TOL = 0.01
+
+
+def primary_camera(role):
+    """主视图统一是 frontview：backview 在它正对面，两台相机平视对称，没有谁量水平面更稳。
+    主视图被 mask 或量不出来时，调用方（fuse_estimates / locate_merged）自动退到另一路。"""
+    return DEFAULT_CAMERA
+
+
+def fuse_estimates(role, estimates):
+    """estimates 是 {相机名: (world, info)}。取主视图的结果，另一视图做校验和兜底。
+
+    返回 (world, info)；info 里 view 是实际用的相机，有两个视图时带另一视图的
+    world 和两者的距离 disagreement_m（跨视图一致性，大说明至少一路定位不可靠）。
+    分歧超过 DISAGREE_TOL 时改用 z 低的一路：遮挡物都在桌面上方，被挡的视图量偏高。
+    """
+    if not estimates:
+        raise ParseError("没有可用的定位结果")
+    primary = primary_camera(role)
+    used = primary if primary in estimates else sorted(estimates)[0]
+    if len(estimates) >= 2:
+        worlds = {camera: np.asarray(item[0], dtype=float) for camera, item in estimates.items()}
+        dist = float(np.linalg.norm(worlds[used] - next(w for cam, w in worlds.items() if cam != used)))
+        if dist > DISAGREE_TOL:
+            used = min(worlds, key=lambda camera: worlds[camera][2])
+    world, info = estimates[used]
+    info = dict(info, view=used)
+    for camera in sorted(estimates):
+        if camera == used:
+            continue
+        other_world = np.asarray(estimates[camera][0], dtype=float)
+        info["other_view"] = camera
+        info["other_world"] = [round(float(value), 4) for value in other_world]
+        info["disagreement_m"] = round(float(np.linalg.norm(np.asarray(world) - other_world)), 4)
+    return world, info
+
+
+def measure_views(role, pixels, views, image_size, params=None):
+    """同一个标注点的多视图定位。pixels 是 {相机名: 像素，可以 None}。
+
+    只有一个视图：直接单视图定位。门板角色：各视图独立定位再融合（主视图 frontview）。
+    MERGED_ROLES：两条视线一致（ray_gap 小）时合并两路点云做测量级融合，
+    模型指点不一致或合并失败时退回逐视图估计再融合。
+    """
+    usable = {camera: pixels.get(camera) for camera in views if pixels.get(camera) is not None}
+    if not usable:
+        raise ParseError("模型没给出任何视图的像素")
+    if len(usable) == 1:
+        camera = next(iter(usable))
+        depth, matrix = views[camera]
+        world, info = locate(role, usable[camera], depth, matrix, image_size, params)
+        return world, dict(info, view=camera)
+    estimates = {}
+    errors = {}
+    for camera in sorted(usable):
+        depth, matrix = views[camera]
+        try:
+            estimates[camera] = locate(role, usable[camera], depth, matrix, image_size, params)
+        except ValueError as exc:
+            errors[camera] = str(exc)
+    if role in FRONT_PRIMARY_ROLES:
+        if not estimates:
+            raise ParseError("各视图都定位失败：{}".format(errors))
+        return fuse_estimates(role, estimates)
+    gap = ray_gap(pixels, views)
+    merged_error = None
+    if role in MERGED_ROLES and (gap is None or gap <= RAY_CONSISTENCY_TOL):
+        try:
+            world, info = locate_merged(role, pixels, views, image_size, params)
+        except ValueError as exc:
+            merged_error = str(exc)
+        else:
+            if gap is not None:
+                info["ray_gap_m"] = round(gap, 4)
+            if len(estimates) >= 2:
+                cams = sorted(estimates)
+                info["disagreement_m"] = round(
+                    float(np.linalg.norm(np.asarray(estimates[cams[0]][0]) - np.asarray(estimates[cams[1]][0]))), 4
+                )
+            return world, info
+    if estimates:
+        world, info = fuse_estimates(role, estimates)
+        if gap is not None:
+            info["ray_gap_m"] = round(gap, 4)
+        return world, info
+    raise ParseError("各视图都定位失败：{}；合并：{}".format(errors, merged_error or "视线不一致，未合并"))
 
 
 def _role(task_name, pick, kind):
@@ -242,16 +542,58 @@ def _role(task_name, pick, kind):
     return "object"
 
 
-def step_roles(task_name, subtasks):
-    """每一步里各个像素的角色，和 subtasks 对齐，形如 {"pixel": "object", "held": "nut"}。
+def _step_roles_full(task_name, subtasks):
+    """每一步里各个像素的 (角色, 记录)，和 subtasks 对齐，形如 {"pixel": ("object", {"kind": ...})}。
 
+    模型在步骤里标注了指的是哪类东西（解析成 pixel_kind、held_kind、pivot_kind、path_kind，
+    取值就是 LOCATORS 的角色名）时优先按标注选量法，depth_locate 不用按任务名硬编码；
+    没标注或标注不认识时退回按任务名和计划结构的推断（_role）。结构推断只看步骤顺序：
     合爪之前指向的是要抓的东西；合爪之后到松爪之前指向放置目标，held 仍是手里的东西；
-    lift 指的是正抓着的那个东西。只看步骤顺序，不看真值，也不靠像素远近判断：
+    lift 指的是正抓着的那个东西。不看真值，也不靠像素远近判断：
     螺母中心和柱顶在画面里可能只差一两个像素。
+
+    同一个点在多步里重复出现时沿用第一次定的角色，免得模型前后标注不一致时
+    同一点量出两个世界坐标；此时记录里 role_reused 是实际沿用的角色。
+    记录 kind 是模型标注的原文，plan_role 是标注和结构推断不一致时推断的角色，
+    unknown_kind 表示标注的不是 LOCATORS 里的角色（这一步仍按结构推断）。
+    带 pixel_2（target_2）的步骤是两指落点，成对定位，角色记 grip，去重键带上两个像素。
     """
     out = []
     carrying = False
     placed = []
+    seen = {}
+
+    def apply(step, key, structural):
+        kind = step.get(key + "_kind")
+        role, extra = structural, {}
+        if kind is not None:
+            extra["kind"] = kind
+            if kind in LOCATORS:
+                role = kind
+                if kind != structural:
+                    extra["plan_role"] = structural
+            else:
+                extra["unknown_kind"] = True
+        if "pixel_2" in step and key == "pixel":
+            # target_1、target_2 是一对两指落点，不是单点平面量法；
+            # 模型标了别的类别也按落点对处理。落点在某台相机被 mask 时那个字段是 None。
+            role = "grip"
+            extra["pair"] = True
+        if key in ("pixel", "held"):
+            pixels = _view_pixels(step, key)
+            if role == "grip" and "pixel_2" in step:
+                for name in ("pixel_2", "pixel_2_back"):
+                    if step.get(name) is not None:
+                        pixels[name] = np.asarray(step[name], dtype=float)
+            pk = _pixel_key(pixels)
+            if pk in seen:
+                if seen[pk] != role:
+                    extra["role_reused"] = seen[pk]
+                    role = seen[pk]
+            else:
+                seen[pk] = role
+        return role, extra
+
     for step in subtasks:
         kind = step["type"]
         roles = {}
@@ -261,26 +603,90 @@ def step_roles(task_name, subtasks):
             carrying = False
         elif kind in ("move_above", "move_down", "reach"):
             # 松爪后退开的那一步还指着刚放下的位置
-            place = carrying or any(np.allclose(step["pixel"], other) for other in placed)
+            place = carrying or any(
+                _pixel_match(step.get("pixel"), step.get("pixel_back"), other, other_back)
+                for other, other_back in placed
+            )
             if place:
-                placed.append(np.asarray(step["pixel"], dtype=float))
-            roles["pixel"] = _role(task_name, not place, kind)
+                placed.append((step.get("pixel"), step.get("pixel_back")))
+            roles["pixel"] = apply(step, "pixel", _role(task_name, not place, kind))
             if "held" in step:
-                roles["held"] = _role(task_name, True, kind)
+                roles["held"] = apply(step, "held", _role(task_name, True, kind))
         elif kind == "lift":
-            roles["pixel"] = _role(task_name, True, kind)
+            roles["pixel"] = apply(step, "pixel", _role(task_name, True, kind))
         elif kind == "turn":
-            roles["pivot"] = _role(task_name, True, kind)
+            roles["pivot"] = apply(step, "pivot", _role(task_name, True, kind))
         elif kind == "wipe":
-            roles["path"] = _role(task_name, True, kind)
+            roles["path"] = apply(step, "path", _role(task_name, True, kind))
         out.append(roles)
     return out
 
 
-def locate_plan(task_name, subtasks, depth, matrix, image_size):
+def step_roles(task_name, subtasks):
+    """每一步里各个像素的角色，和 subtasks 对齐，形如 {"pixel": "object", "held": "nut"}。"""
+    return [{key: role for key, (role, _extra) in roles.items()} for roles in _step_roles_full(task_name, subtasks)]
+
+
+def _pixel_match(front_a, back_a, front_b, back_b):
+    """两个标注是否指同一个点：任一共同可见的视图里像素一致。被 mask（None）的视图不参与；
+    没有共同可见的视图时按不是同一个点。"""
+    for left, right in ((front_a, front_b), (back_a, back_b)):
+        if left is not None and right is not None:
+            return bool(np.allclose(np.asarray(left, dtype=float), np.asarray(right, dtype=float)))
+    return False
+
+
+def _view_pixels(step, key):
+    """这一步 key 字段在各视图里的像素。被 mask 的视图是 None，不放进返回字典；
+    单目没有 *_back 字段。解析保证了至少有一个视图可见。"""
+    pixels = {}
+    if step.get(key) is not None:
+        pixels[DEFAULT_CAMERA] = np.asarray(step[key], dtype=float)
+    pixel_back = step.get(key + "_back")
+    if pixel_back is not None:
+        pixels[BACK_CAMERA] = np.asarray(pixel_back, dtype=float)
+    return pixels
+
+
+def _pixel_key(pixels):
+    return tuple(sorted((camera, tuple(np.round(pixel, 3))) for camera, pixel in pixels.items()))
+
+
+def _dedupe_key(role, pixels):
+    return (role, _pixel_key(pixels))
+
+
+def grip_pixels(step, views):
+    """落点对在各相机的像素。front 是朝前落点（target_1）的 frontview 像素，
+    被 mask 时 front_back 是它在 backview 的像素（target_1_back）。双目时朝后落点（target_2）
+    优先用 backview 像素（target_2_back），被 mask 时用它在 frontview 的像素（same）；
+    单目 same 就是 target_2（挡住也照写）。"""
+    pixels = {}
+    if step.get("pixel") is not None:
+        pixels["front"] = np.asarray(step["pixel"], dtype=float)
+    elif step.get("pixel_back") is not None:
+        pixels["front_back"] = np.asarray(step["pixel_back"], dtype=float)
+    if BACK_CAMERA in views and step.get("pixel_2_back") is not None:
+        pixels["back"] = np.asarray(step["pixel_2_back"], dtype=float)
+    elif step.get("pixel_2") is not None:
+        pixels["same"] = np.asarray(step["pixel_2"], dtype=float)
+    return pixels
+
+
+def _pair_axis(axis, step):
+    """落点对的连线方向：调用方给了就用调用方的（stack 的合拢轴随开局朝向变），
+    否则带 yaw 的步骤按 yaw 算（nut 抓把手），都不带用世界 x 轴。"""
+    return axis if axis is not None else grip_axis(step)
+
+
+def locate_plan(task_name, subtasks, views, image_size, axis=None):
     """给计划里每一步填上 step["world"]（各像素量出来的世界坐标），execute_plan 直接用。
 
-    返回定位过的点 [{"pixel", "role", "world", "info"}]，同一像素同一角色只量一次，给统计用。
+    views 是 {相机名: (深度图, 世界到像素矩阵)}，每个标注点在有的视图里各自定位再融合。
+    带 pixel_2 的步骤是两指落点，按 grip 成对还原，同时填 world 的 pixel 和 pixel_2；
+    axis 是落点对连线方向，None 时按步骤的 yaw 算，都没有用世界 x 轴。
+    返回定位过的点 [{"pixel", "pixel_back", "role", "world", "info"}]，同一点只量一次，给统计用；
+    落点对多 world_2 和 pixel_2、pixel_2_back。被 mask 的视图字段是 None。
     Door 的门板法向取计划里第一个 reach 的 approach。
     """
     params = {}
@@ -289,28 +695,86 @@ def locate_plan(task_name, subtasks, depth, matrix, image_size):
             params["normal"] = np.asarray(step["approach"], dtype=float)
             break
     points = []
+    seen = {}
 
-    def measure(pixel, role):
-        pixel = np.asarray(pixel, dtype=float)
-        for point in points:
-            if point["role"] == role and np.allclose(point["pixel"], pixel):
-                return point["world"]
-        world, info = locate(role, pixel, depth, matrix, image_size, params)
-        points.append({"pixel": pixel, "role": role, "world": world, "info": info})
+    def measure(pixels, role, extra=None):
+        key = _dedupe_key(role, pixels)
+        if key in seen:
+            return seen[key]
+        world, info = measure_views(role, pixels, views, image_size, params)
+        if extra:
+            info.update(extra)
+        seen[key] = world
+        points.append(
+            {
+                "pixel": pixels.get(DEFAULT_CAMERA),
+                "pixel_back": pixels.get(BACK_CAMERA),
+                "role": role,
+                "world": world,
+                "info": info,
+            }
+        )
         return world
 
-    for step, roles in zip(subtasks, step_roles(task_name, subtasks)):
+    for step, roles in zip(subtasks, _step_roles_full(task_name, subtasks)):
         world = {}
-        for key, role in roles.items():
+        for key, (role, extra) in roles.items():
             if key == "path":
-                world[key] = [measure(pixel, role) for pixel in step["path"]]
+                front_path = step["path"]
+                back_path = step.get("path_back") or [None] * len(front_path)
+                world[key] = [
+                    measure(
+                        {
+                            camera: pixel
+                            for camera, pixel in (
+                                (DEFAULT_CAMERA, front),
+                                (BACK_CAMERA, back),
+                            )
+                            if pixel is not None
+                        },
+                        role,
+                        extra,
+                    )
+                    for front, back in zip(front_path, back_path)
+                ]
+            elif role == "grip" and key == "pixel":
+                pixels = grip_pixels(step, views)
+                key_pair = _dedupe_key(role, pixels)
+                if key_pair in seen:
+                    first, second = seen[key_pair]
+                else:
+                    first, second, info = recover_landings(pixels, views, image_size, _pair_axis(axis, step))
+                    if extra:
+                        info.update(extra)
+                    seen[key_pair] = (first, second)
+                    # 两落点的中点是物体中心，统计误差用它配真值；执行照样用两落点。
+                    center = 0.5 * (first + second)
+                    points.append(
+                        {
+                            "pixel": pixels.get("front", pixels.get("front_back")),
+                            "pixel_back": step.get("pixel_back"),
+                            "pixel_2": pixels.get("back", pixels.get("same")),
+                            "pixel_2_back": step.get("pixel_2_back"),
+                            "role": role,
+                            "world": first,
+                            "world_2": second,
+                            "center_world": center,
+                            "center_pixel": project_world(center, views[DEFAULT_CAMERA][1])[0],
+                            "center_pixel_back": project_world(center, views[BACK_CAMERA][1])[0]
+                            if BACK_CAMERA in views
+                            else None,
+                            "info": info,
+                        }
+                    )
+                world["pixel"] = first
+                world["pixel_2"] = second
             else:
-                world[key] = measure(step[key], role)
+                world[key] = measure(_view_pixels(step, key), role, extra)
         step["world"] = world
     return points
 
 
-MOVABLE = ("object", "nut")
+MOVABLE = ("object", "nut", "grip")
 
 
 def pick_starts(task_name, subtasks):
@@ -329,21 +793,66 @@ def pick_starts(task_name, subtasks):
     return starts
 
 
-def relocate(task_name, subtasks, start, depth, matrix, image_size):
+def relocate(task_name, subtasks, start, views, image_size, axis=None):
     """抓下一个物体前用当前这一帧的深度重新量它：开局时挡在它前面的东西可能已经搬走了。
 
     只更新从 start 起指向这个物体的 pixel / held；箱子、柱子还用开局量的，
-    这时夹爪可能正悬在它们上方。量不出来就保留原值。返回新的量测记录或 None。
+    这时夹爪可能正悬在它们上方。两指落点（grip）成对重测。
+    量不出来就保留原值。返回新的量测记录或 None。
     """
     roles = step_roles(task_name, subtasks)
-    pixel = np.asarray(subtasks[start]["pixel"], dtype=float)
     role = roles[start]["pixel"]
+    start_step = subtasks[start]
+    if role == "grip":
+        pixels = grip_pixels(start_step, views)
+        try:
+            first, second, info = recover_landings(pixels, views, image_size, _pair_axis(axis, start_step))
+        except ValueError:
+            return None
+        for step, step_role in zip(subtasks[start:], roles[start:]):
+            if step_role.get("pixel") != "grip":
+                continue
+            same_first = _pixel_match(
+                step.get("pixel"), step.get("pixel_back"), start_step.get("pixel"), start_step.get("pixel_back")
+            )
+            same_second = _pixel_match(
+                step.get("pixel_2"), step.get("pixel_2_back"),
+                start_step.get("pixel_2"), start_step.get("pixel_2_back"),
+            )
+            if same_first and same_second:
+                step["world"]["pixel"] = first
+                step["world"]["pixel_2"] = second
+        center = 0.5 * (first + second)
+        return {
+            "pixel": pixels.get("front", pixels.get("front_back")),
+            "pixel_back": start_step.get("pixel_back"),
+            "role": role,
+            "world": first,
+            "world_2": second,
+            "center_world": center,
+            "center_pixel": project_world(center, views[DEFAULT_CAMERA][1])[0],
+            "center_pixel_back": project_world(center, views[BACK_CAMERA][1])[0]
+            if BACK_CAMERA in views
+            else None,
+            "info": info,
+        }
+    pixels = _view_pixels(start_step, "pixel")
     try:
-        world, info = locate(role, pixel, depth, matrix, image_size)
+        world, info = measure_views(role, pixels, views, image_size)
     except ValueError:
         return None
     for step, step_role in zip(subtasks[start:], roles[start:]):
         for key in ("pixel", "held"):
-            if step_role.get(key) == role and np.allclose(step[key], pixel):
+            if step_role.get(key) != role:
+                continue
+            if _pixel_match(
+                step.get(key), step.get(key + "_back"), start_step.get("pixel"), start_step.get("pixel_back")
+            ):
                 step["world"][key] = world
-    return {"pixel": pixel, "role": role, "world": world, "info": info}
+    return {
+        "pixel": pixels.get(DEFAULT_CAMERA),
+        "pixel_back": pixels.get(BACK_CAMERA),
+        "role": role,
+        "world": world,
+        "info": info,
+    }

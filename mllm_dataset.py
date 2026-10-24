@@ -1,7 +1,9 @@
-"""把 Lift / Stack 的样本并进同一个目录，给训练读。
+"""把各任务的样本并进同一个目录，给训练读。
 
-训练只看 samples.jsonl 里的三列：image、instruction、answer。
-image 是相对这个目录的路径。task 用来区分任务，也用来重跑时替换旧样本。
+训练看 samples.jsonl 里的：image、image_back、instruction、answer。
+image 是 frontview，image_back 是 backview（frontview 正对面，双目时才有），
+都是相对这个目录的路径。instruction 以每台相机一个 <image> 占位开头。
+task 用来区分任务，也用来重跑时替换旧样本。
 只采一个任务时，meta.json 仍是原来的扁平格式，评测能直接读相机矩阵。
 两个任务都在时，各自的统计和相机矩阵放在 meta.json 的 tasks 下面。
 """
@@ -42,13 +44,17 @@ def _shared_value(bodies, key):
     return None
 
 
+def _row_images(row):
+    """一条样本引用的所有图片相对路径：frontview、backview（有的话）。"""
+    return [rel for rel in (row.get("image"), row.get("image_back")) if rel]
+
+
 def _prune_images(out_dir, task, merged, dropped_images):
     image_dir = out_dir / "images"
     keep_names = set()
     for row in merged:
-        image = row.get("image")
-        if image:
-            keep_names.add(Path(image).name)
+        for rel in _row_images(row):
+            keep_names.add(Path(rel).name)
     for rel in dropped_images:
         path = out_dir / rel
         if path.parent == image_dir and path.name not in keep_names and path.is_file():
@@ -105,15 +111,13 @@ def _publish_task(out_dir, task, samples, task_meta):
         row_task = row.get("task")
         if row_task is None and legacy_env:
             if legacy_env == task:
-                if row.get("image"):
-                    dropped_images.append(row["image"])
+                dropped_images.extend(_row_images(row))
                 continue
             row = dict(row)
             row["task"] = legacy_env
             row_task = legacy_env
         if row_task == task:
-            if row.get("image"):
-                dropped_images.append(row["image"])
+            dropped_images.extend(_row_images(row))
             continue
         kept.append(row)
 
@@ -150,9 +154,9 @@ def _publish_task(out_dir, task, samples, task_meta):
 
     bodies = list(tasks.values())
     combined = {
-        "inputs": ["image", "instruction"],
+        "inputs": _shared_value(bodies, "inputs") or ["image", "image_back", "instruction"],
         "output": {
-            "answer": "JSON 字符串，只有 subtasks。训练读 samples.jsonl 的 image、instruction、answer；task 是小写的环境名，各任务的步骤说明在 tasks 里。",
+            "answer": "JSON 字符串，带 subtasks，每个 subtask 带一句 desc；字段说明跟在指令话术后面。训练读 samples.jsonl 的 image、instruction、answer；task 是小写的环境名，各任务的步骤说明在 tasks 里。",
         },
         "num_samples": len(merged),
         "num_episodes": sum(int(body.get("num_episodes") or 0) for body in bodies),

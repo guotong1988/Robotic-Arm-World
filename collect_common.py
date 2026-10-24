@@ -4,9 +4,10 @@
 像素每一帧按当时的位置现算，所以同一份计划在任何一帧都能写成那一帧的 subtasks。
 
 采集先按初始画面写出 subtasks，解析后交给 task_plan.execute_plan，和评测是同一个执行器。
-执行过程中，每一帧按「正在做第几步」和当前状态，重写从这一步起还要做的步骤，作为这一帧的标注：
-正在做的移动已经到位就不再写；lift、turn 写剩下的量；wipe 只写还没擦掉的污渍。
-任务完成后 subtasks 为空。没完成的轨迹整条丢掉，图片和样本都不写盘。
+每条成功轨迹只保存开局那一帧（phase 为 initial），标注是从开局起的整条步骤。
+中途画面不存。泛化放在开局布局上：任务可以在 reset 前改采样范围（prepare_reset），
+reset 之后再挪物体和目标（vary_initial）。没完成的轨迹整条丢掉，图片和样本都不写盘。
+失败的轨迹不占 --episodes 名额，会一直补采到凑满为止，--max-attempts 封顶。
 
 多个任务可以写进同一个 --out。样本 id 和图片名带任务名前缀，samples.jsonl 按任务合并。
 任务名是小写的环境名，比如 pickplacecan，彼此不是前缀关系，清理旧图片时不会误删。
@@ -25,9 +26,18 @@ import robosuite.macros as macros
 from robosuite.utils.transform_utils import mat2quat
 
 from collect_lift_mllm import (
+    BACK_CAMERA,
+    CAMERAS,
     DEFAULT_CAMERA,
+    MASK,
+    OCCLUSION_TOL,
+    add_camera_arg,
+    apply_cameras,
     arm_controller,
+    back_enabled,
     format_pixel,
+    grip_view_pixels,
+    input_fields,
     matrix_to_list,
     move_until,
     panda_world_osc,
@@ -35,7 +45,9 @@ from collect_lift_mllm import (
     rotated_about_z,
     round_pixel,
     save_rgb,
-    world_to_pixel_matrix,
+    view_pixel,
+    with_views,
+    world_to_pixel_matrices,
 )
 from mllm_dataset import make_sample_id, publish_task
 from task_plan import (
@@ -62,13 +74,96 @@ TURN_DONE = 2.0
 WRIST_CENTER = 45.0
 # 手腕 yaw 离中心不超过这个角度就算安全，度。q7 限位是 ±166。
 WRIST_SAFE = 140.0
-ANSWER_SPEC = (
-    "JSON 字符串，只有 subtasks，是从这一帧还要做的步骤。像素都写成 \"[x y]\"，x 向右、y 向下，原点在左上角。"
+_ANSWER_KIND = (
+    "每个像素字段注明指的是哪类东西：target_kind、held_kind、pivot_kind、path_kind，取值 object（放在桌面或箱底上的物体中心）、"
+    "cube_center（方块的中心）、bin（箱子里格子的底面）、nut（平放的螺母中心）、peg（柱子顶端中心）、table（贴在桌面上的点）、"
+    "door_handle（门把手上的抓取点）、door_axis（门锁转轴、铰链）、grip（夹爪合拢时贴住物体表面的落点）。"
     "move_above（clearance，米）、move_down（offset_z，米）可带 yaw（度，夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度）"
     "和 held（手里物体上要对准目标的那一点的像素）。lift 的 delta_z 是还要抬的高度，米。"
     "reach 沿 approach（世界坐标方向）伸向 target，停在 standoff 米处。turn 绕过 pivot 像素、方向为 axis 的转轴转 angle 度。"
     "wipe 贴着桌面依次走过 path 里的像素，offset_z 是往下压的量。另外有 close_gripper、open_gripper、stabilize。完成后 subtasks 为空。"
 )
+# 每步 desc 的通用说法。任务实现 step_desc 时用自己的，可以带上物体名。
+COMMON_STEP_DESC = {
+    "move_above": "移到目标点上方",
+    "move_down": "降到目标点处",
+    "lift": "竖直抬起物体",
+    "reach": "伸向目标点",
+    "turn": "绕转轴转动",
+    "wipe": "沿路径擦拭桌面",
+    "close_gripper": "合爪夹住",
+    "open_gripper": "松爪放下",
+    "stabilize": "停在原地保持稳定",
+}
+
+
+def step_desc(task, env, step):
+    """每步的 desc：这一步做什么，20 字以内。任务实现 step_desc(env, step) 时用自己的。"""
+    fn = getattr(task, "step_desc", None)
+    if fn is not None:
+        text = fn(env, step)
+        if text:
+            return text
+    return COMMON_STEP_DESC.get(step["type"], step["type"])
+
+
+def plan_desc(task):
+    """跟在指令话术后面的字段说明：解释 target_1 等字段。任务实现 plan_desc() 时用自己的（比如两夹爪落点的任务）。"""
+    fn = getattr(task, "plan_desc", None)
+    if fn is not None:
+        text = fn()
+        if text:
+            return text
+    if back_enabled():
+        return (
+            "target_1 是要对准的点在正面相机图上的像素，target_1_back 是同一点在背面相机图上的像素；"
+            "某台相机看不到那个点时对应字段写 \"mask\"，不要猜它的像素"
+        )
+    return "target_1 是要对准的点在正面相机图上的像素"
+
+
+def order_landings_at(center, camera, pair):
+    """两个落点排序成 (朝相机的, 背对的)。"""
+    first, second = (np.asarray(point, dtype=float).reshape(3) for point in pair)
+    camera = np.asarray(camera, dtype=float).reshape(3)
+    center = np.asarray(center, dtype=float).reshape(3)
+    if float(np.dot(first - center, camera - center)) >= float(np.dot(second - center, camera - center)):
+        return first, second
+    return second, first
+
+
+def order_landings(env, center, pair):
+    """两个落点排序成 (朝 frontview 的, 背对的)。评测里 target_1 写正面相机看得到的那个。"""
+    camid = env.sim.model.camera_name2id(DEFAULT_CAMERA)
+    camera = np.asarray(env.sim.data.cam_xpos[camid], dtype=float)
+    return order_landings_at(center, camera, pair)
+
+
+def answer_spec():
+    """样本 answer 的说明。类别始终写；backview 没开时不写 *_back。"""
+    lead = (
+        "JSON 字符串。subtasks 是从这一帧还要做的步骤，每个 subtask 的 desc 用 20 字以内说明这一步做什么；"
+        "各字段的含义跟在指令话术后面，不在 answer 里重复。像素都写成 \"[x y]\"，x 向右、y 向下，原点在左上角。"
+    )
+    if back_enabled():
+        views = (
+            "每个空间字段给两个视图的像素：target_1 对应 image（frontview），target_1_back 对应 image_back（backview 背面机位）；"
+            "held、pivot、path 同理各有 held_back、pivot_back、path_back。"
+            "某台相机看不到那个点时对应字段写 \"mask\"，表示不要猜这张图的像素，用另一台相机的；两台都看不到时 frontview 字段保留像素兜底。"
+        )
+    else:
+        views = "每个空间字段给 frontview 的像素：target_1 对应 image；held、pivot、path 同理。"
+    return lead + views + _ANSWER_KIND
+
+
+def coordinate_frame():
+    if back_enabled():
+        return (
+            "subtasks 里的 target_1、pivot、held、path 是 frontview 像素，"
+            "target_1_back、pivot_back、held_back、path_back 是 backview 像素，被挡的视图是字面量 \"mask\"；"
+            "points 里的 pos 是世界坐标，米"
+        )
+    return "subtasks 里的 target_1、pivot、held、path 是 frontview 像素；points 里的 pos 是世界坐标，米"
 
 
 def wrap_angle(deg, period):
@@ -84,15 +179,16 @@ def body_yaw_deg(env, body_id):
 
 
 def wrist_yaw(env):
-    """夹爪竖直朝下时现在的 yaw，不折回 ±180，度。Panda 第 7 关节 q7 约等于 45 度减 yaw，
-    q7 限位 ±166 度，所以竖直朝下能转到的 yaw 是 [-121, 211]，中心在 45。"""
+    """夹爪竖直朝下时现在的 yaw，不折回 ±180，度。不是逆运动学，只是朝下时 q7 和 yaw 的对应：
+    Panda 第 7 关节 q7 约等于 45 度减 yaw，q7 限位 ±166 度，所以竖直朝下能转到的 yaw 是 [-121, 211]，中心在 45。"""
     robot = env.robots[0]
     q7 = float(env.sim.data.qpos[robot._ref_joint_pos_indexes[-1]])
     return WRIST_CENTER - float(np.degrees(q7))
 
 
 def choose_yaws(current, options):
-    """两指对称，抓取 yaw 加减 180 度是同一种抓法。options 是每次抓取的 (抓取 yaw, 抓住后再转多少度)。
+    """先验知识，不是逆运动学：两指对称，抓取 yaw 加减 180 度是同一种抓法，并躲开手腕限位。
+    options 是每次抓取的 (抓取 yaw, 抓住后再转多少度)。
     控制器按最短方向转到下一个 yaw，这里顺着计划把手腕的实际转角一路累加。
     先保证手腕不超出安全范围，再挑总转动最少的一组，接近半圈的大转动容易在半路把手臂带偏。
     返回每次抓取的 (抓取 yaw, 转完后的 yaw)，都折到 ±180。"""
@@ -136,15 +232,72 @@ def _vector(values):
     return [round(float(value), 2) for value in values]
 
 
-def render_step(task, env, step, points, matrix, eef, eef_ori, current):
-    """抽象步骤写成这一帧的 subtask。current 表示正在做这一步，已经到位就返回 None。"""
+def point_kind(task, name):
+    """引用的点指的是哪类东西（target_kind 等的取值，见 depth_locate.LOCATORS）。任务没实现 point_kind 就不写。"""
+    fn = getattr(task, "point_kind", None)
+    return fn(name) if fn is not None else None
 
-    def pixel(name):
-        return format_pixel(project_world(points[name], matrix)[0])
+
+def render_step(task, env, step, points, matrices, eef, eef_ori, current):
+    """抽象步骤写成这一帧的 subtask。current 表示正在做这一步，已经到位就返回 None。
+
+    每个空间字段给 frontview 像素；开了 backview 时再给 target_1_back，held/pivot/path 同理。
+    双目时某台相机看不到那个点（视线中途被挡住），对应字段写 "mask"，不脑补这张图的像素；
+    两台都被挡时 frontview 保留像素兜底。单目不做遮挡判定，挡住也照写。
+    每个像素字段带 *_kind 类别标注（任务实现 point_kind 时），评测按类别选深度量法。
+    中心类的点命中所属物体自身不算挡（任务实现 point_body(env, name) 给出所属 body）；
+    表面类（door_handle、grip 落点）任何提前命中都算挡。
+    任务实现 grip_points(env, name) 且 name 是夹爪落点时，写两个落点各自在两台相机上的像素
+    （target_1、target_1_back、target_2、target_2_back），target_kind 标 grip，执行器取两点的中点。
+    每步带 desc，说明这一步做什么。
+    """
+
+    # 表面类的点贴着的几何有厚度（门把手杆件），命中目标前方一点点不算挡。
+    KIND_OCCLUSION_TOL = {"door_handle": 0.03}
+
+    def pixel_pair(name):
+        """name 在 frontview、backview 的像素字符串。单目时 back 是 None；双目被挡的是 MASK。"""
+        kind = point_kind(task, name)
+        own = None
+        if kind != "door_handle":
+            body_fn = getattr(task, "point_body", None)
+            if body_fn is not None:
+                own = body_fn(env, name)
+        tol = KIND_OCCLUSION_TOL.get(kind, OCCLUSION_TOL)
+        front = view_pixel(env, points[name], DEFAULT_CAMERA, matrices[DEFAULT_CAMERA], own_body=own, tol=tol)
+        if BACK_CAMERA not in matrices:
+            return front, None
+        back = view_pixel(env, points[name], BACK_CAMERA, matrices[BACK_CAMERA], own_body=own, tol=tol)
+        if front == MASK and back == MASK:
+            front = format_pixel(project_world(points[name], matrices[DEFAULT_CAMERA])[0])
+        return front, back
+
+    def put_views(out, key, name):
+        front, back = pixel_pair(name)
+        out[key] = front
+        if back is not None:
+            out[key + "_back"] = back
+
+    def put_grip(out, name):
+        """落点型的引用点：写两个夹爪落点各自在两台相机上的像素。返回 True 表示是落点。"""
+        fn = getattr(task, "grip_points", None)
+        if fn is None:
+            return False
+        pair = fn(env, name)
+        if pair is None:
+            return False
+        out.update(grip_view_pixels(env, pair[0], pair[1], matrices))
+        out["target_kind"] = "grip"
+        return True
 
     kind = step["type"]
     if kind in ("move_above", "move_down"):
-        out = {"type": kind, "target": pixel(step["ref"])}
+        out = {"type": kind, "desc": step_desc(task, env, step)}
+        if not put_grip(out, step["ref"]):
+            put_views(out, "target_1", step["ref"])
+            ref_kind = point_kind(task, step["ref"])
+            if ref_kind is not None:
+                out["target_kind"] = ref_kind
         if kind == "move_above":
             extra = float(step["clearance"])
             out["clearance"] = round(extra, 2)
@@ -156,7 +309,10 @@ def render_step(task, env, step, points, matrix, eef, eef_ori, current):
         if "yaw" in step:
             out["yaw"] = int(round(float(step["yaw"])))
         if "held" in step:
-            out["held"] = pixel(step["held"])
+            put_views(out, "held", step["held"])
+            held_kind = point_kind(task, step["held"])
+            if held_kind is not None:
+                out["held_kind"] = held_kind
         if current:
             goal = np.asarray(points[step["ref"]], dtype=float) + np.array([0.0, 0.0, extra])
             moving = eef if "held" not in step else np.asarray(points[step["held"]], dtype=float)
@@ -170,15 +326,26 @@ def render_step(task, env, step, points, matrix, eef, eef_ori, current):
             return None
         if delta < 0.005:
             return None
-        return {"type": "lift", "target": pixel(step["ref"]), "delta_z": round(delta, 2)}
+        out = {
+            "type": "lift",
+            "desc": step_desc(task, env, step),
+            "delta_z": round(delta, 2),
+        }
+        if not put_grip(out, step["ref"]):
+            put_views(out, "target_1", step["ref"])
+            ref_kind = point_kind(task, step["ref"])
+            if ref_kind is not None:
+                out["target_kind"] = ref_kind
+        return out
     if kind == "reach":
         approach = np.asarray(step["approach"], dtype=float)
-        out = {
-            "type": "reach",
-            "target": pixel(step["ref"]),
-            "approach": _vector(approach),
-            "standoff": round(float(step["standoff"]), 2),
-        }
+        out = {"type": "reach", "desc": step_desc(task, env, step)}
+        put_views(out, "target_1", step["ref"])
+        out["approach"] = _vector(approach)
+        out["standoff"] = round(float(step["standoff"]), 2)
+        ref_kind = point_kind(task, step["ref"])
+        if ref_kind is not None:
+            out["target_kind"] = ref_kind
         if current:
             goal = np.asarray(points[step["ref"]], dtype=float) - approach * float(step["standoff"])
             if float(np.linalg.norm(eef - goal)) <= REACH_TOL and _ori_close(eef_ori, approach_ori(approach)):
@@ -188,23 +355,37 @@ def render_step(task, env, step, points, matrix, eef, eef_ori, current):
         angle = float(task.turn_remaining(env, step))
         if abs(angle) < TURN_DONE:
             return None
-        return {
-            "type": "turn",
-            "pivot": pixel(step["pivot"]),
-            "axis": _vector(step["axis"]),
-            "angle": int(round(angle)),
-        }
+        out = {"type": "turn", "desc": step_desc(task, env, step)}
+        put_views(out, "pivot", step["pivot"])
+        out["axis"] = _vector(step["axis"])
+        out["angle"] = int(round(angle))
+        pivot_kind = point_kind(task, step["pivot"])
+        if pivot_kind is not None:
+            out["pivot_kind"] = pivot_kind
+        return out
     if kind == "wipe":
         names = task.wipe_path(env)
         if not names:
             return None
-        return {"type": "wipe", "path": [pixel(name) for name in names], "offset_z": round(float(step["offset_z"]), 3)}
+        pairs = [pixel_pair(name) for name in names]
+        out = {
+            "type": "wipe",
+            "desc": step_desc(task, env, step),
+            "path": [front for front, _ in pairs],
+        }
+        if BACK_CAMERA in matrices:
+            out["path_back"] = [back for _, back in pairs]
+        out["offset_z"] = round(float(step["offset_z"]), 3)
+        path_kind = point_kind(task, names[0])
+        if path_kind is not None:
+            out["path_kind"] = path_kind
+        return out
     if kind == "stabilize":
-        return {"type": "stabilize", "duration": STABILIZE_DURATION}
-    return {"type": kind}
+        return {"type": "stabilize", "desc": step_desc(task, env, step), "duration": STABILIZE_DURATION}
+    return {"type": kind, "desc": step_desc(task, env, step)}
 
 
-def render_plan(task, env, plan, index, matrix, done):
+def render_plan(task, env, plan, index, matrices, done):
     """从第 index 步起还要做的 subtasks，以及每条对应抽象计划里的第几步。"""
     if done:
         return [], []
@@ -212,7 +393,7 @@ def render_plan(task, env, plan, index, matrix, done):
     eef, eef_ori = eef_pose(env)
     subtasks, mapping = [], []
     for k in range(int(index), len(plan)):
-        step = render_step(task, env, plan[k], points, matrix, eef, eef_ori, current=(k == index))
+        step = render_step(task, env, plan[k], points, matrices, eef, eef_ori, current=(k == index))
         if step is not None:
             subtasks.append(step)
             mapping.append(k)
@@ -245,7 +426,7 @@ def make_env(task, image_size, seed, use_camera=True, camera_depths=False):
         ignore_done=True,
         use_camera_obs=bool(use_camera),
         use_object_obs=True,
-        camera_names=DEFAULT_CAMERA,
+        camera_names=list(CAMERAS),
         camera_heights=image_size,
         camera_widths=image_size,
         camera_depths=bool(use_camera and camera_depths),
@@ -267,7 +448,14 @@ def make_env(task, image_size, seed, use_camera=True, camera_depths=False):
 
 def prepare_scene(env, task, rng, on_step):
     """物体落稳之后，手臂先抬高，再平移到随机出发点。这段不交给模型。"""
+    prepare = getattr(task, "prepare_reset", None)
+    if prepare is not None:
+        prepare(env, rng)
     obs = env.reset()
+    vary = getattr(task, "vary_initial", None)
+    if vary is not None:
+        vary(env, rng)
+        env.sim.forward()
     on_step(obs)
     arm = arm_controller(env)
     arm.update(force=True)
@@ -301,16 +489,19 @@ class TaskWriter:
         self.discarded = 0
         self.merged_count = 0
 
-    def add(self, record, rgb):
-        self.pending.append((record, np.array(rgb, copy=True)))
+    def add(self, record, rgbs):
+        """rgbs 是 {相机名: 图像}。"""
+        self.pending.append((record, {name: np.array(rgb, copy=True) for name, rgb in rgbs.items()}))
 
     def finish_episode(self, episode, success, info=None):
         pending, self.pending = self.pending, []
         if not success:
             self.discarded += 1
             return
-        for record, rgb in pending:
-            save_rgb(self.image_dir / Path(record["image"]).name, rgb)
+        for record, rgbs in pending:
+            save_rgb(self.image_dir / Path(record["image"]).name, rgbs[DEFAULT_CAMERA])
+            if record.get("image_back") and BACK_CAMERA in rgbs:
+                save_rgb(self.image_dir / Path(record["image_back"]).name, rgbs[BACK_CAMERA])
             record["success"] = True
             self.samples.append(record)
         entry = {"episode": int(episode), "success": True, "num_samples": len(pending)}
@@ -327,14 +518,15 @@ class TaskWriter:
         self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
 
 
-def run_episode(env, task, episode, rng, style, matrix, image_size, writer=None, bucket_m=0.02):
+def run_episode(env, task, episode, rng, style, matrices, image_size, writer=None, bucket_m=0.02):
     """采一条轨迹。writer 为 None 时只执行、不渲染标注，用来检查计划本身能不能做成。"""
     state = {"step": 0, "index": 0, "plan": [], "obs": None, "last_key": None, "last_step": None}
 
     def label():
         done = bool(task.success(env))
-        subtasks, mapping = render_plan(task, env, state["plan"], state["index"], matrix, done)
-        instruction = task.instruction(env, state["plan"], state["index"], style, done)
+        subtasks, mapping = render_plan(task, env, state["plan"], state["index"], matrices, done)
+        # 指令带 <image> 占位、话术后面带字段说明，和训练样本的格式一致。
+        instruction = with_views(task.instruction(env, state["plan"], state["index"], style, done), plan_desc(task))
         return subtasks, mapping, instruction
 
     def record(phase, force):
@@ -352,11 +544,14 @@ def run_episode(env, task, episode, rng, style, matrix, image_size, writer=None,
         points = task.points(env)
         shown = {}
         for name in task.record_points(env):
-            pixel, _ = project_world(points[name], matrix)
+            pixel, _ = project_world(points[name], matrices[DEFAULT_CAMERA])
             shown[name] = {
                 "pos": [round(float(value), 4) for value in points[name]],
                 "pixel": round_pixel(pixel),
             }
+            if BACK_CAMERA in matrices:
+                pixel_back, _ = project_world(points[name], matrices[BACK_CAMERA])
+                shown[name]["pixel_back"] = round_pixel(pixel_back)
         sample = {
             "id": sample_id,
             "task": task.task,
@@ -371,14 +566,13 @@ def run_episode(env, task, episode, rng, style, matrix, image_size, writer=None,
             "answer": format_plan(subtasks),
             "success": False,
         }
+        if BACK_CAMERA in CAMERAS:
+            sample["image_back"] = "images/{}_back.png".format(sample_id)
+            sample["camera_back"] = BACK_CAMERA
         sample.update(task.record_extra(env))
-        writer.add(sample, state["obs"][DEFAULT_CAMERA + "_image"])
+        writer.add(sample, {name: state["obs"][name + "_image"] for name in CAMERAS})
         state["last_key"] = key
         state["last_step"] = state["step"]
-
-    def phase_name():
-        plan, index = state["plan"], state["index"]
-        return plan[index]["type"] if 0 <= index < len(plan) else "final"
 
     def tick(new_obs):
         state["step"] += 1
@@ -387,8 +581,6 @@ def run_episode(env, task, episode, rng, style, matrix, image_size, writer=None,
     def on_step(new_obs):
         state["step"] += 1
         state["obs"] = new_obs
-        if writer is not None:
-            record(phase_name(), force=False)
 
     obs, hold_ori = prepare_scene(env, task, rng, tick)
     state["obs"] = obs
@@ -396,7 +588,8 @@ def run_episode(env, task, episode, rng, style, matrix, image_size, writer=None,
     for round_index in range(int(task.max_rounds)):
         state["plan"] = task.build_plan(env, rng)
         state["index"] = 0
-        record("initial" if round_index == 0 else "replan", force=True)
+        if round_index == 0:
+            record("initial", force=True)
         subtasks, mapping, _ = label()
         if not subtasks:
             break
@@ -404,14 +597,13 @@ def run_episode(env, task, episode, rng, style, matrix, image_size, writer=None,
 
         def on_progress(concrete, _step, mapping=mapping):
             state["index"] = mapping[concrete]
-            record(phase_name(), force=True)
 
         final, trace = execute_plan(
             env,
             parsed["subtasks"],
             hold_ori,
             task.landmarks(env),
-            matrix,
+            matrices,
             grip=-1.0,
             on_step=on_step,
             on_progress=on_progress,
@@ -423,7 +615,6 @@ def run_episode(env, task, episode, rng, style, matrix, image_size, writer=None,
         if task.success(env):
             break
     state["index"] = len(state["plan"])
-    record("final", force=True)
     success = bool(task.success(env))
     failed = [
         "{}#{}({})".format(step["type"], k, step["err_m"])
@@ -442,46 +633,58 @@ def run_episode(env, task, episode, rng, style, matrix, image_size, writer=None,
     return success
 
 
-def task_meta(task, matrix, image_size):
+def task_meta(task, matrices, image_size):
     meta = {
         "env": task.env_name,
         "robot": "Panda",
         "camera": DEFAULT_CAMERA,
+        "cameras": list(CAMERAS),
         "image_size": [int(image_size), int(image_size)],
-        "inputs": ["image", "instruction"],
-        "output": {"answer": ANSWER_SPEC},
+        "inputs": input_fields(),
+        "output": {"answer": answer_spec()},
         "primitives": list(task.primitives),
-        "coordinate_frame": "subtasks 里的 target、pivot、held、path 是 frontview 像素；points 里的 pos 是世界坐标，米",
-        "camera_world_to_pixel": matrix_to_list(matrix),
-        "instruction": task.instruction_note,
+        "coordinate_frame": coordinate_frame(),
+        "camera_world_to_pixel": {name: matrix_to_list(matrix) for name, matrix in matrices.items()},
+        "instruction": "指令以若干个 <image> 占位开头，每行一个，和 inputs 里的图片一一对应；多张图时占位后面注明每张来自哪台相机。话术后面带 answer 各字段的说明。" + task.instruction_note,
+        "sampling": "每条成功轨迹只保存 phase=initial 的一帧。泛化来自开局布局：物体位置、朝向和目标位置，不存轨迹中途的画面。",
     }
+    if back_enabled():
+        meta["camera_back"] = BACK_CAMERA
     meta.update(task.meta_extra())
     return meta
 
 
 def add_common_args(parser, default_out):
-    parser.add_argument("--episodes", type=int, default=50, help="采集多少条轨迹，失败的不算")
+    parser.add_argument("--episodes", type=int, default=50, help="采够多少条成功轨迹才停，失败的不占名额")
+    parser.add_argument("--max-attempts", type=int, default=0, help="最多尝试多少条，防止一直失败死循环。0 表示 episodes 的 10 倍")
     parser.add_argument("--out", type=str, default=default_out, help="输出目录。可以和其他任务共用，按 task 合并")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=512)
-    parser.add_argument("--bucket-cm", type=float, default=2.0, help="夹爪大约每移动这么多厘米存一帧")
+    parser.add_argument("--bucket-cm", type=float, default=2.0, help="保留参数。现在每条成功轨迹只存开局一帧，不再按位移抽帧")
+    add_camera_arg(parser)
 
 
 def run_collection(task, args):
+    apply_cameras(args)
     rng = np.random.default_rng(args.seed)
     env = make_env(task, args.image_size, args.seed, use_camera=True)
-    matrix = world_to_pixel_matrix(env, args.image_size)
+    matrices = world_to_pixel_matrices(env, args.image_size)
     writer = TaskWriter(args.out, task.task, args.image_size)
+    max_attempts = args.max_attempts or args.episodes * 10
     successes = 0
+    episode = 0
     try:
-        for episode in range(args.episodes):
+        while successes < args.episodes and episode < max_attempts:
             style = task.styles[int(rng.integers(len(task.styles)))]
             successes += int(
-                run_episode(env, task, episode, rng, style, matrix, args.image_size, writer, args.bucket_cm / 100.0)
+                run_episode(env, task, episode, rng, style, matrices, args.image_size, writer, args.bucket_cm / 100.0)
             )
+            episode += 1
     finally:
-        writer.close(task_meta(task, matrix, args.image_size))
+        writer.close(task_meta(task, matrices, args.image_size))
         env.close()
+    if successes < args.episodes:
+        print("达到最大尝试次数 {}，只采到 {} 条成功轨迹".format(max_attempts, successes))
     print(
         "saved {} samples from {} succeeded episodes ({} failed, discarded); {} samples in {}".format(
             len(writer.samples), successes, writer.discarded, writer.merged_count, writer.out_dir

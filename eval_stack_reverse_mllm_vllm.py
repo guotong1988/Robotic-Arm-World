@@ -6,11 +6,11 @@
 场景、感知、执行都和 eval_stack_mllm_vllm.py 相同，同一个 --seed 摆出的场景也相同，可以逐条对照。
 不同的地方：
 
-1. 指令换成反向说法，也可以用 --instruction 指定一句
+1. 指令换成反向说法，也可以用 --instruction 指定一句；指令和采集一样以每台相机一个 <image> 占位开头
 2. 成功按反向判定：绿块中心离桌面超过 4cm、和红块接触、夹爪没有抓着绿块。阈值和 robosuite 的 Stack 一样
 3. 同时记下原任务是否成功（红块叠在绿块上），看模型是不是无视指令照旧做
 4. 按模型合爪前、松爪前指的像素各自离哪个方块近，判断它实际抓了哪个、放到哪个上面
-5. --oracle 用反向真值步骤，先确认抓绿块、放红块这套动作本身能做成
+5. --oracle 用反向真值像素和真值步骤，先确认抓绿块、放红块这套动作本身能做成
 """
 
 import argparse
@@ -23,33 +23,46 @@ gl_backend.configure()
 
 import numpy as np
 
-from collect_lift_mllm import format_pixel, project_world, round_pixel, world_to_pixel_matrix
+from collect_lift_mllm import (
+    BACK_CAMERA,
+    DEFAULT_CAMERA,
+    MASK,
+    add_camera_arg,
+    apply_cameras,
+    format_pixel,
+    grip_view_pixels,
+    project_world,
+    view_pixel,
+    with_views,
+    world_to_pixel_matrices,
+)
+from collect_common import order_landings_at
 from collect_stack_mllm import (
+    half_z,
     make_env,
     place_offset,
+    plan_desc,
     positions_from_obs,
     prepare_scene,
     remaining_subtasks,
 )
-from eval_lift_core import (
+from eval_lift_mllm_vllm import (
     ServerError,
-    camera_image,
+    VLLMClient,
+    camera_images,
     camera_size,
     format_cm,
-    format_err_axes,
-    format_xyz,
     grab_frame,
-    pos_error,
     write_mp4,
 )
-from eval_lift_mllm_vllm import VLLMClient
+from depth_locate import make_views
 from eval_stack_mllm_vllm import (
     VIDEO_FPS,
     nearest_object,
     perceive,
     plan_matches,
+    point_target,
     print_summary,
-    real_depth,
     summarize,
     write_results,
 )
@@ -81,32 +94,58 @@ def reverse_success(env, obs):
     return lifted and touching and not is_holding_green(env)
 
 
-def reverse_plan(obs, offset, matrix):
-    """抓绿块、放到红块上的真值步骤。复用正向的步骤生成，只把两块对调。"""
+def reverse_plan(env, obs, offset, matrices, half, axis, camera_pos):
+    """抓绿块、放到红块上的真值步骤。复用正向的步骤生成，只把两块对调。
+
+    抓绿块的步骤写两指落点对（贴绿块两侧），放红块的步骤写红块中心，和正向任务一致。
+    被相机挡住、看不到的落点写 "mask"；两台相机都看不到时 frontview 保留像素兜底。
+    """
     cube_a, cube_b, eef = positions_from_obs(obs)
-    pix_a, _ = project_world(cube_a, matrix)
-    pix_b, _ = project_world(cube_b, matrix)
-    steps = remaining_subtasks(cube_b, cube_a, eef, pix_b, pix_a, float(cube_b[2]), offset, False, False)
+    side = np.asarray(axis, dtype=float) * float(half)
+    # 两指落点贴被叠的绿块两侧，朝 frontview 的一侧写 target_1。
+    land_1, land_2 = order_landings_at(cube_b, camera_pos, (cube_b + side, cube_b - side))
+    grip_pixels = grip_view_pixels(env, land_1, land_2, matrices)
+    pix_place = view_pixel(env, cube_a, DEFAULT_CAMERA, matrices[DEFAULT_CAMERA], own_body=env.cubeA_body_id)
+    pix_place_back = None
+    if BACK_CAMERA in matrices:
+        pix_place_back = view_pixel(env, cube_a, BACK_CAMERA, matrices[BACK_CAMERA], own_body=env.cubeA_body_id)
+        if pix_place == MASK and pix_place_back == MASK:
+            pix_place = format_pixel(project_world(cube_a, matrices[DEFAULT_CAMERA])[0])
+    steps = remaining_subtasks(
+        cube_b, cube_a, eef, grip_pixels, pix_place, float(cube_b[2]), offset, False, False, pix_place_back
+    )
+    # format_plan 直接返回模型输出格式的 JSON 文本，oracle 时喂给 parse_plan。
     return format_plan(steps)
 
 
 def step_before(subtasks, kind):
-    """kind 这一步之前最近一个带像素的步骤的像素。"""
+    """kind 这一步之前最近一个带像素的步骤的像素和所在视图。front 被 mask 时回退 backview。"""
     pixel = None
+    view = None
     for step in subtasks:
         if step["type"] == kind:
-            return pixel
+            return pixel, view
         if "pixel" in step:
-            pixel = step["pixel"]
-    return None
+            if step["pixel"] is not None:
+                pixel, view = step["pixel"], DEFAULT_CAMERA
+            elif step.get("pixel_back") is not None:
+                pixel, view = step["pixel_back"], BACK_CAMERA
+    return None, None
 
 
-def classify_behavior(subtasks, gt_pix):
-    """按合爪、松爪前的像素判断抓了哪块、放到哪块上。"""
-    pick = step_before(subtasks, "close_gripper")
-    place = step_before(subtasks, "open_gripper")
-    picked = None if pick is None else OBJECT_NAMES[nearest_object(pick, gt_pix)[0]]
-    placed_on = None if place is None else OBJECT_NAMES[nearest_object(place, gt_pix)[0]]
+def classify_behavior(subtasks, gt_pix, gt_pix_back):
+    """按合爪、松爪前的像素判断抓了哪块、放到哪块上。像素在哪个视图就用哪个视图的真值。"""
+    pick, pick_view = step_before(subtasks, "close_gripper")
+    place, place_view = step_before(subtasks, "open_gripper")
+
+    def nearest(pixel, view):
+        if pixel is None:
+            return None
+        gt = gt_pix if view == DEFAULT_CAMERA else gt_pix_back
+        return OBJECT_NAMES[nearest_object(pixel, gt)[0]]
+
+    picked = nearest(pick, pick_view)
+    placed_on = nearest(place, place_view)
     if picked == "green" and placed_on == "red":
         behavior = "reverse"
     elif picked == "red" and placed_on == "green":
@@ -126,20 +165,33 @@ def run_episode(env, client, rng, episode, image_size, oracle, instruction=None,
     record = None
     try:
         obs, hold_ori, _rest_z = prepare_scene(env, rng, on_step)
-        styled = REVERSE_INSTRUCTIONS[int(rng.integers(len(REVERSE_INSTRUCTIONS)))]
-        instruction = instruction or styled
-        matrix = world_to_pixel_matrix(env, image_size)
-        image = camera_image(obs, image_size)
-        depth = real_depth(env, obs)
+        styled = instruction or REVERSE_INSTRUCTIONS[int(rng.integers(len(REVERSE_INSTRUCTIONS)))]
+        # 和采集一致：指令以每台相机一个 <image> 占位开头、话术后面带字段说明，图走 image_url 后占位被剥掉。
+        instruction = with_views(styled, plan_desc())
+        matrices = world_to_pixel_matrices(env, image_size)
+        images = camera_images(obs, image_size)
+        views = make_views(env, obs, matrices)
+        matrix = matrices[DEFAULT_CAMERA]
+        # 评测执行保持 hold_ori，两指合拢轴就是它的第一列。
+        axis = np.asarray(hold_ori, dtype=float)[:, 0].copy()
+        cam_pos = env.sim.data.cam_xpos[env.sim.model.camera_name2id(DEFAULT_CAMERA)]
 
         # 以下真值只用来统计，不进模型，不进控制。
         gt_a, gt_b, _ = positions_from_obs(obs)
         gt_pix = [project_world(gt_a, matrix)[0], project_world(gt_b, matrix)[0]]
-        gt_answer = reverse_plan(obs, place_offset(env), matrix)
+        gt_pix_back = [None, None]
+        if BACK_CAMERA in matrices:
+            gt_pix_back = [
+                project_world(gt_a, matrices[BACK_CAMERA])[0],
+                project_world(gt_b, matrices[BACK_CAMERA])[0],
+            ]
+        gt_answer = reverse_plan(
+            env, obs, place_offset(env), matrices, half_z(env.cubeA, 0.02), axis, cam_pos
+        )
 
         record = {"episode": episode, "instruction": instruction, "success": False, "behavior": None}
         started = time.perf_counter()
-        answer = gt_answer if oracle else client.complete(image, instruction)
+        answer = gt_answer if oracle else client.complete(images, instruction)
         record["seconds"] = round(time.perf_counter() - started, 3)
         record["answer"] = answer
         print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
@@ -148,44 +200,20 @@ def run_episode(env, client, rng, episode, image_size, oracle, instruction=None,
             subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
             record["steps"] = [step["type"] for step in subtasks]
             record["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-            record["picked"], record["placed_on"], record["behavior"] = classify_behavior(subtasks, gt_pix)
-            points = perceive(subtasks, depth, matrix, image_size)
+            record["picked"], record["placed_on"], record["behavior"] = classify_behavior(subtasks, gt_pix, gt_pix_back)
+            points = perceive(subtasks, views, image_size, axis=axis)
             targets = []
             for point in points:
-                index, dists = nearest_object(point["pixel"], gt_pix)
-                gt = gt_a if index == 0 else gt_b
-                err = pos_error(point["world"], gt)
-                targets.append(
-                    {
-                        "object": OBJECT_NAMES[index],
-                        "pixel": round_pixel(point["pixel"]),
-                        "gt_pixel": round_pixel(gt_pix[index]),
-                        "pixel_err": round(dists[index], 2),
-                        "world": [round(float(v), 4) for v in point["world"]],
-                        "gt_world": [round(float(v), 4) for v in gt],
-                        "err_m": {k: round(v, 4) for k, v in err.items()},
-                        "depth": point["info"],
-                    }
-                )
-                print(
-                    "episode {:02d} {} pixel gt={} pred={} pos gt={} pred={} {}".format(
-                        episode,
-                        targets[-1]["object"],
-                        format_pixel(gt_pix[index]),
-                        format_pixel(point["pixel"]),
-                        format_xyz(gt),
-                        format_xyz(point["world"]),
-                        format_err_axes(err),
-                    ),
-                    flush=True,
-                )
+                target, line = point_target(point, gt_pix, gt_pix_back, gt_a, gt_b)
+                targets.append(target)
+                print("episode {:02d} {}".format(episode, line), flush=True)
             record["targets"] = targets
             final, trace = execute_plan(
                 env,
                 subtasks,
                 hold_ori,
                 [point["world"] for point in points],
-                matrix,
+                matrices,
                 grip=-1.0,
                 on_step=on_step,
             )
@@ -283,6 +311,7 @@ def main():
     parser.add_argument("--out", default="data/stack_reverse_eval")
     parser.add_argument("--no-video", action="store_true", help="不把每条测评的 frontview 录成 mp4")
     parser.add_argument("--oracle", action="store_true", help="用反向真值步骤代替模型，检查抓绿放红能否做成")
+    add_camera_arg(parser)
     args = parser.parse_args()
 
     check_parser()
@@ -301,6 +330,7 @@ def main():
         )
         print("api {} model {}".format(client.api_base, client.resolve_model()), flush=True)
 
+    apply_cameras(args)
     rng = np.random.default_rng(args.seed)
     env = make_env(args.image_size, args.seed, use_camera=True, camera_depths=True)
     image_size = camera_size(env)
