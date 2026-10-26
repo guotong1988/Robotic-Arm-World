@@ -2,7 +2,7 @@
 
 https://space.bilibili.com/447278957/lists
 
-robosuite + Panda 上的单臂操作。微调后的 Qwen 看 frontview 和 backview（采集脚本加在 frontview 正对面、往 +y 偏一截的背面机位，视线对着桌面中心；`--cameras frontview` 退回单目）。指令以每台相机一个 `<image>` 占位开头，注明各图来自哪台相机，话术后面带字段说明。模型输出 `subtasks`，每步一句 `desc`。同一个点在正面相机写 `target_1`、背面相机写 `target_1_back`，看不到的视图写 `"mask"`。要抓的物体（Lift 和 Stack 的方块、螺母把手）写两指落点，每个落点各给两台相机的像素（`target_1`、`target_1_back`、`target_2`、`target_2_back`），`target_kind` 为 `grip`，中点是抓取位置。评测只用深度把像素换成世界坐标：单点按角色融合，主视图是 frontview；两指落点成对还原。Lift 按两个落点做逆运动学，其余任务交给 `task_plan.py` 的执行器。
+本项目基于 robosuite + Panda 实现多模态大模型驱动的单臂操作。整体思路是：先在仿真环境中采集 2D 视觉识别与执行计划数据，用于微调 Qwen 多模态大模型；推理时，模型根据图像和指令生成操作计划，再结合 2D 像素与深度信息完成三维空间定位，最后通过逆运动学（IK）驱动机械臂执行操作。
 
 采集、评测、步骤原语和深度定位的说明见 [QUICK_START.md](QUICK_START.md)。
 
