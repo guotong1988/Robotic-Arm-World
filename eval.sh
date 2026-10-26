@@ -11,6 +11,7 @@ set -e
 PY=${PY:-/opt/conda/envs/python3.10.13/bin/python3}
 API_BASE=${API_BASE:-http://127.0.0.1:8000/v1}
 EPISODES=${EPISODES:-20}
+TIMEOUT=${TIMEOUT:-600}
 OUT=${OUT:-data/eval}
 CAMERAS=frontview,backview
 LOG=$OUT/logs
@@ -35,15 +36,15 @@ run() {
   pids+=($!)
 }
 
-run lift $PY eval_lift_mllm_vllm.py --api-base $API_BASE --episodes $EPISODES --out $OUT/lift --cameras $CAMERAS $EXTRA
-run stack $PY eval_stack_mllm_vllm.py --api-base $API_BASE --episodes $EPISODES --out $OUT/stack --cameras $CAMERAS $EXTRA
-run door $PY eval_door_mllm_vllm.py --api-base $API_BASE --episodes $EPISODES --out $OUT/door --cameras $CAMERAS $EXTRA
-run wipe $PY eval_wipe_mllm_vllm.py --api-base $API_BASE --episodes $EPISODES --out $OUT/wipe --cameras $CAMERAS $EXTRA
+run lift $PY eval_lift_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/lift --cameras $CAMERAS $EXTRA
+run stack $PY eval_stack_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/stack --cameras $CAMERAS $EXTRA
+run door $PY eval_door_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/door --cameras $CAMERAS $EXTRA
+run wipe $PY eval_wipe_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/wipe --cameras $CAMERAS $EXTRA
 for env in PickPlaceMilk PickPlaceBread PickPlaceCereal PickPlaceCan PickPlace; do
-    run pickplace_$env $PY eval_pickplace_mllm_vllm.py --api-base $API_BASE --env $env --episodes $EPISODES --out $OUT/pickplace_$env --cameras $CAMERAS $EXTRA
+    run pickplace_$env $PY eval_pickplace_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --env $env --episodes $EPISODES --out $OUT/pickplace_$env --cameras $CAMERAS $EXTRA
 done
 for env in NutAssemblySquare NutAssemblyRound NutAssembly; do
-    run nut_$env $PY eval_nut_mllm_vllm.py --api-base $API_BASE --env $env --episodes $EPISODES --out $OUT/nut_$env --cameras $CAMERAS $EXTRA
+    run nut_$env $PY eval_nut_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --env $env --episodes $EPISODES --out $OUT/nut_$env --cameras $CAMERAS $EXTRA
 done
 
 fail=0

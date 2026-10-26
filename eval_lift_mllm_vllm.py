@@ -416,7 +416,7 @@ class OracleClient:
 
 
 class VLLMClient:
-    def __init__(self, api_base, model, timeout, max_tokens, temperature, system, text_template):
+    def __init__(self, api_base, model, timeout, max_tokens, temperature, system, text_template, retries=2):
         self.api_base = api_base.rstrip("/")
         if not self.api_base.endswith("/v1"):
             self.api_base += "/v1"
@@ -426,6 +426,7 @@ class VLLMClient:
         self.temperature = temperature
         self.system = system
         self.text_template = text_template
+        self.retries = max(0, int(retries))
         self._drop_thinking_flag = False
 
     def _request(self, method, path, payload=None):
@@ -435,14 +436,29 @@ class VLLMClient:
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise ServerError("HTTP {} {}\n{}".format(exc.code, url, detail[:800])) from exc
-        except urllib.error.URLError as exc:
-            raise ServerError("连不上 {} ：{}".format(url, exc.reason)) from exc
+        for attempt in range(self.retries + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise ServerError("HTTP {} {}\n{}".format(exc.code, url, detail[:800])) from exc
+            except (TimeoutError, urllib.error.URLError) as exc:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else "等待响应超时"
+                if attempt >= self.retries:
+                    raise ServerError(
+                        "请求 {} 失败（已尝试 {} 次，单次超时 {} 秒）：{}".format(
+                            url, attempt + 1, self.timeout, reason
+                        )
+                    ) from exc
+                delay = 2 * (attempt + 1)
+                print(
+                    "请求 {} 第 {}/{} 次失败（{}），{} 秒后重试".format(
+                        url, attempt + 1, self.retries + 1, reason, delay
+                    ),
+                    flush=True,
+                )
+                time.sleep(delay)
 
     def resolve_model(self):
         if self.model:

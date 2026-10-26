@@ -166,6 +166,14 @@ def match_targets(points, gt):
             target["pixel_back"] = round_pixel(back)
             target["gt_pixel_back"] = round_pixel(nearest["pixel_back"])
             target["pixel_back_err"] = round(float(np.linalg.norm(back - nearest["pixel_back"])), 2)
+        if point["role"] == "grip" and point.get("land_2") is not None:
+            first = np.asarray(point["land_1"], dtype=float)
+            second = np.asarray(point["land_2"], dtype=float)
+            axis = second - first
+            target["land_1"] = np.round(first, 4).tolist()
+            target["land_2"] = np.round(second, 4).tolist()
+            target["grip_width_m"] = round(float(np.linalg.norm(axis[:2])), 4)
+            target["closing_yaw_deg"] = round(float(np.degrees(np.arctan2(-axis[0], axis[1]))), 2)
         targets.append(target)
     return targets
 

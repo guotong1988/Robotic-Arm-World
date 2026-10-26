@@ -305,7 +305,7 @@ def grip_axis(step):
     return ori[:, 0] / float(np.linalg.norm(ori[:, 0]))
 
 
-def recover_landings(pixels, views, image_size, axis=None):
+def recover_landings(pixels, views, image_size, axis=None, plane_offset=None):
     """两个落点像素换成世界坐标，返回 (朝前的点, 朝后的点, 记录)。
 
     pixels 里 front 是朝前落点的 frontview 像素（被 mask 时 front_back 是它在 backview 的像素）；
@@ -317,6 +317,8 @@ def recover_landings(pixels, views, image_size, axis=None):
     axis 是两落点的连线方向（世界系，默认世界 x 轴，lift 的合拢方向），
     方向不限：same 分支会把它规范成指向相机（back 比 front 远离相机，
     在 axis 的负侧），调用方给执行朝向的第一列也不怕符号反。
+    plane_offset 给出落点相对支撑面的高度（如 Nut 的半厚）。same 分支优先
+    用这个水平面和两条像素射线求交，避免细把手套用方块宽度的固定 fallback。
     """
     if axis is None:
         axis = np.array([1.0, 0.0, 0.0])
@@ -341,12 +343,23 @@ def recover_landings(pixels, views, image_size, axis=None):
     # 就是 front 指向 back 的水平方向。axis 规范成指向相机（back 比 front 远离相机，
     # 在 axis 的负侧），调用方给执行朝向的第一列也不怕符号反。
     same_depth, same_matrix = views[DEFAULT_CAMERA]
-    p_front = ray_at_height(front_px, float(front[2]), front_matrix)
-    p_same = ray_at_height(np.asarray(same, dtype=float), float(front[2]), same_matrix)
+    radius = max(8, int(round(PAIR_RADIUS * float(image_size) / 512.0)))
+    pair_z = float(front[2])
+    support = None
+    if plane_offset is not None:
+        disk = backproject_disk(front_depth, front_matrix, front_px, radius)
+        support = lowest_surface(disk)
+        pair_z = support + float(plane_offset)
+    p_front = ray_at_height(front_px, pair_z, front_matrix)
+    p_same = ray_at_height(np.asarray(same, dtype=float), pair_z, same_matrix)
     delta = p_same - p_front
     if float(np.linalg.norm(delta)) > 1e-6 and float(axis @ delta) > 0.0:
         axis = -axis
-    radius = max(8, int(round(PAIR_RADIUS * float(image_size) / 512.0)))
+    # 竖直抓取的两个指腹落点同高。已知支撑面时，被挡点的像素射线与这个
+    # 水平面的交点就是它的三维位置；不要给细把手套方块宽度的固定 fallback。
+    if support is not None and plausible(p_front) and plausible(p_same) and landing_pair_ok(p_front, p_same):
+        info = {"mode": "mono", "method": "support_plane", "support_z": round(support, 4)}
+        return p_front, p_same, info
     disk = backproject_disk(front_depth, front_matrix, front_px, radius)
     top = disk[(disk[:, 2] > front[2] + 0.008) & (disk[:, 2] < front[2] + 0.045)]
     if len(top) >= 8:
@@ -361,7 +374,7 @@ def recover_landings(pixels, views, image_size, axis=None):
         back = front - axis * PAIR_FALLBACK
     if not landing_pair_ok(front, back):
         back = np.array([front[0] - PAIR_FALLBACK, front[1], front[2]], dtype=float)
-    return front, back, {"mode": "mono", "s_back": round(float(s_back), 4)}
+    return front, back, {"mode": "mono", "method": "surface_or_fallback", "s_back": round(float(s_back), 4)}
 
 
 def locate(role, pixel, depth, matrix, image_size, params=None):
@@ -679,6 +692,12 @@ def _pair_axis(axis, step):
     return axis if axis is not None else grip_axis(step)
 
 
+def _recover_for_task(task_name, pixels, views, image_size, axis):
+    """按物体已有的高度先验恢复落点对；Nut 不能用方块宽度的 fallback。"""
+    offset = NUT_HALF_THICKNESS if task_name.startswith("nutassembly") else None
+    return recover_landings(pixels, views, image_size, axis, plane_offset=offset)
+
+
 def locate_plan(task_name, subtasks, views, image_size, axis=None):
     """给计划里每一步填上 step["world"]（各像素量出来的世界坐标），execute_plan 直接用。
 
@@ -743,7 +762,7 @@ def locate_plan(task_name, subtasks, views, image_size, axis=None):
                 if key_pair in seen:
                     first, second = seen[key_pair]
                 else:
-                    first, second, info = recover_landings(pixels, views, image_size, _pair_axis(axis, step))
+                    first, second, info = _recover_for_task(task_name, pixels, views, image_size, _pair_axis(axis, step))
                     if extra:
                         info.update(extra)
                     seen[key_pair] = (first, second)
@@ -758,6 +777,8 @@ def locate_plan(task_name, subtasks, views, image_size, axis=None):
                             "role": role,
                             "world": first,
                             "world_2": second,
+                            "land_1": first,
+                            "land_2": second,
                             "center_world": center,
                             "center_pixel": project_world(center, views[DEFAULT_CAMERA][1])[0],
                             "center_pixel_back": project_world(center, views[BACK_CAMERA][1])[0]
@@ -806,7 +827,7 @@ def relocate(task_name, subtasks, start, views, image_size, axis=None):
     if role == "grip":
         pixels = grip_pixels(start_step, views)
         try:
-            first, second, info = recover_landings(pixels, views, image_size, _pair_axis(axis, start_step))
+            first, second, info = _recover_for_task(task_name, pixels, views, image_size, _pair_axis(axis, start_step))
         except ValueError:
             return None
         for step, step_role in zip(subtasks[start:], roles[start:]):
@@ -829,6 +850,8 @@ def relocate(task_name, subtasks, start, views, image_size, axis=None):
             "role": role,
             "world": first,
             "world_2": second,
+            "land_1": first,
+            "land_2": second,
             "center_world": center,
             "center_pixel": project_world(center, views[DEFAULT_CAMERA][1])[0],
             "center_pixel_back": project_world(center, views[BACK_CAMERA][1])[0]

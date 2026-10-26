@@ -73,6 +73,9 @@ WIPE_TOL = 0.01
 WIPE_STEPS = 40
 WIPE_SPEED = 0.01
 WIPE_PRESS = 0.01
+# 两指落点的水平间距必须小于夹爪最大开度；异常点对不能继续取中点执行。
+MIN_GRIP_WIDTH = 0.005
+MAX_GRIP_WIDTH = 0.085
 # 朝向一次变化超过这个角度时分段插值。目标离当前朝向接近半圈时，
 # 控制器自己选的转向会随一点点误差翻到另一边，把手腕带到关节极限。
 ORI_STEP = 0.15
@@ -426,12 +429,37 @@ def step_point(step, key, landmarks, matrices):
     return _resolve_view(step.get(key), step.get(key + "_back"), landmarks, matrices)
 
 
+def _grip_world(step, landmarks, matrices):
+    """返回两个落点并校验水平开度，避免错误点对被中点掩盖后继续执行。"""
+    first = np.asarray(step_point(step, "pixel", landmarks, matrices), dtype=float)
+    second = np.asarray(step_point(step, "pixel_2", landmarks, matrices), dtype=float)
+    axis = second - first
+    axis[2] = 0.0
+    width = float(np.linalg.norm(axis))
+    if not np.isfinite(width) or not MIN_GRIP_WIDTH <= width <= MAX_GRIP_WIDTH:
+        raise ParseError("两个落点的水平间距 {:.3f} 米，夹爪夹不了".format(width))
+    return first, second
+
+
+def _grip_ori(first, second, current):
+    """由落点连线确定竖直抓取的 yaw；两个对称朝向里选离当前更近的，避免无谓翻转。"""
+    axis = np.asarray(second, dtype=float) - np.asarray(first, dtype=float)
+    axis[2] = 0.0
+    axis /= np.linalg.norm(axis)
+    yaw = float(np.degrees(np.arctan2(-axis[0], axis[1])))
+    ori = topdown_ori(yaw)
+    flipped = topdown_ori(yaw + 180.0)
+    if float(np.dot(flipped[:, 0], current[:, 0])) > float(np.dot(ori[:, 0], current[:, 0])):
+        return flipped
+    return ori
+
+
 def _dest_for(step, landmarks, matrices, grasp_point, grasp_ori, ori):
     world = clip_workspace(step_point(step, "pixel", landmarks, matrices))
     if "pixel_2" in step:
         # target_1、target_2 是两指合拢时的两个落点，两点的中点才是要到的位置。
-        world_2 = clip_workspace(step_point(step, "pixel_2", landmarks, matrices))
-        world = 0.5 * (world + world_2)
+        first, second = _grip_world(step, landmarks, matrices)
+        world = 0.5 * (clip_workspace(first) + clip_workspace(second))
     kind = step["type"]
     if kind == "move_above":
         extra = float(step["clearance"])
@@ -484,10 +512,21 @@ def execute_plan(env, steps, hold_ori, landmarks, matrices, grip=-1.0, on_step=N
         if on_progress is not None:
             on_progress(index, step)
         kind = step["type"]
+        entry = {"type": kind}
         if kind in SPATIAL:
             if "yaw" in step:
+                # 任务给了明确 yaw 时优先使用，它通常还考虑了手腕限位和后续搬运。
                 ori = topdown_ori(step["yaw"])
+            elif "pixel_2" in step:
+                first, second = _grip_world(step, landmarks, matrices)
+                ori = _grip_ori(first, second, ori)
             dest = _dest_for(step, landmarks, matrices, grasp_point, grasp_ori, ori)
+            target_axis = np.asarray(ori, dtype=float)[:, 0]
+            entry["target_pos"] = np.round(dest, 4).tolist()
+            entry["target_yaw_deg"] = round(float(np.degrees(np.arctan2(-target_axis[0], target_axis[1]))), 2)
+            if "pixel_2" in step:
+                first, second = _grip_world(step, landmarks, matrices)
+                entry["grip_width_m"] = round(float(np.linalg.norm((second - first)[:2])), 4)
             if kind == "move_above":
                 tol, limit, command = MOVE_ABOVE_TOL, MOVE_ABOVE_STEPS, grip
             elif kind == "move_down":
@@ -496,6 +535,11 @@ def execute_plan(env, steps, hold_ori, landmarks, matrices, grip=-1.0, on_step=N
             else:
                 tol, limit, command = LIFT_TOL, LIFT_STEPS, 1.0
             obs, ok, err = goto(env, dest, ori, command, tol, limit, on_step)
+            arm = arm_controller(env)
+            actual_axis = np.asarray(arm.ref_ori_mat, dtype=float)[:, 0]
+            entry["actual_pos"] = np.round(arm.ref_pos, 4).tolist()
+            entry["actual_yaw_deg"] = round(float(np.degrees(np.arctan2(-actual_axis[0], actual_axis[1]))), 2)
+            entry["ori_err_deg"] = round(float(np.degrees(_ori_angle(arm.ref_ori_mat, ori))), 2)
             anchor = dest
             grip = command
         elif kind == "reach":
@@ -535,13 +579,8 @@ def execute_plan(env, steps, hold_ori, landmarks, matrices, grip=-1.0, on_step=N
                 ok, err = True, 0.0
         else:
             raise ParseError("未知子任务 {}".format(kind))
-        trace.append(
-            {
-                "type": kind,
-                "ok": bool(ok),
-                "err_m": None if err is None else round(float(err), 4),
-            }
-        )
+        entry.update({"ok": bool(ok), "err_m": None if err is None else round(float(err), 4)})
+        trace.append(entry)
     return obs, trace
 
 
@@ -627,6 +666,22 @@ def check_parser():
     assert np.allclose(plan[4]["path_back"][1], [160, 255])
     assert plan[4]["path_kind"] == "table"
     assert np.allclose(topdown_ori(0.0), TOPDOWN)
+    pair_step = {
+        "world": {
+            "pixel": np.array([-0.02, 0.0, 0.83]),
+            "pixel_2": np.array([0.02, 0.0, 0.83]),
+        }
+    }
+    first, second = _grip_world(pair_step, [], {})
+    assert np.allclose(_grip_ori(first, second, topdown_ori(-90.0))[:, 0], [1.0, 0.0, 0.0])
+    assert np.allclose(_grip_ori(first, second, topdown_ori(90.0))[:, 0], [-1.0, 0.0, 0.0])
+    pair_step["world"]["pixel_2"] = np.array([0.2, 0.0, 0.83])
+    try:
+        _grip_world(pair_step, [], {})
+    except ParseError:
+        pass
+    else:
+        raise AssertionError("超过夹爪开度的落点对应被拒绝")
     for bad in (
         '{"subtasks": [{"type": "fly"}]}',
         '{"subtasks": [{"type": "wipe"}]}',

@@ -67,12 +67,10 @@ from eval_lift_mllm_vllm import (
 )
 from eval_video import EvalVideo
 from depth_locate import (
-    RAY_CONSISTENCY_TOL,
     backproject_disk,
-    fuse_estimates,
     make_views,
+    measure_views,
     ray_at_height,
-    ray_gap,
     recover_landings,
 )
 from task_plan import SPATIAL, ParseError, check_parser, execute_plan, parse_plan, plausible, resolve_pixel
@@ -182,34 +180,17 @@ def perceive(subtasks, views, image_size, axis=None):
                 "center_pixel": center_pixel,
                 "center_pixel_back": project_world(world, views[BACK_CAMERA][1])[0] if BACK_CAMERA in views else None,
                 "world": world,
+                "land_1": land_front,
+                "land_2": land_back,
                 "info": dict(info, kind="grip"),
             }
             located = {"pixel": land_front, "pixel_2": land_back}
         else:
-            estimates = {}
-            errors = {}
-            for camera, pixel in ((DEFAULT_CAMERA, front), (BACK_CAMERA, back)):
-                if pixel is None or camera not in views:
-                    continue
-                depth, matrix = views[camera]
-                try:
-                    estimates[camera] = locate(pixel, depth, matrix, image_size)
-                except ParseError as exc:
-                    errors[camera] = str(exc)
-            if not estimates:
-                raise ParseError("各视图都定位失败：{}".format(errors))
+            # 中心点使用共享的自洽顶面估计：只在中心竖直小柱里找顶面，
+            # 不把旁边手臂的高差点直接当方块顶面。object 两视图独立估计后融合，
+            # 被手臂污染的一路偏高时由共享规则剔除。
             pixels = {DEFAULT_CAMERA: front, BACK_CAMERA: back}
-            gap = ray_gap(pixels, views)
-            world, info = None, {}
-            if len(estimates) >= 2 and (gap is None or gap <= RAY_CONSISTENCY_TOL):
-                try:
-                    world, info = locate_merged(front, back, views, image_size)
-                except ParseError:
-                    world = None
-            if world is None:
-                world, info = fuse_estimates("object", estimates)
-            if gap is not None:
-                info["ray_gap_m"] = round(gap, 4)
+            world, info = measure_views("object", pixels, views, image_size)
             point = {"pixel": front, "pixel_back": back, "world": world, "info": dict(info, kind="object")}
             located = {"pixel": world}
         points.append(point)
@@ -268,6 +249,14 @@ def point_target(point, gt_pix, gt_pix_back, gt_a, gt_b):
         target["pixel_back"] = round_pixel(stat_back)
         target["gt_pixel_back"] = round_pixel(gt_pix_back[index])
         target["pixel_back_err"] = round(float(np.linalg.norm(delta)), 2)
+    if target["kind"] == "grip" and point.get("land_2") is not None:
+        first = np.asarray(point["land_1"], dtype=float)
+        second = np.asarray(point["land_2"], dtype=float)
+        axis = second - first
+        target["land_1"] = np.round(first, 4).tolist()
+        target["land_2"] = np.round(second, 4).tolist()
+        target["grip_width_m"] = round(float(np.linalg.norm(axis[:2])), 4)
+        target["closing_yaw_deg"] = round(float(np.degrees(np.arctan2(-axis[0], axis[1]))), 2)
     line = "{} pixel gt={} pred={} pos gt={} pred={} {}".format(
         target["object"],
         format_pixel(stat_gt),
