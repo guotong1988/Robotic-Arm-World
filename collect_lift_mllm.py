@@ -70,7 +70,7 @@ import json
 import os
 from pathlib import Path
 
-from mllm_dataset import make_sample_id, publish_task
+from mllm_dataset import finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
 
 # mjpython 会在子线程建窗口，采集时不要用它。渲染后端要在 import robosuite 之前定好。
 import gl_backend
@@ -550,7 +550,10 @@ def plan_desc():
             "target_1 在正面相机图上，target_1_back 在背面相机图上，target_2、target_2_back 同理；"
             "某台相机看不到那个落点时对应字段写 \"mask\"，不要猜它的像素。两落点的中点是抓取位置"
         )
-    return "target_1 是夹爪1落点的像素，target_2 是夹爪2落点的像素，都在正面相机图上，两落点的中点是抓取位置"
+    return (
+        "target_1 是夹爪1落点的像素，target_2 是夹爪2落点的像素，都在正面相机图上；"
+        "target_2 被方块挡住时也根据方块形状和朝向补出它的像素，不写 mask。两落点的中点是抓取位置"
+    )
 
 
 def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels):
@@ -619,8 +622,7 @@ def save_rgb(path, image):
 class DatasetWriter:
     def __init__(self, out_dir, image_size, env):
         self.out_dir = Path(out_dir)
-        self.image_dir = self.out_dir / "images"
-        self.image_dir.mkdir(parents=True, exist_ok=True)
+        self.image_dir = make_image_staging_dir(self.out_dir, "lift")
         self.jsonl_path = self.out_dir / "samples.jsonl"
         self.meta_path = self.out_dir / "meta.json"
         self.image_size = image_size
@@ -692,7 +694,7 @@ class DatasetWriter:
             }
         )
 
-    def close(self):
+    def close(self, publish=True):
         desc_note = "每个 subtask 都带 desc，用 20 字以内说明这一步做什么；各字段的含义跟在指令话术后面，不在 answer 里重复。"
         if back_enabled():
             pixels = (
@@ -753,7 +755,9 @@ class DatasetWriter:
         }
         if back_enabled():
             meta["camera_back"] = BACK_CAMERA
-        self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
+        finish_image_staging(self.out_dir, self.image_dir, publish)
+        if publish:
+            self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
 
 
 def arm_controller(env):
@@ -924,6 +928,8 @@ def main():
     parser.add_argument("--max-attempts", type=int, default=0, help="最多尝试多少条，防止一直失败死循环。0 表示 episodes 的 10 倍")
     parser.add_argument("--out", type=str, default="data/lift_mllm", help="输出目录。可以和 Stack 共用，按 task 合并")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--episode-offset", type=int, default=0, help="首个 episode 编号；并行分片时用不同偏移避免样本 ID 冲突")
+    parser.add_argument("--episode-stride", type=int, default=1, help="每次尝试后的 episode 编号步长；并行分片使用 worker 总数")
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--height-min", type=float, default=0.06, help="抬升高度下限，米")
     parser.add_argument("--height-max", type=float, default=0.18, help="抬升高度上限，米")
@@ -936,9 +942,11 @@ def main():
     writer = DatasetWriter(args.out, args.image_size, env)
     max_attempts = args.max_attempts or args.episodes * 10
     successes = 0
-    episode = 0
+    episode = args.episode_offset
+    attempts = 0
+    complete = False
     try:
-        while successes < args.episodes and episode < max_attempts:
+        while successes < args.episodes and attempts < max_attempts:
             # 低、中、高三档各抽，避免高度都挤在区间中间。
             if args.height_max <= args.height_min:
                 target_lift = float(args.height_min)
@@ -949,12 +957,18 @@ def main():
             style = INSTRUCTION_STYLES[int(rng.integers(len(INSTRUCTION_STYLES)))]
             success = collect_episode(env, writer, episode, target_lift, style, rng)
             successes += int(success)
-            episode += 1
+            episode += args.episode_stride
+            attempts += 1
+        complete = successes >= args.episodes
     finally:
-        writer.close()
+        writer.close(publish=complete)
         env.close()
-    if successes < args.episodes:
-        print("达到最大尝试次数 {}，只采到 {} 条成功抓取".format(max_attempts, successes))
+    if not complete:
+        raise RuntimeError(
+            "达到最大尝试次数 {}，只采到 {} / {} 条成功抓取；未发布，保留原有数据".format(
+                max_attempts, successes, args.episodes
+            )
+        )
 
     print(
         "saved {} samples from {} succeeded episodes ({} failed, discarded); {} samples in {}".format(

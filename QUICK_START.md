@@ -36,8 +36,12 @@
 | `--episodes` | 50 | 采集多少条成功的轨迹 |
 | `--out` | 各脚本不同 | 输出目录 |
 | `--seed` | 0 | 随机种子 |
+| `--episode-offset` | 0 | 首个 episode 编号；并行分片使用不同偏移，避免样本 ID 冲突 |
+| `--episode-stride` | 1 | 每次尝试后的 episode 编号步长；并行分片使用 worker 总数，失败补采也不会与其他分片重叠 |
 | `--image-size` | 512 | 图像边长 |
 | `--cameras` | `frontview,backview` | 渲染并写入的相机。`frontview` 单目，被挡也照写像素；加上 `backview` 时被挡的视图写 `"mask"` |
+
+批量运行 `collect.sh` 时可用 `EPISODES`（默认 100）、`WORKERS`（默认 2）、`SEED`、`CAMERAS`、`PY` 和 `OUT` 环境变量调整配置。每个任务再启动 `WORKERS` 个独立进程，episode 按 worker 编号交错分配，失败补采不会与其他分片重叠；分片全部采满并校验通过后才合并发布，任一 worker 失败会保留该任务的原有数据。单目采集和评测可统一使用 `CAMERAS=frontview`。
 
 ## 步骤原语
 
@@ -53,9 +57,9 @@
 | `turn` | `pivot`、`axis`、`angle` | 夹爪连同手里的东西绕过 `pivot` 像素、方向为 `axis` 的转轴转 `angle` 度 |
 | `wipe` | `path`、`offset_z` | 压着桌面依次走过 `path` 里的像素，`offset_z` 是往下压的量 |
 
-- `yaw`：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度，度。用在长方物品、螺母把手上。
+- `yaw`：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度，度。只保留在无法由双落点确定的单点步骤中，例如 Nut 搬运到柱子上方、Wipe 初始朝向；双落点抓取步骤不写，执行器由两点连线推导。
 - `held`：手里物体上要对准目标的那一点的像素。螺母要对准柱子的是螺母中心，不是夹爪。抓住后夹爪再转，这一点跟着一起转。
-- `target_kind: "grip"`：`target_1`、`target_2` 是两指合拢时贴在物体两侧的两个落点，不是同一个点的两个视图。双目时每个落点再写 `target_1_back`、`target_2_back`，被挡住的那台写 `"mask"`。抓取步骤（Lift、Stack 的方块，NutAssembly 的螺母把手）这样写。PickPlace 抓的是物体中心，不写落点对。放置目标和其他空间字段仍是一点两视图。
+- `target_kind: "grip"`：`target_1`、`target_2` 是两指合拢时贴在物体两侧的两个落点，不是同一个点的两个视图。Lift、Stack、PickPlace 的竖直抓取和 NutAssembly 的螺母把手都这样写；Stack 的 Unstack/Reverse 也复用这一格式。两点的中点是抓取位置，连线决定合拢方向和 yaw，不再重复输出 `yaw`。只有 frontview 时，两个落点都写在这张图上，被物体挡住的另一个落点按形状和朝向补出像素，不写 `"mask"`；双目时每个落点再写 `target_1_back`、`target_2_back`，被挡住的那台写 `"mask"`。放置目标和其他空间字段仍是一点两视图。
 
 ## 评测时的坐标换算
 
@@ -70,16 +74,16 @@
 
 | 角色 | 量什么 |
 | --- | --- |
-| 物体中心（PickPlace 的物品；没标类别时按结构推断的抓取目标） | 底下支撑面和物体顶面，取半高 |
+| 物体中心（没标类别时按结构推断的单点抓取目标） | 底下支撑面和物体顶面，取半高 |
 | 方块中心（Stack 放绿块，`cube_center`） | 和物体中心同一套量法 |
 | 箱里的格子 | 箱沿高度减壁高（底面被箱壁挡住） |
 | 螺母 | 桌面加半个螺母厚 |
 | 柱顶 | 柱子上的顶面 |
 | 污渍 | 桌面 |
 | 门的转轴、把手 | 竖直的门板平面，法向取模型给的 `approach` |
-| 两指落点对（`grip`） | 不按平面量，成对还原两个落点（见下） |
+| 两指落点对（`grip`） | 成对还原两个落点（见下） |
 
-两指落点成对还原（`recover_landings`）：双目时每台相机用自己的深度还原看得到的那个落点；单目、或朝后的落点在 backview 被 mask 时，朝后的落点被物体挡住，用落点附近点云沿两落点连线方向的远端估计深度。执行取两落点的中点，统计误差也用中点配真值。连线方向：Stack 用开局保持的夹爪朝向（合拢轴），螺母按步骤的 `yaw` 算，Lift 不带 `yaw`，用世界 x 轴（两指沿世界 x 合拢）。
+两指落点成对还原（`recover_landings`）：双目且两台相机各看到一侧时，分别用自己的深度还原；单目或另一视图被 mask 时，Nut 用支撑面加半厚、PickPlace 结合物品顶面先验和可见指腹表面确定共同水平面，再求第二条像素射线与这个平面的交点。没有高度先验的任务退回落点附近点云和固定距离估计。执行取两落点的中点，统计误差也用中点配真值，合拢方向和 yaw 统一由恢复后的两点连线确定。深度恢复时 Stack 用开局保持的夹爪朝向作为初始连线方向，其他任务用世界 x 轴；单目分支再用两个像素的射线校正方向，旧数据里显式 `yaw` 仍兼容。
 
 合爪前指向要抓的东西，合爪后到松爪前指向放置目标。多物体时，每抓下一个之前用当前帧的深度重新量它，开局挡在它前面的物体可能已经搬走了；两指落点也成对重测。
 
@@ -111,7 +115,7 @@ python3 eval_stack_mllm_vllm.py --oracle --episodes 20
 
 ## PickPlace
 
-`--env` 可选 `PickPlace`、`PickPlaceSingle`、`PickPlaceMilk`、`PickPlaceBread`、`PickPlaceCereal`、`PickPlaceCan`（默认）。抓的是物品中心（`object`），不写两指落点。长方物品用 `yaw` 对齐。
+`--env` 可选 `PickPlace`、`PickPlaceSingle`、`PickPlaceMilk`、`PickPlaceBread`、`PickPlaceCereal`、`PickPlaceCan`（默认）。四类物品的抓取步骤都写两指落点（`grip`），中点包含顶面下 3 cm 的抓取高度；采集器内部仍用 `yaw` 选择长方物品的合拢方向，但标签只写落点，由连线恢复朝向。箱格放置仍写单个中心点（`bin`）。
 
 ```
 ~/.pyenv/versions/3.11.13/bin/python3 collect_pickplace_mllm.py --env PickPlaceCan --episodes 50 --out data/mllm
@@ -121,7 +125,7 @@ python3 eval_pickplace_mllm_vllm.py --env PickPlaceCan --oracle --episodes 20
 
 ## NutAssembly
 
-`--env` 可选 `NutAssembly`、`NutAssemblySingle`、`NutAssemblySquare`（默认）、`NutAssemblyRound`。抓螺母把手写两指落点对并带 `yaw`，套柱子时用 `held` 对准螺母中心，柱顶是单点（`peg`）。
+`--env` 可选 `NutAssembly`、`NutAssemblySingle`、`NutAssemblySquare`（默认）、`NutAssemblyRound`。抓螺母把手只写两指落点对，不再重复写抓取 `yaw`；套柱子时用 `held` 对准螺母中心，柱顶是单点（`peg`），搬运到柱子上方仍保留控制把手方向的 `yaw`。
 
 ```
 ~/.pyenv/versions/3.11.13/bin/python3 collect_nut_mllm.py --env NutAssemblySquare --episodes 50 --out data/mllm

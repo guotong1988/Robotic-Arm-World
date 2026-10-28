@@ -5,10 +5,10 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
 右边箱子每个格子里有对应物品的半透明影子，指令只说放进对应的格子。
 
 每样物品的步骤：移到物品上方、下降、合爪、抬过箱壁、移到对应格子上方、下降、松爪、抬开。
-全部放完后停住。麦片盒 10 厘米宽、3 厘米厚，只能沿窄边合拢，所以 move_above 带 yaw。
-牛奶、面包两条边都夹得下，选和最近邻居方向垂直的那条，免得手指碰到旁边的东西；
-易拉罐是圆的，旁边有东西时同样按邻居定 yaw，单独一个时不写。
-抓靠上的位置，move_down 的 offset_z 是相对物品中心的高度，顶面按碰撞网格算。
+全部放完后停住。麦片盒 10 厘米宽、3 厘米厚，只能沿窄边合拢；牛奶、面包选和最近邻居方向垂直的那条，
+免得手指碰到旁边的东西；易拉罐旁边有东西时同样按邻居选方向。采集器内部用 yaw 生成两指落点，
+标签不重复写 yaw，执行时由落点连线恢复。
+抓靠上的位置，两个指腹落点的中点已含抓取高度，所以 move_down 的 offset_z 为 0。
 四样都放时，先拿离其他物品最远的那样。
 
 输入例子。每台相机一张 RGB，默认 frontview 加 backview，对应样本的 image、image_back 字段；
@@ -16,17 +16,17 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
 
     <image>
     <image>
-    第一张图是正面相机（frontview），第二张图是背面相机（backview）。把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，target_1 是要对准的点在正面相机图上的像素，target_1_back 是同一点在背面相机图上的像素；某台相机看不到那个点时对应字段写 "mask"，不要猜它的像素。
+    第一张图是正面相机（frontview），第二张图是背面相机（backview）。把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，抓物品的步骤里 target_1、target_2 是两指落点，每个落点各给两台相机的像素；某台相机看不到那个落点时对应字段写 "mask"，不要猜它的像素。两落点的中点是抓取位置；放进箱格的步骤只写格子中心。
 
 单目只开 frontview，一个占位后面接话术和字段说明：
 
     <image>
-    把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，target_1 是要对准的点在正面相机图上的像素。
+    把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，抓物品的步骤里 target_1、target_2 是两指落点，都在正面相机图上；另一个落点被挡住时也根据物品形状和朝向补出它的像素，不写 mask。放进箱格的步骤只写格子中心。
 
-输出例子（易拉罐单独一个、还没抓住时，不带 yaw；物品中心就是要对准的点，不写两指落点。
-双目时每个空间字段各给两台相机的像素，某台相机看不到那个点时对应字段写 "mask"）：
+输出例子（易拉罐单独一个、还没抓住时；抓取步骤写两个指腹落点，中点是抓取位置，连线决定 yaw，
+不再单独输出 yaw。双目时每个落点各给两台相机的像素，某台相机看不到那个点时对应字段写 "mask"）：
 
-    {"subtasks": [{"type": "move_above", "desc": "移到易拉罐上方", "target_1": "[180 290]", "target_1_back": "mask", "target_kind": "object", "clearance": 0.12}, {"type": "move_down", "desc": "降到易拉罐处准备夹", "target_1": "[180 290]", "target_1_back": "mask", "target_kind": "object", "offset_z": 0.02}, {"type": "close_gripper", "desc": "合爪夹住易拉罐"}, {"type": "lift", "desc": "抬起易拉罐", "delta_z": 0.17, "target_1": "[180 290]", "target_1_back": "mask", "target_kind": "object"}, {"type": "move_above", "desc": "移到格子正上方", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "clearance": 0.22}, {"type": "move_down", "desc": "把易拉罐放进格子", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "offset_z": 0.1}, {"type": "open_gripper", "desc": "松爪放下易拉罐"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "clearance": 0.22}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+    {"subtasks": [{"type": "move_above", "desc": "移到易拉罐上方", "target_1": "[180 290]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[220 250]", "target_kind": "grip", "clearance": 0.12}, {"type": "move_down", "desc": "降到易拉罐处准备夹", "target_1": "[180 290]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[220 250]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住易拉罐"}, {"type": "lift", "desc": "抬起易拉罐", "delta_z": 0.17, "target_1": "[180 290]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[220 250]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到格子正上方", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "clearance": 0.22}, {"type": "move_down", "desc": "把易拉罐放进格子", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "offset_z": 0.1}, {"type": "open_gripper", "desc": "松爪放下易拉罐"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "clearance": 0.22}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
 每条成功轨迹只存开局那一帧。左边箱子里的物品会换位置和朝向，
 右边格子里的半透明目标也会在格子内部挪开中心。中途画面不存。
@@ -40,8 +40,17 @@ import argparse
 
 import numpy as np
 
-from collect_common import add_common_args, body_yaw_deg, choose_yaws, is_grasping, run_collection, wrist_yaw
-from collect_lift_mllm import set_free_xyaw
+from collect_common import (
+    add_common_args,
+    body_yaw_deg,
+    choose_yaws,
+    is_grasping,
+    order_landings_at,
+    run_collection,
+    wrist_yaw,
+)
+from collect_lift_mllm import DEFAULT_CAMERA, back_enabled, set_free_xyaw
+from grip_ik import box_contacts
 from task_plan import DEFAULT_CLEARANCE
 
 ENVS = ("PickPlace", "PickPlaceSingle", "PickPlaceMilk", "PickPlaceBread", "PickPlaceCereal", "PickPlaceCan")
@@ -182,6 +191,10 @@ class PickPlaceTask:
         out = {}
         for name in self.active(env):
             out[name] = np.array(env.sim.data.body_xpos[env.obj_body_id[name]], dtype=float)
+            # 双落点中点的真值，只用于标注记录和评测误差统计；计划仍引用物品名。
+            grasp = out[name].copy()
+            grasp[2] += max(0.0, float(self.extent(env, name)[1][2]) - GRASP_DEPTH)
+            out[name + "_grasp"] = grasp
             out[name + "_bin"] = np.array(env.target_bin_placements[self._index(env, name)], dtype=float)
         return out
 
@@ -219,6 +232,46 @@ class PickPlaceTask:
             local = (np.concatenate(points) - data.body_xpos[body]) @ mat
             self._extents[name] = (local.min(axis=0), local.max(axis=0))
         return self._extents[name]
+
+    def grip_points(self, env, name):
+        """物品两侧的两指接触点，中点和原中心抓取目标一致。"""
+        if name not in self.active(env):
+            return None
+        points = self.points(env)
+        order = self.order(env)
+        if name not in order:
+            return None
+        index = order.index(name)
+        yaw = self.grasp_yaw(env, name, points, order[index + 1 :])
+        angle = np.radians(0.0 if yaw is None else yaw)
+        axis = np.array([-np.sin(angle), np.cos(angle), 0.0])
+        center = np.array(points[name], dtype=float)
+        low, high = self.extent(env, name)
+        center[2] += max(0.0, float(high[2]) - GRASP_DEPTH)
+        body = env.obj_body_id[name]
+        rot = np.asarray(env.sim.data.body_xmat[body], dtype=float).reshape(3, 3)
+        if name == "Can":
+            radius = 0.25 * float(high[0] - low[0] + high[1] - low[1])
+            pair = (center + axis * radius, center - axis * radius)
+        else:
+            pair = box_contacts(center, 0.5 * (high - low), rot, axis)
+        camera = env.sim.data.cam_xpos[env.sim.model.camera_name2id(DEFAULT_CAMERA)]
+        return order_landings_at(center, camera, pair)
+
+    def plan_desc(self):
+        """抓取写两指落点；箱格仍写单个中心点。单目被挡的落点按形状补出。"""
+        if back_enabled():
+            return (
+                "抓物品的步骤里 target_1、target_2 是贴住物品两侧的两指落点，每个落点各给两台相机的像素："
+                "target_1 在正面相机图上，target_1_back 在背面相机图上，target_2、target_2_back 同理；"
+                "某台相机看不到那个落点时对应字段写 \"mask\"，不要猜它的像素。两落点的中点是抓取位置；"
+                "放进箱格的步骤只写 target_1、target_1_back（格子中心）"
+            )
+        return (
+            "抓物品的步骤里 target_1、target_2 是贴住物品两侧的两指落点，都在正面相机图上；"
+            "另一个落点被物品挡住时也根据物品形状和朝向补出它的像素，不写 mask。两落点的中点是抓取位置；"
+            "放进箱格的步骤只写 target_1（格子中心）"
+        )
 
     def grasp_yaw(self, env, name, points, neighbors):
         """先验知识，不是逆运动学：只给出目标 yaw，关节角留给后面的控制器。
@@ -276,13 +329,20 @@ class PickPlaceTask:
             grasp = max(0.0, top - GRASP_DEPTH)
             carry_z = bin_z + WALL_HEIGHT + CARRY_MARGIN + grasp + rest
             label = OBJECT_CN[name]
-            above = {"type": "move_above", "ref": name, "clearance": max(DEFAULT_CLEARANCE, top + 0.06), "obj": name, "desc_hint": "移到{}上方".format(label)}
+            # 双落点中点已经包含 grasp 高度，above/down 只写相对这个中点的剩余位移。
+            above = {
+                "type": "move_above",
+                "ref": name,
+                "clearance": max(DEFAULT_CLEARANCE, top + 0.06) - grasp,
+                "obj": name,
+                "desc_hint": "移到{}上方".format(label),
+            }
             if yaw is not None:
                 above["yaw"] = yaw
             target = name + "_bin"
             plan += [
                 above,
-                {"type": "move_down", "ref": name, "offset_z": grasp, "obj": name, "desc_hint": "降到{}处准备夹".format(label)},
+                {"type": "move_down", "ref": name, "offset_z": 0.0, "obj": name, "desc_hint": "降到{}处准备夹".format(label)},
                 {"type": "close_gripper", "obj": name, "desc_hint": "合爪夹住{}".format(label)},
                 {"type": "lift", "ref": name, "goal_z": carry_z, "obj": name, "desc_hint": "抬起{}过箱壁".format(label)},
                 {"type": "move_above", "ref": target, "clearance": carry_z - bin_z, "obj": name, "desc_hint": "移到格子正上方"},
@@ -345,7 +405,7 @@ class PickPlaceTask:
             "objects_cn": OBJECT_CN,
             "grasp_depth_m": GRASP_DEPTH,
             "drop_height_m": DROP_HEIGHT,
-            "point_names": "物品名是物品中心，物品名_bin 是右边箱子里对应格子底面的中心",
+            "point_names": "物品名是物品中心，物品名_grasp 是两指落点中点，物品名_bin 是右边箱子里对应格子底面的中心",
         }
 
     def describe(self, env):

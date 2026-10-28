@@ -4,9 +4,9 @@
     python3 eval_pickplace_mllm_vllm.py --oracle --env PickPlace --episodes 5
 
 一张 frontview RGB 加一句「把牛奶放进右边箱子里对应的格子。」，模型写出每样物品
-移到上方、下降、合爪、抬过箱壁、放到格子里、松爪退开的全部步骤，长方物品带 yaw。
-物品中心用深度图量出它的底面和顶面，取半高处的视线交点；格子底面被箱壁挡着看不到，
-用量到的箱沿高度减去壁高。流程详见 eval_task_core.py 和 depth_locate.py。
+移到上方、下降、合爪、抬过箱壁、放到格子里、松爪退开的全部步骤。抓取步骤只给物品两侧的
+两指落点，由连线恢复 yaw；单目结合顶面先验和可见表面补全另一侧。格子底面被箱壁
+挡着看不到，用量到的箱沿高度减去壁高。流程详见 eval_task_core.py 和 depth_locate.py。
 """
 
 import argparse

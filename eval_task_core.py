@@ -20,7 +20,7 @@
 
 仿真真值只用于事后统计像素和世界误差，不进模型输入，也不参与定位和控制。
 --oracle 用真值步骤代替模型回答，其余流程不变，用来确认深度定位和执行器本身够用。
-录像是左右并排的 mp4：左边 frontview 标出模型像素，右边是深度点云和定位点。
+录像按采集输入的相机顺序并排，逐视图标出模型回答的原始像素，不叠加深度点云。
 """
 
 import time
@@ -32,7 +32,7 @@ gl_backend.configure()
 
 import numpy as np
 
-from collect_common import eef_pose, make_env, plan_desc, prepare_scene, render_plan
+from collect_common import eef_pose, make_env, prepare_scene, render_plan, task_instruction
 from collect_lift_mllm import (
     BACK_CAMERA,
     CAMERAS,
@@ -42,7 +42,6 @@ from collect_lift_mllm import (
     format_pixel,
     project_world,
     round_pixel,
-    with_views,
     world_to_pixel_matrices,
 )
 from depth_locate import locate_plan, make_views, pick_starts, relocate
@@ -55,6 +54,7 @@ from eval_lift_mllm_vllm import (
     format_err_axes,
     format_xyz,
     pos_error,
+    reset_episode_rng,
     write_mp4,
 )
 from eval_video import EvalVideo
@@ -117,9 +117,11 @@ def gt_pool(gt, role):
         pool = [item for item in gt if item["name"].endswith("_bin")]
     elif role == "peg":
         pool = [item for item in gt if item["name"].endswith("_peg")]
-    elif role in ("object", "cube_center", "nut", "grip"):
-        # grip 是螺母的两指落点，中点就是螺母中心，和 nut 一样配螺母的真值点；cube_center 是方块中心。
-        pool = [item for item in gt if not item["name"].endswith(("_bin", "_peg"))]
+    elif role == "grip":
+        # 两落点的中点是抓取高度，不和物体几何中心或放置目标混配。
+        pool = [item for item in gt if item["name"].endswith("_grasp")]
+    elif role in ("object", "cube_center", "nut"):
+        pool = [item for item in gt if not item["name"].endswith(("_bin", "_peg", "_grasp"))]
     else:
         pool = []
     return pool or gt
@@ -196,7 +198,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
             plan = task.build_plan(env, rng)
             if bool(task.success(env)):
                 break
-            instruction = with_views(task.instruction(env, plan, 0, style, False), plan_desc(task))
+            instruction = task_instruction(task, env, plan, 0, style, False)
             gt_subtasks, _ = render_plan(task, env, plan, 0, matrices, False)
             if not gt_subtasks:
                 break
@@ -221,11 +223,11 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
             )
             try:
                 subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
+                if video is not None:
+                    video.set_plan(subtasks, obs)
                 round_rec["steps"] = [step["type"] for step in subtasks]
                 round_rec["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
                 points = locate_plan(task.task, subtasks, views, image_size)
-                if video is not None:
-                    video.set_points(points, obs)
                 round_rec["targets"] = match_targets(points, gt)
                 for target in round_rec["targets"]:
                     print(
@@ -250,8 +252,6 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                         )
                         if point is not None:
                             relocated.extend(match_targets([point], gt_points(task, env, matrices)))
-                            if video is not None:
-                                video.update_point(point, latest.get("obs"))
 
                 final, trace = execute_plan(
                     env,
@@ -380,6 +380,7 @@ def add_common_args(parser, default_out):
     parser.add_argument("--model", default="", help="模型名。留空则用服务 /v1/models 的第一个")
     parser.add_argument("--episodes", type=int, default=20, help="测评多少条")
     parser.add_argument("--seed", type=int, default=1000, help="和采集用的 seed 0 错开；传 0 则和采集同批场景")
+    parser.add_argument("--fixed-initial", action="store_true", help="每条测评都使用同一个 seed 对应的初始场景")
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-tokens", type=int, default=2048, help="多物体任务的计划有三十几步，比 Stack 长")
@@ -422,6 +423,8 @@ def run_eval(task, args, client):
     records = []
     try:
         for episode in range(args.episodes):
+            if args.fixed_initial:
+                rng = reset_episode_rng(env, args.seed)
             style = task.styles[int(rng.integers(len(task.styles)))]
             video_path = None if video_dir is None else video_dir / "ep{:04d}.mp4".format(episode)
             try:
@@ -439,6 +442,7 @@ def run_eval(task, args, client):
         summary["env"] = task.env_name
         summary["oracle"] = bool(args.oracle)
         summary["seed"] = args.seed
+        summary["fixed_initial"] = bool(args.fixed_initial)
         summary["backend"] = "oracle" if args.oracle else "vllm"
         if client is not None:
             summary["model"] = client.model
@@ -479,7 +483,6 @@ def self_test():
                     "target_1": "[195 305]",
                     "target_2": "[205 315]",
                     "target_kind": "grip",
-                    "yaw": -35,
                     "clearance": 0.1,
                 },
                 {
@@ -497,7 +500,7 @@ def self_test():
                     "target_kind": "grip",
                     "delta_z": 0.17,
                 },
-                {"type": "move_above", "target_1": "[320 280]", "clearance": 0.05, "held": "[205 312]"},
+                {"type": "move_above", "target_1": "[320 280]", "clearance": 0.05, "yaw": 12, "held": "[205 312]"},
                 {"type": "move_down", "target_1": "[320 280]", "offset_z": -0.165, "held": "[205 312]"},
                 {"type": "open_gripper"},
                 {"type": "move_above", "target_1": "[320 280]", "clearance": 0.06, "held": "[205 312]"},

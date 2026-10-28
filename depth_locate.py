@@ -21,9 +21,9 @@ depth_locate 不用按任务名硬编码；没写或写了不认识的类别时�
 - door_axis、door_handle：Door 的门锁转轴、铰链在门板中面上，把手抓取点在中面前方。
   门几乎侧对相机，水平面求交很不稳（高度差 1 毫米，水平位置差 5 毫米），改用竖直的门板平面。
   门板法向就是模型给的 approach（门锁转轴方向），沿法向投影后最密的一层点是门板朝相机的那面
-- grip：两指落点是一对，不按平面量，用 recover_landings 成对还原：
-  双目时每台相机用自己的深度还原它看得到的那个落点；单目（或落点在背面相机被 mask）时
-  朝后的落点被物体挡住，用落点附近点云沿两落点连线方向的远端估计深度。执行时取两点的中点
+- grip：两指落点是一对，用 recover_landings 成对还原：双目各看到一侧时分别读表面深度；
+  单目（或落点在背面相机被 mask）时，Nut 用支撑面加半厚、PickPlace 结合物品顶面先验
+  和可见指腹表面确定共同水平面，补出另一条视线上的落点；其他任务退回落点附近点云。执行取两点中点
 
 每个标注点有两个视图：frontview（平视）和 backview（在 frontview 正对面）。
 模型在两个视图里各给一个像素，被遮挡的视图写 "mask"（解析成 None），定位只用看得到的视图。
@@ -75,6 +75,8 @@ MIN_COLUMN_POINTS = 5
 VISIBLE_TOLERANCE = 0.005
 # PickPlace 箱壁顶面相对箱子原点的高度，米。和 collect_pickplace_mllm.WALL_HEIGHT 一致。
 BIN_WALL_HEIGHT = 0.10
+# PickPlace 指尖落在物品顶面以下的深度，和采集的 GRASP_DEPTH 一致。
+PICKPLACE_GRASP_DEPTH = 0.03
 # 螺母中心比桌面高这么多，米，约为螺母厚度的一半。
 NUT_HALF_THICKNESS = 0.009
 # 门板厚度的一半；把手抓取点在门板中面前方多远，米。
@@ -305,7 +307,7 @@ def grip_axis(step):
     return ori[:, 0] / float(np.linalg.norm(ori[:, 0]))
 
 
-def recover_landings(pixels, views, image_size, axis=None, plane_offset=None):
+def recover_landings(pixels, views, image_size, axis=None, plane_offset=None, plane_z=None):
     """两个落点像素换成世界坐标，返回 (朝前的点, 朝后的点, 记录)。
 
     pixels 里 front 是朝前落点的 frontview 像素（被 mask 时 front_back 是它在 backview 的像素）；
@@ -317,8 +319,9 @@ def recover_landings(pixels, views, image_size, axis=None, plane_offset=None):
     axis 是两落点的连线方向（世界系，默认世界 x 轴，lift 的合拢方向），
     方向不限：same 分支会把它规范成指向相机（back 比 front 远离相机，
     在 axis 的负侧），调用方给执行朝向的第一列也不怕符号反。
-    plane_offset 给出落点相对支撑面的高度（如 Nut 的半厚）。same 分支优先
-    用这个水平面和两条像素射线求交，避免细把手套用方块宽度的固定 fallback。
+    plane_offset 给出落点相对支撑面的高度（如 Nut 的半厚），plane_z 也可直接
+    给出绝对高度（如 PickPlace 由顶面先验和可见指腹表面确定的抓取高度）。same 分支优先用
+    这个水平面和两条像素射线求交，避免遮挡落点套用固定宽度 fallback。
     """
     if axis is None:
         axis = np.array([1.0, 0.0, 0.0])
@@ -344,9 +347,9 @@ def recover_landings(pixels, views, image_size, axis=None, plane_offset=None):
     # 在 axis 的负侧），调用方给执行朝向的第一列也不怕符号反。
     same_depth, same_matrix = views[DEFAULT_CAMERA]
     radius = max(8, int(round(PAIR_RADIUS * float(image_size) / 512.0)))
-    pair_z = float(front[2])
+    pair_z = float(front[2]) if plane_z is None else float(plane_z)
     support = None
-    if plane_offset is not None:
+    if plane_z is None and plane_offset is not None:
         disk = backproject_disk(front_depth, front_matrix, front_px, radius)
         support = lowest_surface(disk)
         pair_z = support + float(plane_offset)
@@ -355,10 +358,13 @@ def recover_landings(pixels, views, image_size, axis=None, plane_offset=None):
     delta = p_same - p_front
     if float(np.linalg.norm(delta)) > 1e-6 and float(axis @ delta) > 0.0:
         axis = -axis
-    # 竖直抓取的两个指腹落点同高。已知支撑面时，被挡点的像素射线与这个
-    # 水平面的交点就是它的三维位置；不要给细把手套方块宽度的固定 fallback。
-    if support is not None and plausible(p_front) and plausible(p_same) and landing_pair_ok(p_front, p_same):
-        info = {"mode": "mono", "method": "support_plane", "support_z": round(support, 4)}
+    # 竖直抓取的两个指腹落点同高。已知抓取水平面时，被挡点的像素射线与
+    # 这个平面的交点就是它的三维位置，不用固定宽度 fallback。
+    if (plane_z is not None or support is not None) and plausible(p_front) and plausible(p_same) and landing_pair_ok(p_front, p_same):
+        if plane_z is not None:
+            info = {"mode": "mono", "method": "known_plane", "plane_z": round(pair_z, 4)}
+        else:
+            info = {"mode": "mono", "method": "support_plane", "support_z": round(support, 4)}
         return p_front, p_same, info
     disk = backproject_disk(front_depth, front_matrix, front_px, radius)
     top = disk[(disk[:, 2] > front[2] + 0.008) & (disk[:, 2] < front[2] + 0.045)]
@@ -692,10 +698,55 @@ def _pair_axis(axis, step):
     return axis if axis is not None else grip_axis(step)
 
 
+def _pickplace_object_plane(pixel, depth, matrix, image_size):
+    """按物体顶面和固定抓取深度估计水平面。"""
+    center, info = locate("object", pixel, depth, matrix, image_size)
+    if info["top_z"] is None:
+        raise ParseError("PickPlace 物品顶面估计失败")
+    return float(info["top_z"]) - PICKPLACE_GRASP_DEPTH, info
+
+
+def _pickplace_plane(pixels, views, image_size):
+    """顶面先验为主；高物品的可见接触面明显更高时，用它纠正箱壁造成的低估。"""
+    camera = DEFAULT_CAMERA if pixels.get("front") is not None else BACK_CAMERA
+    key = "front" if camera == DEFAULT_CAMERA else "front_back"
+    if pixels.get(key) is None or camera not in views:
+        raise ParseError("PickPlace 朝前落点没有可用视图")
+    if pixels.get("same") is None:
+        raise ParseError("缺少第二个落点")
+    depth, matrix = views[camera]
+    front = surface_point(pixels[key], depth, matrix, radius=1)
+    visible_z = float(front[2])
+    info = {"view": camera, "surface_z": round(visible_z, 4)}
+    pixel = 0.5 * (np.asarray(pixels[key], dtype=float) + np.asarray(pixels["same"], dtype=float))
+    try:
+        object_z, object_info = _pickplace_object_plane(pixel, depth, matrix, image_size)
+    except ValueError:
+        return visible_z, dict(info, source="visible")
+    info["object_plane"] = object_info
+    # 圆柱剪影的深度会偏低；Milk 的尖顶又会让通用中心定位锁到箱壁。
+    # 只有可见面高出顶面估计足够多时才覆盖，普通箱壁遮挡仍用顶面减抓取深度。
+    if visible_z > object_z + 0.045:
+        return visible_z, dict(info, source="visible", object_z=round(object_z, 4))
+    return object_z, dict(info, source="object_top", object_z=round(object_z, 4))
+
+
 def _recover_for_task(task_name, pixels, views, image_size, axis):
-    """按物体已有的高度先验恢复落点对；Nut 不能用方块宽度的 fallback。"""
+    """按物体已有的高度先验恢复落点对，遮挡时不用统一的方块宽度。"""
     offset = NUT_HALF_THICKNESS if task_name.startswith("nutassembly") else None
-    return recover_landings(pixels, views, image_size, axis, plane_offset=offset)
+    # 双目各看一侧时直接读两个可见表面；只有 same 分支才需要 PickPlace 的抓取平面。
+    needs_plane = task_name.startswith("pickplace") and not (
+        pixels.get("back") is not None and BACK_CAMERA in views
+    )
+    plane_info = None
+    if needs_plane:
+        plane_z, plane_info = _pickplace_plane(pixels, views, image_size)
+    else:
+        plane_z = None
+    first, second, info = recover_landings(pixels, views, image_size, axis, plane_offset=offset, plane_z=plane_z)
+    if plane_info is not None:
+        info["visible_plane"] = plane_info
+    return first, second, info
 
 
 def locate_plan(task_name, subtasks, views, image_size, axis=None):

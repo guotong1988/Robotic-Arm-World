@@ -65,7 +65,7 @@ import robosuite as suite
 import robosuite.macros as macros
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
-from mllm_dataset import make_sample_id, publish_task
+from mllm_dataset import finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
 from collect_common import order_landings_at
 from collect_lift_mllm import (
     ABOVE_XY_TOL,
@@ -269,8 +269,8 @@ def plan_desc():
             "两落点的中点是抓取点；" + tail
         )
     return (
-        "抓红块的步骤里 target_1、target_2 是贴住红块两侧的两指落点的像素，"
-        "都在正面相机图上，中点是抓取点；"
+        "抓红块的步骤里 target_1、target_2 是贴住红块两侧的两指落点的像素，都在正面相机图上；"
+        "另一个落点被红块挡住时也根据方块形状和朝向补出它的像素，不写 mask。两落点的中点是抓取点；"
         "放绿块的步骤只写 target_1，target_kind 是 cube_center（方块中心），offset_z 是相对这个中心的高度"
     )
 
@@ -415,8 +415,7 @@ def prepare_scene(env, rng, on_step=None):
 class DatasetWriter:
     def __init__(self, out_dir, image_size, env):
         self.out_dir = Path(out_dir)
-        self.image_dir = self.out_dir / "images"
-        self.image_dir.mkdir(parents=True, exist_ok=True)
+        self.image_dir = make_image_staging_dir(self.out_dir, "stack")
         self.jsonl_path = self.out_dir / "samples.jsonl"
         self.meta_path = self.out_dir / "meta.json"
         self.image_size = int(image_size)
@@ -475,7 +474,7 @@ class DatasetWriter:
             self.samples.append(record)
         self.episodes.append({"episode": episode, "success": True})
 
-    def close(self):
+    def close(self, publish=True):
         if BACK_CAMERA in CAMERAS:
             pixels = (
                 "move_above、move_down、lift 里每个空间字段各给两台相机的像素，格式是 \"[x y]\"，x 向右、y 向下："
@@ -528,7 +527,9 @@ class DatasetWriter:
         }
         if BACK_CAMERA in CAMERAS:
             meta["camera_back"] = BACK_CAMERA
-        self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
+        finish_image_staging(self.out_dir, self.image_dir, publish)
+        if publish:
+            self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
 
 
 def collect_episode(env, writer, episode, style, rng):
@@ -645,6 +646,8 @@ def main():
     parser.add_argument("--max-attempts", type=int, default=0, help="最多尝试多少条，防止一直失败死循环。0 表示 episodes 的 10 倍")
     parser.add_argument("--out", type=str, default="data/stack_mllm", help="输出目录。可以和 Lift 共用，按 task 合并")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--episode-offset", type=int, default=0, help="首个 episode 编号；并行分片时用不同偏移避免样本 ID 冲突")
+    parser.add_argument("--episode-stride", type=int, default=1, help="每次尝试后的 episode 编号步长；并行分片使用 worker 总数")
     parser.add_argument("--image-size", type=int, default=512)
     add_camera_arg(parser)
     args = parser.parse_args()
@@ -655,18 +658,26 @@ def main():
     writer = DatasetWriter(args.out, args.image_size, env)
     max_attempts = args.max_attempts or args.episodes * 10
     successes = 0
-    episode = 0
+    episode = args.episode_offset
+    attempts = 0
+    complete = False
     try:
-        while successes < args.episodes and episode < max_attempts:
+        while successes < args.episodes and attempts < max_attempts:
             style = INSTRUCTION_STYLES[int(rng.integers(len(INSTRUCTION_STYLES)))]
             success = collect_episode(env, writer, episode, style, rng)
             successes += int(success)
-            episode += 1
+            episode += args.episode_stride
+            attempts += 1
+        complete = successes >= args.episodes
     finally:
-        writer.close()
+        writer.close(publish=complete)
         env.close()
-    if successes < args.episodes:
-        print("达到最大尝试次数 {}，只采到 {} 条成功叠放".format(max_attempts, successes))
+    if not complete:
+        raise RuntimeError(
+            "达到最大尝试次数 {}，只采到 {} / {} 条成功叠放；未发布，保留原有数据".format(
+                max_attempts, successes, args.episodes
+            )
+        )
     print(
         "saved {} samples from {} succeeded episodes ({} failed, discarded); {} samples in {}".format(
             len(writer.samples), successes, writer.discarded, writer.merged_count, writer.out_dir

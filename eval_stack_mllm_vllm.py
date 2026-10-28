@@ -63,6 +63,7 @@ from eval_lift_mllm_vllm import (
     format_err_axes,
     format_xyz,
     pos_error,
+    reset_episode_rng,
     write_mp4,
 )
 from eval_video import EvalVideo
@@ -335,11 +336,11 @@ def run_episode(env, client, rng, episode, image_size, oracle, video_path=None):
         print("episode {:02d} answer ({}s):\n{}".format(episode, record["seconds"], answer), flush=True)
         try:
             subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
+            if video is not None:
+                video.set_plan(subtasks, obs)
             record["steps"] = [step["type"] for step in subtasks]
             record["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
             points = perceive(subtasks, views, image_size, axis=axis)
-            if video is not None:
-                video.set_points(points, obs)
             targets = []
             for point in points:
                 target, line = point_target(point, gt_pix, gt_pix_back, gt_a, gt_b)
@@ -498,6 +499,7 @@ def main():
     parser.add_argument("--model", default="", help="模型名。留空则用服务 /v1/models 的第一个")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1000, help="和采集用的 seed 0 错开，避免同一批初始场景")
+    parser.add_argument("--fixed-initial", action="store_true", help="每条测评都使用同一个 seed 对应的初始场景")
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-tokens", type=int, default=1024)
@@ -538,6 +540,8 @@ def main():
     records = []
     try:
         for episode in range(args.episodes):
+            if args.fixed_initial:
+                rng = reset_episode_rng(env, args.seed)
             video_path = None if video_dir is None else video_dir / "ep{:04d}.mp4".format(episode)
             try:
                 record = run_episode(env, client, rng, episode, image_size, args.oracle, video_path)
@@ -550,6 +554,7 @@ def main():
         summary = summarize(records)
         summary["oracle"] = bool(args.oracle)
         summary["seed"] = args.seed
+        summary["fixed_initial"] = bool(args.fixed_initial)
         summary["backend"] = "oracle" if args.oracle else "vllm"
         if client is not None:
             summary["model"] = client.model

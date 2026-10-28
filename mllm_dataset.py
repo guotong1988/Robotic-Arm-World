@@ -8,10 +8,12 @@ task 用来区分任务，也用来重跑时替换旧样本。
 两个任务都在时，各自的统计和相机矩阵放在 meta.json 的 tasks 下面。
 """
 
+import argparse
 import fcntl
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -63,6 +65,28 @@ def _prune_images(out_dir, task, merged, dropped_images):
         for path in image_dir.glob(task + "_*.png"):
             if path.name not in keep_names:
                 path.unlink()
+
+
+def make_image_staging_dir(out_dir, task):
+    """正式图片发布前的任务私有目录，避免残缺采集覆盖同名旧图。"""
+    out_dir = Path(out_dir)
+    staging_root = out_dir / ".collect_pending"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=task + "_", dir=str(staging_root)))
+
+
+def finish_image_staging(out_dir, staging_dir, publish):
+    staging_dir = Path(staging_dir)
+    if publish:
+        image_dir = Path(out_dir) / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        for source in staging_dir.glob("*.png"):
+            os.replace(str(source), str(image_dir / source.name))
+    shutil.rmtree(staging_dir)
+    try:
+        staging_dir.parent.rmdir()
+    except OSError:
+        pass
 
 
 def _lock_path(out_dir):
@@ -173,3 +197,127 @@ def _publish_task(out_dir, task, samples, task_meta):
         combined["camera_world_to_pixel"] = matrix
     meta_path.write_text(json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8")
     return len(merged)
+
+
+def _shard_meta(out_dir, task):
+    meta = _read_json(out_dir / "meta.json")
+    if "tasks" in meta:
+        if task not in meta["tasks"]:
+            raise ValueError("{} 的 meta.json 缺少任务 {}".format(out_dir, task))
+        return meta["tasks"][task]
+    if not meta:
+        raise ValueError("{} 缺少有效的 meta.json".format(out_dir))
+    return meta
+
+
+def _meta_config(meta):
+    volatile = {"num_episodes", "num_discarded_episodes", "num_samples", "episodes"}
+    return {key: value for key, value in meta.items() if key not in volatile}
+
+
+def merge_task_shards(out_dir, task, shard_dirs, expected_episodes):
+    """校验并合并同任务的独立采集分片；校验失败时不碰正式数据。"""
+    if not shard_dirs:
+        raise ValueError("至少需要一个采集分片")
+    out_dir = Path(out_dir)
+    rows = []
+    episodes = []
+    sample_ids = set()
+    episode_ids = set()
+    image_paths = set()
+    copies = []
+    merged_meta = None
+    meta_config = None
+    discarded = 0
+
+    for shard_dir in shard_dirs:
+        shard_dir = Path(shard_dir)
+        shard_rows = _read_jsonl(shard_dir / "samples.jsonl")
+        if not shard_rows:
+            raise ValueError("分片 {} 没有样本，拒绝发布".format(shard_dir))
+        meta = _shard_meta(shard_dir, task)
+        config = _meta_config(meta)
+        if meta_config is None:
+            merged_meta = dict(meta)
+            meta_config = config
+        elif config != meta_config:
+            raise ValueError("分片 {} 的相机或任务元数据与其他分片不一致".format(shard_dir))
+
+        shard_episodes = set()
+        for row in shard_rows:
+            if row.get("task") != task:
+                raise ValueError("分片 {} 含其他任务的样本".format(shard_dir))
+            sample_id = row.get("id")
+            episode = row.get("episode")
+            if not isinstance(sample_id, str) or not sample_id:
+                raise ValueError("分片 {} 含无效样本 ID".format(shard_dir))
+            if not isinstance(episode, int) or isinstance(episode, bool):
+                raise ValueError("样本 {} 的 episode 无效".format(sample_id))
+            if sample_id in sample_ids:
+                raise ValueError("样本 ID 重复：{}".format(sample_id))
+            if episode in episode_ids:
+                raise ValueError("episode 重复：{}".format(episode))
+            sample_ids.add(sample_id)
+            episode_ids.add(episode)
+            shard_episodes.add(episode)
+            rows.append(row)
+            for rel in _row_images(row):
+                rel_path = Path(rel)
+                if rel_path.is_absolute() or not rel_path.parts or rel_path.parts[0] != "images" or ".." in rel_path.parts:
+                    raise ValueError("样本 {} 的图片路径不安全：{}".format(sample_id, rel))
+                source = shard_dir / rel_path
+                if not source.is_file():
+                    raise ValueError("样本 {} 缺少图片：{}".format(sample_id, source))
+                if rel in image_paths:
+                    raise ValueError("多个样本引用同一图片：{}".format(rel))
+                image_paths.add(rel)
+                copies.append((source, out_dir / rel_path))
+
+        if meta.get("num_episodes") != len(shard_episodes):
+            raise ValueError("分片 {} 的 episode 统计与样本不一致".format(shard_dir))
+        if meta.get("num_samples") != len(shard_rows):
+            raise ValueError("分片 {} 的样本统计与 samples.jsonl 不一致".format(shard_dir))
+        shard_meta_episodes = meta.get("episodes", [])
+        meta_episode_ids = [entry.get("episode") for entry in shard_meta_episodes]
+        if len(meta_episode_ids) != len(shard_episodes) or set(meta_episode_ids) != shard_episodes:
+            raise ValueError("分片 {} 的 meta episodes 与样本编号不一致".format(shard_dir))
+        episodes.extend(shard_meta_episodes)
+        discarded += int(meta.get("num_discarded_episodes", 0))
+
+    if len(episode_ids) != int(expected_episodes):
+        raise ValueError(
+            "任务 {} 只有 {} / {} 条成功轨迹，拒绝发布".format(task, len(episode_ids), expected_episodes)
+        )
+    if len(episodes) != len(episode_ids):
+        raise ValueError("任务 {} 的 meta episodes 与样本数量不一致".format(task))
+
+    for _, destination in copies:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    for source, destination in copies:
+        shutil.copy2(source, destination)
+    rows.sort(key=lambda row: (row["episode"], row.get("step", 0), row["id"]))
+    merged_meta["num_episodes"] = len(episode_ids)
+    merged_meta["num_discarded_episodes"] = discarded
+    merged_meta["num_samples"] = len(rows)
+    merged_meta["episodes"] = sorted(episodes, key=lambda entry: entry["episode"])
+    return publish_task(out_dir, task, rows, merged_meta)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MLLM 数据集的分片合并工具")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    merge = subparsers.add_parser("merge-task", help="全部校验通过后合并一个任务的采集分片")
+    merge.add_argument("--out", required=True, help="正式数据集目录")
+    merge.add_argument("--task", required=True)
+    merge.add_argument("--episodes", type=int, required=True, help="必须达到的成功轨迹总数")
+    merge.add_argument("--shards", nargs="+", required=True, help="该任务的独立分片目录")
+    args = parser.parse_args()
+    if args.command == "merge-task":
+        count = merge_task_shards(args.out, args.task, args.shards, args.episodes)
+        print("published task {} with {} episodes; {} samples in {}".format(
+            args.task, args.episodes, count, args.out
+        ))
+
+
+if __name__ == "__main__":
+    main()

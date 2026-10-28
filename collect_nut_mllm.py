@@ -3,8 +3,8 @@
 --env 可选 NutAssembly（两个都套）、NutAssemblySingle（每次随机一个）、
 NutAssemblySquare、NutAssemblyRound（固定一个）。方形螺母套方柱，圆形螺母套圆柱。
 
-螺母只有把手能抓。夹爪按螺母朝向转到两指横跨把手（move_above 带 yaw），
-抓取步骤带两指落点：target_1、target_2 贴在把手横杆两侧，两点的中点是把手上的抓取点。
+螺母只有把手能抓。采集器内部按螺母朝向规划抓取 yaw，让两指横跨把手；
+抓取标签只带两指落点：target_1、target_2 贴在把手横杆两侧，两点的中点是抓取点，连线决定执行 yaw。
 单目只开 frontview 时两个落点都写在正面相机图上；默认 frontview 加 backview 双目时
 每个落点各给两台相机的像素：target_1、target_1_back、target_2、target_2_back，
 某台相机看不到那个落点时对应字段写 "mask"，不脑补这张图的像素。
@@ -29,7 +29,7 @@ NutAssemblySquare、NutAssemblyRound（固定一个）。方形螺母套方柱�
 
 输出例子（方形螺母还没抓住时，每个 subtask 都带 desc）：
 
-    {"subtasks": [{"type": "move_above", "desc": "移到方形螺母上方", "target_1": "[238 305]", "target_1_back": "[255 300]", "target_2": "mask", "target_2_back": "[262 300]", "target_kind": "grip", "clearance": 0.1, "yaw": -35}, {"type": "move_down", "desc": "降到把手上方准备夹", "target_1": "[238 305]", "target_1_back": "[255 300]", "target_2": "mask", "target_2_back": "[262 300]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住把手"}, {"type": "lift", "desc": "抬起方形螺母", "delta_z": 0.25, "target_1": "[238 305]", "target_1_back": "[255 300]", "target_2": "mask", "target_2_back": "[262 300]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到方柱正上方", "target_1": "[300 250]", "target_1_back": "[215 255]", "target_kind": "peg", "clearance": 0.05, "yaw": 12, "held": "[248 308]", "held_back": "[265 303]", "held_kind": "nut"}, {"type": "move_down", "desc": "把方形螺母套到方柱上", "target_1": "[300 250]", "target_1_back": "[215 255]", "target_kind": "peg", "offset_z": -0.165, "held": "[248 308]", "held_back": "[265 303]", "held_kind": "nut"}, {"type": "open_gripper", "desc": "松爪放下螺母"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[300 250]", "target_1_back": "[215 255]", "target_kind": "peg", "clearance": 0.06, "held": "[248 308]", "held_back": "[265 303]", "held_kind": "nut"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+    {"subtasks": [{"type": "move_above", "desc": "移到方形螺母上方", "target_1": "[238 305]", "target_1_back": "[255 300]", "target_2": "mask", "target_2_back": "[262 300]", "target_kind": "grip", "clearance": 0.1}, {"type": "move_down", "desc": "降到把手上方准备夹", "target_1": "[238 305]", "target_1_back": "[255 300]", "target_2": "mask", "target_2_back": "[262 300]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住把手"}, {"type": "lift", "desc": "抬起方形螺母", "delta_z": 0.25, "target_1": "[238 305]", "target_1_back": "[255 300]", "target_2": "mask", "target_2_back": "[262 300]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到方柱正上方", "target_1": "[300 250]", "target_1_back": "[215 255]", "target_kind": "peg", "clearance": 0.05, "yaw": 12, "held": "[248 308]", "held_back": "[265 303]", "held_kind": "nut"}, {"type": "move_down", "desc": "把方形螺母套到方柱上", "target_1": "[300 250]", "target_1_back": "[215 255]", "target_kind": "peg", "offset_z": -0.165, "held": "[248 308]", "held_back": "[265 303]", "held_kind": "nut"}, {"type": "open_gripper", "desc": "松爪放下螺母"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[300 250]", "target_1_back": "[215 255]", "target_kind": "peg", "clearance": 0.06, "held": "[248 308]", "held_back": "[265 303]", "held_kind": "nut"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
 每条成功轨迹只存开局那一帧。螺母在靠近机械臂的半边桌面上换位置和朝向，
 对应的柱子在远离机械臂的半边换位置，两者保持间隔。中途画面不存。
@@ -216,7 +216,11 @@ class NutTask:
                 "某台相机看不到那个落点时对应字段写 \"mask\"，不要猜它的像素。两落点的中点是抓取点；"
                 "柱顶等单点步骤只写 target_1、target_1_back"
             )
-        return "target_1、target_2 是夹住把手的两指落点的像素，都在正面相机图上，中点是抓取点；柱顶等单点步骤只写 target_1"
+        return (
+            "target_1、target_2 是夹住把手的两指落点的像素，都在正面相机图上；"
+            "另一个落点被挡住时也根据把手形状和朝向补出它的像素，不写 mask。"
+            "两落点的中点是抓取点；柱顶等单点步骤只写 target_1"
+        )
 
     def step_desc(self, env, step):
         return step.get("desc_hint")

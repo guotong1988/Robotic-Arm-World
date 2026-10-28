@@ -22,8 +22,8 @@ vLLM 服务示例：
    按这两个点做逆运动学：走到落点中点上方、下降、合爪、抬起并稳住
 6. 抓住方块，并且方块抬过桌面 4 厘米，才算成功
 
-每条测评按控制频率收成 mp4，写到输出目录的 videos/。画面左右并排：左边是 frontview，
-标出模型给的像素；右边是用深度反投影出来的三维点云和定位点。--no-video 可以关掉。
+每条测评按控制频率收成 mp4，写到输出目录的 videos/。画面按采集输入的相机顺序并排，
+逐视图标出模型回答的原始像素，不叠加深度点云。--no-video 可以关掉。
 
 模型给的是像素，不是世界坐标。仿真里的落点只用于 --oracle 出答案和事后统计误差，不参与定位和控制。
 move_above 在落点中点上方 12 厘米，这个高度落在采集时的悬停范围内。
@@ -747,32 +747,14 @@ def run_episode(env, client, rng, episode, height_min, height_max, oracle, video
                 opening_spoken,
                 episode,
             )
+            if video is not None:
+                video.set_plan(pred["plan"]["subtasks"], obs)
             front_w = pred["plan"]["front"]
             back_w = pred["plan"]["back"]
             try:
                 pose, ori, _yaw, _q = choose_grasp(arm.ik, grasp_candidates([front_w, back_w], finger_offset))
             except ValueError as exc:
                 raise ParseError(str(exc)) from exc
-            if video is not None:
-                video.set_points(
-                    [
-                        {
-                            "pixel": pred["plan"]["pixel"],
-                            "pixel_back": pred["plan"].get("pixel_back"),
-                            "world": front_w,
-                            "role": "grip",
-                            "info": pred["located"],
-                        },
-                        {
-                            "pixel": pred["plan"].get("pixel_2"),
-                            "pixel_back": pred["plan"].get("pixel_2_back"),
-                            "world": back_w,
-                            "role": "grip",
-                            "info": pred["located"],
-                        },
-                    ],
-                    obs,
-                )
             print(
                 "episode {:02d} front gt={} pred={} {}   back {} {}".format(
                     episode,
@@ -1305,10 +1287,27 @@ def write_results(out_dir, records, summary):
     return jsonl_path, summary_path
 
 
+def reset_episode_rng(env, seed):
+    """把环境和所有物体摆放采样器恢复到同一个 seed，并返回本条测评的任务随机数。"""
+    env.rng = np.random.default_rng(seed)
+
+    def reset_sampler(sampler):
+        if sampler is None:
+            return
+        if hasattr(sampler, "rng"):
+            sampler.rng = np.random.default_rng(seed)
+        for child in getattr(sampler, "samplers", {}).values():
+            reset_sampler(child)
+
+    reset_sampler(getattr(env, "placement_initializer", None))
+    return np.random.default_rng(seed)
+
+
 def add_common_args(parser):
     parser.add_argument("--model", default="", help="模型名。留空则用服务 /v1/models 的第一个")
     parser.add_argument("--episodes", type=int, default=20, help="测评多少条")
     parser.add_argument("--seed", type=int, default=1000, help="和采集用的 seed 0 错开，避免同一批初始场景")
+    parser.add_argument("--fixed-initial", action="store_true", help="每条测评都使用同一个 seed 对应的初始场景")
     parser.add_argument("--image-size", type=int, default=512, help="测评相机、模型输入和视频的边长")
     parser.add_argument("--height-min", type=float, default=0.06)
     parser.add_argument("--height-max", type=float, default=0.18)
@@ -1344,6 +1343,8 @@ def run_eval(args, client, backend, extra_summary=None):
     records = []
     try:
         for episode in range(args.episodes):
+            if args.fixed_initial:
+                rng = reset_episode_rng(env, args.seed)
             video_path = None if video_dir is None else video_dir / "ep{:04d}.mp4".format(episode)
             try:
                 record = run_episode(
@@ -1365,6 +1366,7 @@ def run_eval(args, client, backend, extra_summary=None):
         summary = summarize(records)
         summary["oracle"] = bool(args.oracle)
         summary["seed"] = args.seed
+        summary["fixed_initial"] = bool(args.fixed_initial)
         summary["backend"] = "oracle" if args.oracle else backend
         if not args.oracle:
             summary["model"] = client.model
