@@ -490,12 +490,15 @@ def _turn(env, pivot, axis, angle_deg, ori, grip, on_step):
     return obs, ok, err, rot @ ori, dest
 
 
-def execute_plan(env, steps, hold_ori, landmarks, matrices, grip=-1.0, on_step=None, on_progress=None):
+def execute_plan(
+    env, steps, hold_ori, landmarks, matrices, grip=-1.0, on_step=None, on_progress=None, on_complete=None
+):
     """按步骤顺序执行。步骤带 world（评测按深度图定好的坐标）时直接用；
     否则用 landmarks（采集时提问那一帧的物体中心）反投影。执行过程中都不更新。
     matrices 是每台相机的 world_to_pixel 矩阵，被 mask 的像素换另一台相机的还原。
 
     on_progress(index, step) 在每一步开始前调用，采集用它知道正在做第几步。
+    on_complete(index, step) 在每一步结束后调用，只用于记录状态，不影响执行。
     """
     if on_step is None:
         on_step = lambda _obs: None
@@ -581,6 +584,8 @@ def execute_plan(env, steps, hold_ori, landmarks, matrices, grip=-1.0, on_step=N
             raise ParseError("未知子任务 {}".format(kind))
         entry.update({"ok": bool(ok), "err_m": None if err is None else round(float(err), 4)})
         trace.append(entry)
+        if on_complete is not None:
+            on_complete(index, step)
     return obs, trace
 
 

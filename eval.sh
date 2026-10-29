@@ -14,6 +14,7 @@ API_BASE=${API_BASE:-http://127.0.0.1:8000/v1}
 EPISODES=${EPISODES:-20}
 TIMEOUT=${TIMEOUT:-600}
 SEED=${SEED:-1000}
+IMAGE_SIZE=${IMAGE_SIZE:-1024}
 MODE=${MODE:-random}
 FG=0
 for arg in "$@"; do
@@ -27,6 +28,11 @@ if [ "$MODE" != "random" ] && [ "$MODE" != "fixed" ]; then
     echo "MODE 只能是 random 或 fixed" >&2
     exit 2
 fi
+case $IMAGE_SIZE in ''|*[!0-9]*) echo "IMAGE_SIZE 必须是正整数" >&2; exit 2;; esac
+if [ "$IMAGE_SIZE" -lt 1 ]; then
+    echo "IMAGE_SIZE 必须大于 0" >&2
+    exit 2
+fi
 if [ "$MODE" = "fixed" ]; then
     DEFAULT_OUT=data/eval_fixed
 else
@@ -38,12 +44,14 @@ LOG=$OUT/logs
 mkdir -p $LOG
 
 if [ "$FG" -ne 1 ]; then
-    nohup bash "$0" "$MODE" --fg > $LOG/eval.log 2>&1 &
+    nohup env PY="$PY" API_BASE="$API_BASE" EPISODES="$EPISODES" TIMEOUT="$TIMEOUT" SEED="$SEED" \
+        IMAGE_SIZE="$IMAGE_SIZE" OUT="$OUT" CAMERAS="$CAMERAS" ORACLE="${ORACLE:-}" \
+        bash "$0" "$MODE" --fg > $LOG/eval.log 2>&1 &
     echo "后台执行 pid $!，模式 $MODE，总日志 $LOG/eval.log，各任务日志在 $LOG"
     exit 0
 fi
 
-EXTRA="--seed $SEED"
+EXTRA="--seed $SEED --image-size $IMAGE_SIZE"
 if [ "$MODE" = "fixed" ]; then
     EXTRA="$EXTRA --fixed-initial"
 fi

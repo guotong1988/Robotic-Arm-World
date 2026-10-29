@@ -500,7 +500,7 @@ def main():
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1000, help="和采集用的 seed 0 错开，避免同一批初始场景")
     parser.add_argument("--fixed-initial", action="store_true", help="每条测评都使用同一个 seed 对应的初始场景")
-    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)

@@ -132,10 +132,22 @@ def point_group(name):
     return name.rstrip("0123456789") or name
 
 
-def match_targets(points, gt):
+def closing_yaw(first, second):
+    """双落点连线对应的夹爪 yaw；正反两个方向相差 180 度，物理上等价。"""
+    axis = np.asarray(second, dtype=float) - np.asarray(first, dtype=float)
+    return float(np.degrees(np.arctan2(-axis[0], axis[1])))
+
+
+def yaw_error_180(pred, gt):
+    """有符号 yaw 误差，折到 [-90, 90)，避免等价朝向被记成 180 度误差。"""
+    return (float(pred) - float(gt) + 90.0) % 180.0 - 90.0
+
+
+def match_targets(points, gt, grip_gt=None):
     """每个定位点配像素距离最近的同类真值点，记录像素和世界误差。
 
     模型没给某个视图的像素时（pixel 或 pixel_back 为 None，被 mask），那一项误差跳过。
+    grip_gt 是可选的落点对真值函数，只用于补充宽度、朝向诊断。
     """
     targets = []
     for point in points:
@@ -172,10 +184,26 @@ def match_targets(points, gt):
             first = np.asarray(point["land_1"], dtype=float)
             second = np.asarray(point["land_2"], dtype=float)
             axis = second - first
+            width = float(np.linalg.norm(axis[:2]))
+            yaw = closing_yaw(first, second)
             target["land_1"] = np.round(first, 4).tolist()
             target["land_2"] = np.round(second, 4).tolist()
-            target["grip_width_m"] = round(float(np.linalg.norm(axis[:2])), 4)
-            target["closing_yaw_deg"] = round(float(np.degrees(np.arctan2(-axis[0], axis[1]))), 2)
+            target["grip_width_m"] = round(width, 4)
+            target["closing_yaw_deg"] = round(yaw, 2)
+            pair = grip_gt(nearest["name"]) if grip_gt is not None else None
+            if pair is not None:
+                gt_first, gt_second = (np.asarray(item, dtype=float) for item in pair)
+                gt_width = float(np.linalg.norm((gt_second - gt_first)[:2]))
+                gt_yaw = closing_yaw(gt_first, gt_second)
+                yaw_err = yaw_error_180(yaw, gt_yaw)
+                target["gt_land_1"] = np.round(gt_first, 4).tolist()
+                target["gt_land_2"] = np.round(gt_second, 4).tolist()
+                target["gt_grip_width_m"] = round(gt_width, 4)
+                target["gt_closing_yaw_deg"] = round(gt_yaw, 2)
+                target["grip_width_err_m"] = round(width - gt_width, 4)
+                target["grip_width_abs_err_m"] = round(abs(width - gt_width), 4)
+                target["closing_yaw_err_deg"] = round(yaw_err, 2)
+                target["closing_yaw_abs_err_deg"] = round(abs(yaw_err), 2)
         targets.append(target)
     return targets
 
@@ -207,6 +235,9 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
             views = make_views(env, obs, matrices)
             # 真值只用来统计误差，不进模型，不进定位和控制。
             gt = gt_points(task, env, matrices)
+            grip_gt = None
+            if hasattr(task, "grip_points"):
+                grip_gt = lambda name: task.grip_points(env, name)
             started = time.perf_counter()
             answer = gt_answer if oracle else client.complete(images, instruction)
             round_rec = {
@@ -228,7 +259,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                 round_rec["steps"] = [step["type"] for step in subtasks]
                 round_rec["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
                 points = locate_plan(task.task, subtasks, views, image_size)
-                round_rec["targets"] = match_targets(points, gt)
+                round_rec["targets"] = match_targets(points, gt, grip_gt)
                 for target in round_rec["targets"]:
                     print(
                         "episode {:02d} {} pixel gt={} pred={} pos gt={} pred={} {}".format(
@@ -242,17 +273,105 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                         ),
                         flush=True,
                     )
+                    if "gt_grip_width_m" in target:
+                        print(
+                            "episode {:02d} {} pair width gt={} pred={} err={} "
+                            "yaw gt={:.1f}deg pred={:.1f}deg err={:+.1f}deg".format(
+                                episode,
+                                target["point"],
+                                format_cm(target["gt_grip_width_m"]),
+                                format_cm(target["grip_width_m"]),
+                                format_cm(target["grip_width_err_m"]),
+                                target["gt_closing_yaw_deg"],
+                                target["closing_yaw_deg"],
+                                target["closing_yaw_err_deg"],
+                            ),
+                            flush=True,
+                        )
                 starts = set(pick_starts(task.task, subtasks))
                 relocated = []
+                grasp_diagnostics = []
+                grasp_context = {"name": None, "offset": None}
 
-                def on_progress(index, _step):
+                def grip_name(index):
+                    for previous in reversed(subtasks[:index]):
+                        world = previous.get("world", {})
+                        if "pixel_2" not in world:
+                            continue
+                        center = 0.5 * (np.asarray(world["pixel"]) + np.asarray(world["pixel_2"]))
+                        candidates = [item for item in gt if item["name"].endswith("_grasp")]
+                        if not candidates:
+                            return None
+                        nearest = min(candidates, key=lambda item: np.linalg.norm(center - item["world"]))
+                        return nearest["name"][: -len("_grasp")]
+                    return None
+
+                def grasp_snapshot(phase, index):
+                    name = grasp_context["name"]
+                    if name is None or not hasattr(task, "grasp_state"):
+                        return
+                    state = task.grasp_state(env).get(name)
+                    if state is None:
+                        return
+                    # 直接读物理末端位置；诊断不能调用 arm.update，避免影响后续控制。
+                    site = env.robots[0].eef_site_id["right"]
+                    eef = np.array(env.sim.data.site_xpos[site], dtype=float)
+                    center = np.asarray(state["center"], dtype=float)
+                    offset = center - eef
+                    entry = {
+                        "phase": phase,
+                        "step_index": int(index),
+                        "object": name,
+                        "grasped": bool(state["grasped"]),
+                        "eef_pos": np.round(eef, 4).tolist(),
+                        "object_pos": np.round(center, 4).tolist(),
+                        "held_offset_actual": np.round(offset, 4).tolist(),
+                    }
+                    if phase == "close":
+                        grasp_context["offset"] = offset.copy()
+                        for later in subtasks[index + 1 :]:
+                            if later["type"] == "open_gripper":
+                                break
+                            predicted = later.get("world", {}).get("held")
+                            if predicted is not None:
+                                predicted_offset = np.asarray(predicted, dtype=float) - eef
+                                entry["held_offset_pred"] = np.round(predicted_offset, 4).tolist()
+                                entry["held_offset_err_m"] = round(float(np.linalg.norm(predicted_offset - offset)), 4)
+                                break
+                    elif phase == "lift" and grasp_context["offset"] is not None:
+                        entry["held_offset_drift_m"] = round(
+                            float(np.linalg.norm(offset - grasp_context["offset"])), 4
+                        )
+                    elif phase == "pre_place":
+                        peg = np.asarray(state["peg"], dtype=float)
+                        entry["peg_pos"] = np.round(peg, 4).tolist()
+                        entry["object_peg_xy_m"] = round(float(np.linalg.norm(center[:2] - peg[:2])), 4)
+                    grasp_diagnostics.append(entry)
+
+                def on_progress(index, step):
+                    if step["type"] == "close_gripper":
+                        grasp_context["name"] = grip_name(index)
+                        grasp_context["offset"] = None
+                    elif step["type"] == "move_down" and "held" in step:
+                        grasp_snapshot("pre_place", index)
                     if index in starts and "obs" in latest:
                         point = relocate(
                             task.task, subtasks, index, make_views(env, latest["obs"], matrices), image_size
                         )
                         if point is not None:
-                            relocated.extend(match_targets([point], gt_points(task, env, matrices)))
+                            relocated.extend(match_targets([point], gt_points(task, env, matrices), grip_gt))
 
+                def on_complete(index, step):
+                    if step["type"] == "close_gripper":
+                        grasp_snapshot("close", index)
+                    elif step["type"] == "lift":
+                        grasp_snapshot("lift", index)
+                    elif step["type"] == "open_gripper":
+                        grasp_context["name"] = None
+                        grasp_context["offset"] = None
+
+                if hasattr(task, "grasp_state"):
+                    round_rec["grasp_diagnostics"] = grasp_diagnostics
                 final, trace = execute_plan(
                     env,
                     subtasks,
@@ -262,6 +381,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                     grip=-1.0,
                     on_step=on_step,
                     on_progress=on_progress,
+                    on_complete=on_complete,
                 )
                 round_rec["trace"] = trace
                 if relocated:
@@ -313,6 +433,8 @@ def summarize(records):
             "pixel_err": mean_or_none([t.get("pixel_err") for t in items]),
             "xy_err_m": mean_or_none([t["err_m"]["xy"] for t in items]),
             "z_err_m": mean_or_none([abs(t["err_m"]["z"]) for t in items]),
+            "grip_width_abs_err_m": mean_or_none([t.get("grip_width_abs_err_m") for t in items]),
+            "closing_yaw_abs_err_deg": mean_or_none([t.get("closing_yaw_abs_err_deg") for t in items]),
         }
         for name, items in sorted(groups.items())
     }
@@ -333,6 +455,26 @@ def print_episode(record):
         flush=True,
     )
     for rr in rounds:
+        for item in rr.get("grasp_diagnostics") or []:
+            if item["phase"] == "pre_place":
+                print(
+                    "  round {} pre_place {} actual_obj_peg_xy={}".format(
+                        rr["round"], item["object"], format_cm(item["object_peg_xy_m"])
+                    ),
+                    flush=True,
+                )
+            else:
+                print(
+                    "  round {} {} {} grasped={} held_offset_err={} offset_drift={}".format(
+                        rr["round"],
+                        item["phase"],
+                        item["object"],
+                        item["grasped"],
+                        format_cm(item.get("held_offset_err_m")),
+                        format_cm(item.get("held_offset_drift_m")),
+                    ),
+                    flush=True,
+                )
         failed = [step for step in rr.get("trace") or [] if not step["ok"]]
         if failed:
             print(
@@ -364,13 +506,19 @@ def print_summary(summary):
         flush=True,
     )
     for name, stats in summary["points"].items():
+        extra = ""
+        if stats.get("grip_width_abs_err_m") is not None:
+            extra = "  宽度误差 {}  yaw误差 {:.1f}deg".format(
+                format_cm(stats["grip_width_abs_err_m"]), stats["closing_yaw_abs_err_deg"]
+            )
         print(
-            "{} n={} 像素误差 {}  水平误差 {}  高度误差 {}".format(
+            "{} n={} 像素误差 {}  水平误差 {}  高度误差 {}{}".format(
                 name,
                 stats["n"],
                 "n/a" if stats["pixel_err"] is None else "{:.1f}px".format(stats["pixel_err"]),
                 format_cm(stats["xy_err_m"]),
                 format_cm(stats["z_err_m"]),
+                extra,
             ),
             flush=True,
         )
@@ -381,7 +529,7 @@ def add_common_args(parser, default_out):
     parser.add_argument("--episodes", type=int, default=20, help="测评多少条")
     parser.add_argument("--seed", type=int, default=1000, help="和采集用的 seed 0 错开；传 0 则和采集同批场景")
     parser.add_argument("--fixed-initial", action="store_true", help="每条测评都使用同一个 seed 对应的初始场景")
-    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-tokens", type=int, default=2048, help="多物体任务的计划有三十几步，比 Stack 长")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -419,6 +567,7 @@ def run_eval(task, args, client):
     env = make_env(task, args.image_size, args.seed, use_camera=True, camera_depths=True)
     image_size = camera_size(env)
     matrices = world_to_pixel_matrices(env, image_size)
+    print("native image size {}x{} cameras {}".format(image_size, image_size, ",".join(CAMERAS)), flush=True)
     video_dir = None if args.no_video else Path(args.out) / "videos"
     records = []
     try:
@@ -443,6 +592,8 @@ def run_eval(task, args, client):
         summary["oracle"] = bool(args.oracle)
         summary["seed"] = args.seed
         summary["fixed_initial"] = bool(args.fixed_initial)
+        summary["image_size"] = [int(image_size), int(image_size)]
+        summary["cameras"] = list(CAMERAS)
         summary["backend"] = "oracle" if args.oracle else "vllm"
         if client is not None:
             summary["model"] = client.model
@@ -457,6 +608,9 @@ def run_eval(task, args, client):
 
 def self_test():
     check_parser()
+    assert closing_yaw([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]) == 0.0
+    assert abs(yaw_error_180(-170.0, 170.0) - 20.0) < 1e-9
+    assert abs(yaw_error_180(170.0, -170.0) + 20.0) < 1e-9
     # Door：reach 的 target_1、turn 的 pivot 都要收进来
     door = parse_plan(
         format_plan(

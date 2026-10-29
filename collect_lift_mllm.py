@@ -930,7 +930,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--episode-offset", type=int, default=0, help="首个 episode 编号；并行分片时用不同偏移避免样本 ID 冲突")
     parser.add_argument("--episode-stride", type=int, default=1, help="每次尝试后的 episode 编号步长；并行分片使用 worker 总数")
-    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--height-min", type=float, default=0.06, help="抬升高度下限，米")
     parser.add_argument("--height-max", type=float, default=0.18, help="抬升高度上限，米")
     add_camera_arg(parser)

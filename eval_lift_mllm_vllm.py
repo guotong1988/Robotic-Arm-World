@@ -1308,7 +1308,7 @@ def add_common_args(parser):
     parser.add_argument("--episodes", type=int, default=20, help="测评多少条")
     parser.add_argument("--seed", type=int, default=1000, help="和采集用的 seed 0 错开，避免同一批初始场景")
     parser.add_argument("--fixed-initial", action="store_true", help="每条测评都使用同一个 seed 对应的初始场景")
-    parser.add_argument("--image-size", type=int, default=512, help="测评相机、模型输入和视频的边长")
+    parser.add_argument("--image-size", type=int, default=1024, help="测评相机、模型输入和视频的边长")
     parser.add_argument("--height-min", type=float, default=0.06)
     parser.add_argument("--height-max", type=float, default=0.18)
     parser.add_argument("--timeout", type=float, default=180.0)

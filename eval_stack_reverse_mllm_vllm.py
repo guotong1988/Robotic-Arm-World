@@ -301,7 +301,7 @@ def main():
     parser.add_argument("--model", default="", help="模型名。留空则用服务 /v1/models 的第一个")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1000, help="默认和 eval_stack_mllm_vllm.py 相同，场景可逐条对照")
-    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)

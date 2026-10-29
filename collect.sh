@@ -8,6 +8,7 @@ EPISODES=${EPISODES:-100}
 WORKERS=${WORKERS:-4}
 SEED=${SEED:-0}
 CAMERAS=${CAMERAS:-frontview}
+IMAGE_SIZE=${IMAGE_SIZE:-1024}
 SHARDS=${SHARDS:-$OUT/.collect_shards}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
@@ -18,8 +19,9 @@ mkdir -p "$LOG" "$SHARDS"
 
 case $EPISODES in ''|*[!0-9]*) echo "EPISODES 必须是正整数" >&2; exit 2;; esac
 case $WORKERS in ''|*[!0-9]*) echo "WORKERS 必须是正整数" >&2; exit 2;; esac
-if (( EPISODES < 1 || WORKERS < 1 )); then
-    echo "EPISODES 和 WORKERS 必须大于 0" >&2
+case $IMAGE_SIZE in ''|*[!0-9]*) echo "IMAGE_SIZE 必须是正整数" >&2; exit 2;; esac
+if (( EPISODES < 1 || WORKERS < 1 || IMAGE_SIZE < 1 )); then
+    echo "EPISODES、WORKERS 和 IMAGE_SIZE 必须大于 0" >&2
     exit 2
 fi
 if (( WORKERS > EPISODES )); then
@@ -28,7 +30,7 @@ fi
 
 if [ "${1:-}" != "--fg" ]; then
     nohup env PY="$PY" OUT="$OUT" EPISODES="$EPISODES" WORKERS="$WORKERS" SEED="$SEED" \
-        CAMERAS="$CAMERAS" SHARDS="$SHARDS" OMP_NUM_THREADS="$OMP_NUM_THREADS" \
+        CAMERAS="$CAMERAS" IMAGE_SIZE="$IMAGE_SIZE" SHARDS="$SHARDS" OMP_NUM_THREADS="$OMP_NUM_THREADS" \
         MKL_NUM_THREADS="$MKL_NUM_THREADS" OPENBLAS_NUM_THREADS="$OPENBLAS_NUM_THREADS" \
         NUMEXPR_NUM_THREADS="$NUMEXPR_NUM_THREADS" bash "$0" --fg > "$LOG/collect.log" 2>&1 &
     echo "后台执行 pid $!，每任务 $WORKERS 个 worker，每任务采满 $EPISODES 条才发布"
@@ -61,7 +63,8 @@ launch_task() {
         shard=$SHARDS/$task/worker_$worker
         name=${log_name}.worker_$worker
         run "$name" "$@" --episodes "$count" --episode-offset "$worker" \
-            --episode-stride "$WORKERS" --seed "$((SEED + worker))" --out "$shard" --cameras "$CAMERAS"
+            --episode-stride "$WORKERS" --seed "$((SEED + worker))" --out "$shard" --cameras "$CAMERAS" \
+            --image-size "$IMAGE_SIZE"
         pid_tasks+=("$task")
     done
 }

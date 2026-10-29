@@ -301,6 +301,18 @@ class NutTask:
             turn = min((wrap_angle(goal - current, 360.0) for goal in (90.0, -90.0)), key=abs)
         return body_yaw_deg(env, env.obj_body_id[name]), turn
 
+    def grasp_state(self, env):
+        """评测事后诊断：实际抓取状态、螺母中心和柱顶，不参与模型定位或控制。"""
+        points = self.points(env)
+        return {
+            name: {
+                "grasped": is_grasping(env, self._nut(env, name)),
+                "center": points[name],
+                "peg": points[name + "_peg"],
+            }
+            for name in self.active(env)
+        }
+
     def holding(self, env, plan, index):
         if not 0 <= index < len(plan) or "obj" not in plan[index]:
             return None, False
