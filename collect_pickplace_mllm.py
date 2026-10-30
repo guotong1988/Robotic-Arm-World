@@ -11,22 +11,16 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
 抓靠上的位置，两个指腹落点的中点已含抓取高度，所以 move_down 的 offset_z 为 0。
 四样都放时，先拿离其他物品最远的那样。
 
-输入例子。每台相机一张 RGB，默认 frontview 加 backview，对应样本的 image、image_back 字段；
-指令开头的 <image> 每行一个，和图片一一对应，多张图时占位后面注明每张来自哪台相机；话术后面带 answer 各字段的说明：
-
-    <image>
-    <image>
-    第一张图是正面相机（frontview），第二张图是背面相机（backview）。把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，抓物品的步骤里 target_1、target_2 是两指落点，每个落点各给两台相机的像素；某台相机看不到那个落点时对应字段写 "mask"，不要猜它的像素。两落点的中点是抓取位置；放进箱格的步骤只写格子中心。
-
-单目只开 frontview，一个占位后面接话术和字段说明：
+输入是一张 frontview RGB，对应样本的 image 字段；指令以一个 <image> 占位开头，
+话术后面带 answer 各字段的说明：
 
     <image>
     把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，抓物品的步骤里 target_1、target_2 是两指落点，都在正面相机图上；另一个落点被挡住时也根据物品形状和朝向补出它的像素，不写 mask。放进箱格的步骤只写格子中心。
 
 输出例子（易拉罐单独一个、还没抓住时；抓取步骤写两个指腹落点，中点是抓取位置，连线决定 yaw，
-不再单独输出 yaw。双目时每个落点各给两台相机的像素，某台相机看不到那个点时对应字段写 "mask"）：
+不再单独输出 yaw）：
 
-    {"subtasks": [{"type": "move_above", "desc": "移到易拉罐上方", "target_1": "[180 290]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[220 250]", "target_kind": "grip", "clearance": 0.12}, {"type": "move_down", "desc": "降到易拉罐处准备夹", "target_1": "[180 290]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[220 250]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住易拉罐"}, {"type": "lift", "desc": "抬起易拉罐", "delta_z": 0.17, "target_1": "[180 290]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[220 250]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到格子正上方", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "clearance": 0.22}, {"type": "move_down", "desc": "把易拉罐放进格子", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "offset_z": 0.1}, {"type": "open_gripper", "desc": "松爪放下易拉罐"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[360 270]", "target_1_back": "[155 255]", "target_kind": "bin", "clearance": 0.22}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+    {"subtasks": [{"type": "move_above", "desc": "移到易拉罐上方", "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip", "clearance": 0.12}, {"type": "move_down", "desc": "降到易拉罐处准备夹", "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住易拉罐"}, {"type": "lift", "desc": "抬起易拉罐", "delta_z": 0.17, "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到格子正上方", "target_1": "[360 270]", "target_kind": "bin", "clearance": 0.22}, {"type": "move_down", "desc": "把易拉罐放进格子", "target_1": "[360 270]", "target_kind": "bin", "offset_z": 0.1}, {"type": "open_gripper", "desc": "松爪放下易拉罐"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[360 270]", "target_kind": "bin", "clearance": 0.22}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
 每条成功轨迹只存开局那一帧。左边箱子里的物品会换位置和朝向，
 右边格子里的半透明目标也会在格子内部挪开中心。中途画面不存。
@@ -49,7 +43,7 @@ from collect_common import (
     run_collection,
     wrist_yaw,
 )
-from collect_lift_mllm import DEFAULT_CAMERA, back_enabled, set_free_xyaw
+from collect_lift_mllm import DEFAULT_CAMERA, set_free_xyaw
 from grip_ik import box_contacts
 from task_plan import DEFAULT_CLEARANCE
 
@@ -68,6 +62,11 @@ WALL_HEIGHT = 0.10
 CARRY_MARGIN = 0.05
 # 松爪时物品离格子底面还有这么高，米。
 DROP_HEIGHT = 0.03
+# 默认桌子和两个箱子的中心在 x=0.10。整体向机械臂移近 15 cm，箱子、
+# 物品采样、目标影子和成功判定仍由同一组环境坐标驱动。
+TABLE_FULL_SIZE = (0.39, 0.49, 0.82)
+BIN1_POS = (-0.05, -0.25, 0.80)
+BIN2_POS = (-0.05, 0.28, 0.80)
 SINGLE_STYLES = (
     ("把{0}放进右边箱子里对应的格子。", "把手里的{0}放进右边箱子里对应的格子。", "{0}已经放好了。"),
     ("将{0}从左边箱子拿到右边箱子的对应格子里。", "将拿着的{0}放到右边箱子的对应格子里。", "{0}已经放进对应的格子。"),
@@ -106,7 +105,11 @@ class PickPlaceTask:
         )
 
     def env_kwargs(self):
-        return {}
+        return {
+            "table_full_size": TABLE_FULL_SIZE,
+            "bin1_pos": BIN1_POS,
+            "bin2_pos": BIN2_POS,
+        }
 
     def _bin_center(self, env, index):
         """右边箱子第 index 个格子的底面中心。和环境里 target_bin_placements 的算法一致。"""
@@ -259,14 +262,7 @@ class PickPlaceTask:
         return order_landings_at(center, camera, pair)
 
     def plan_desc(self):
-        """抓取写两指落点；箱格仍写单个中心点。单目被挡的落点按形状补出。"""
-        if back_enabled():
-            return (
-                "抓物品的步骤里 target_1、target_2 是贴住物品两侧的两指落点，每个落点各给两台相机的像素："
-                "target_1 在正面相机图上，target_1_back 在背面相机图上，target_2、target_2_back 同理；"
-                "某台相机看不到那个落点时对应字段写 \"mask\"，不要猜它的像素。两落点的中点是抓取位置；"
-                "放进箱格的步骤只写 target_1、target_1_back（格子中心）"
-            )
+        """抓取写两指落点；箱格仍写单个中心点。被挡的落点按形状补出。"""
         return (
             "抓物品的步骤里 target_1、target_2 是贴住物品两侧的两指落点，都在正面相机图上；"
             "另一个落点被物品挡住时也根据物品形状和朝向补出它的像素，不写 mask。两落点的中点是抓取位置；"

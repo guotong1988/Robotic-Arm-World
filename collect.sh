@@ -7,7 +7,6 @@ OUT=${OUT:-/data/oss_bucket_3/guotong/mllm_data/}
 EPISODES=${EPISODES:-100}
 WORKERS=${WORKERS:-4}
 SEED=${SEED:-0}
-CAMERAS=${CAMERAS:-frontview}
 IMAGE_SIZE=${IMAGE_SIZE:-1024}
 SHARDS=${SHARDS:-$OUT/.collect_shards}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
@@ -30,7 +29,7 @@ fi
 
 if [ "${1:-}" != "--fg" ]; then
     nohup env PY="$PY" OUT="$OUT" EPISODES="$EPISODES" WORKERS="$WORKERS" SEED="$SEED" \
-        CAMERAS="$CAMERAS" IMAGE_SIZE="$IMAGE_SIZE" SHARDS="$SHARDS" OMP_NUM_THREADS="$OMP_NUM_THREADS" \
+        IMAGE_SIZE="$IMAGE_SIZE" SHARDS="$SHARDS" OMP_NUM_THREADS="$OMP_NUM_THREADS" \
         MKL_NUM_THREADS="$MKL_NUM_THREADS" OPENBLAS_NUM_THREADS="$OPENBLAS_NUM_THREADS" \
         NUMEXPR_NUM_THREADS="$NUMEXPR_NUM_THREADS" bash "$0" --fg > "$LOG/collect.log" 2>&1 &
     echo "后台执行 pid $!，每任务 $WORKERS 个 worker，每任务采满 $EPISODES 条才发布"
@@ -63,7 +62,7 @@ launch_task() {
         shard=$SHARDS/$task/worker_$worker
         name=${log_name}.worker_$worker
         run "$name" "$@" --episodes "$count" --episode-offset "$worker" \
-            --episode-stride "$WORKERS" --seed "$((SEED + worker))" --out "$shard" --cameras "$CAMERAS" \
+            --episode-stride "$WORKERS" --seed "$((SEED + worker))" --out "$shard" \
             --image-size "$IMAGE_SIZE"
         pid_tasks+=("$task")
     done

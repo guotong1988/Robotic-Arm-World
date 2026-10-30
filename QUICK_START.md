@@ -23,11 +23,11 @@
 
 ## 数据格式
 
-每条样本的输入是一到两张 RGB 加一条指令：`image` 是 frontview（桌面正前方，robosuite 自带）。默认再加 `image_back`，即 backview。这台相机不是 robosuite 自带机位，采集脚本加在 frontview 正对面、往 +y 偏到约 (-1.25, 0.48, 1.80)，视线对着桌面中心 (0, 0, 0.82)，fovy 45 度；精确镜像的 -x 轴机位会被机身挡住。`--cameras frontview` 退回单目，所有任务都用同一套相机。指令以每台相机一个 `<image>` 占位开头，多张图时接着说明各图来自哪个相机，再接任务话术，话术后面带字段说明（写在指令里，不写进 answer）。输出是只含 `subtasks` 的 JSON，每个 subtask 带一句 `desc`（20 字以内）说明这一步做什么。空间字段的像素格式是 `"[x y]"`（x 向右、y 向下，原点在左上角）：`target_1` 对应 `image`，`target_1_back` 对应 `image_back`；`held`、`pivot`、`path` 同理各有 `held_back`、`pivot_back`、`path_back`。某台相机看不到那个点时对应字段写 `"mask"`，定位只用看得到的视图；两台都看不到时 frontview 保留像素兜底。单目没有 `*_back`，挡住也照写，不写 `"mask"`。要抓的物体（Lift、Stack 的方块，NutAssembly 的螺母把手）写两指落点：`target_1` 是朝 frontview 那一侧，`target_2` 是朝后那一侧，每个落点各给两台相机的像素（`target_1_back`、`target_2_back`），`target_kind` 为 `"grip"`，执行取两点的中点。放置目标和其余空间点仍是同一个点的两个视图。`task_plan.py` 按这个列表做，它不认识具体任务；Lift 的评测不走这个执行器，见 Lift 一节。
+每条样本的输入是一张 frontview RGB 加一条指令，图片字段为 `image`。frontview 使用统一的抬高、前移机位，所有任务共用同一套相机配置。指令以一个 `<image>` 占位开头，后接任务话术和字段说明（写在指令里，不写进 answer）。输出是只含 `subtasks` 的 JSON，每个 subtask 带一句 `desc`（20 字以内）说明这一步做什么。空间字段的像素格式是 `"[x y]"`（x 向右、y 向下，原点在左上角），包括 `target_1`、`target_2`、`align_point`、`pivot` 和 `path`。要抓的物体（Lift、Stack 的方块，NutAssembly 的螺母把手）写两指落点：`target_1` 和 `target_2` 都在同一张 frontview 上，`target_kind` 为 `"grip"`，执行取两点的中点。放置目标和其余空间点也只写 frontview 像素。`task_plan.py` 按这个列表做，它不认识具体任务；Lift 的评测不走这个执行器，见 Lift 一节。
 
 每条成功轨迹只保存开局那一帧（`phase` 为 `initial`），标注是从开局起的整条步骤。泛化靠开局布局，不靠轨迹中途的画面：方块、物品、螺母的位置和朝向，以及叠放目标、格子、柱子、门、污渍的位置都会变。没做成的轨迹整条丢掉。
 
-输出在 `--out` 目录：`images/` 存各视图的 RGB（`样本id.png` 是 frontview，双目再加 `样本id_back.png` 是 backview），`samples.jsonl` 每行一条样本，`meta.json` 记环境和采集统计，其中 `camera_world_to_pixel` 是各视图的世界坐标到像素矩阵，评测反投影用。样本的 `task` 是任务名（PickPlace、NutAssembly 用小写的环境名，如 `pickplacecan`），样本 id 和图片名带任务名前缀。所有任务可以写进同一个 `--out`，`samples.jsonl` 按 task 合并，后跑的采集不会盖掉其他任务。
+输出在 `--out` 目录：`images/` 存 frontview RGB（文件名为 `样本id.png`），`samples.jsonl` 每行一条样本，`meta.json` 记环境和采集统计，其中 `camera_world_to_pixel` 是 frontview 的世界坐标到像素矩阵，评测反投影用。样本的 `task` 是任务名（PickPlace、NutAssembly 用小写的环境名，如 `pickplacecan`），样本 id 和图片名带任务名前缀。所有任务可以写进同一个 `--out`，`samples.jsonl` 按 task 合并，后跑的采集不会盖掉其他任务。
 
 所有采集脚本都有这几个参数：
 
@@ -39,16 +39,15 @@
 | `--episode-offset` | 0 | 首个 episode 编号；并行分片使用不同偏移，避免样本 ID 冲突 |
 | `--episode-stride` | 1 | 每次尝试后的 episode 编号步长；并行分片使用 worker 总数，失败补采也不会与其他分片重叠 |
 | `--image-size` | 512 | 图像边长 |
-| `--cameras` | `frontview,backview` | 渲染并写入的相机。`frontview` 单目，被挡也照写像素；加上 `backview` 时被挡的视图写 `"mask"` |
 
-批量运行 `collect.sh` 时可用 `EPISODES`（默认 100）、`WORKERS`（默认 2）、`SEED`、`CAMERAS`、`PY` 和 `OUT` 环境变量调整配置。每个任务再启动 `WORKERS` 个独立进程，episode 按 worker 编号交错分配，失败补采不会与其他分片重叠；分片全部采满并校验通过后才合并发布，任一 worker 失败会保留该任务的原有数据。单目采集和评测可统一使用 `CAMERAS=frontview`。
+批量运行 `collect.sh` 时可用 `EPISODES`（默认 100）、`WORKERS`（默认 2）、`SEED`、`PY` 和 `OUT` 环境变量调整配置。每个任务再启动 `WORKERS` 个独立进程，episode 按 worker 编号交错分配，失败补采不会与其他分片重叠；分片全部采满并校验通过后才合并发布，任一 worker 失败会保留该任务的原有数据。
 
 ## 步骤原语
 
 | 原语 | 参数 | 含义 |
 | --- | --- | --- |
-| `move_above` | `clearance`，可选 `yaw`、`held` | 移到目标上方 |
-| `move_down` | `offset_z`，可选 `yaw`、`held` | 下降到目标 |
+| `move_above` | `clearance`，可选 `yaw`、`align_point` | 移到目标上方 |
+| `move_down` | `offset_z`，可选 `yaw`、`align_point` | 下降到目标 |
 | `lift` | `delta_z` | 竖直抬起 |
 | `close_gripper` | | 合爪 |
 | `open_gripper` | | 松爪 |
@@ -58,19 +57,14 @@
 | `wipe` | `path`、`offset_z` | 压着桌面依次走过 `path` 里的像素，`offset_z` 是往下压的量 |
 
 - `yaw`：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度，度。只保留在无法由双落点确定的单点步骤中，例如 Nut 搬运到柱子上方、Wipe 初始朝向；双落点抓取步骤不写，执行器由两点连线推导。
-- `held`：手里物体上要对准目标的那一点的像素。螺母要对准柱子的是螺母中心，不是夹爪。抓住后夹爪再转，这一点跟着一起转。
-- `target_kind: "grip"`：`target_1`、`target_2` 是两指合拢时贴在物体两侧的两个落点，不是同一个点的两个视图。Lift、Stack、PickPlace 的竖直抓取和 NutAssembly 的螺母把手都这样写；Stack 的 Unstack/Reverse 也复用这一格式。两点的中点是抓取位置，连线决定合拢方向和 yaw，不再重复输出 `yaw`。只有 frontview 时，两个落点都写在这张图上，被物体挡住的另一个落点按形状和朝向补出像素，不写 `"mask"`；双目时每个落点再写 `target_1_back`、`target_2_back`，被挡住的那台写 `"mask"`。放置目标和其他空间字段仍是一点两视图。
+- `align_point`：手里物体上要对准目标的那一点的像素。螺母要对准柱子的是螺母中心，不是夹爪。抓住后夹爪再转，这一点跟着一起转。
+- `target_kind: "grip"`：`target_1`、`target_2` 是两指合拢时贴在物体两侧的两个落点，不是同一个点的两个视图。Lift、Stack、PickPlace 的竖直抓取和 NutAssembly 的螺母把手都这样写；Stack 的 Unstack/Reverse 也复用这一格式。两点的中点是抓取位置，连线决定合拢方向和 yaw，不再重复输出 `yaw`。两个落点都写在 frontview 上，被物体挡住的另一个落点按形状和朝向补出像素，不写 `"mask"`。放置目标和其他空间字段同样只写 frontview 像素。
 
 ## 评测时的坐标换算
 
-像素换世界坐标只用深度相机（`depth_locate.py`），仿真里的物体位置只用于事后统计误差，不进模型输入，也不参与控制。一个像素只定一条视线，还差一个数。标注点常被挡住或在物体内部，不能直接读该像素的深度，而是按像素在计划里的角色，从它周围的深度点量出标注点所在的平面，再取视线和平面的交点。角色优先看步骤里的 `target_kind`、`held_kind`、`pivot_kind`、`path_kind`；没写或不认识时，按任务名和步骤顺序推断。
+像素换世界坐标只用深度相机（`depth_locate.py`），仿真里的物体位置只用于事后统计误差，不进模型输入，也不参与控制。一个像素只定一条视线，还差一个数。标注点常被挡住或在物体内部，不能直接读该像素的深度，而是按像素在计划里的角色，从它周围的深度点量出标注点所在的平面，再取视线和平面的交点。角色优先看步骤里的 `target_kind`、`align_point_kind`、`pivot_kind`、`path_kind`；没写或不认识时，按任务名和步骤顺序推断。
 
-每个标注点在看得到的视图里各有一个像素，被 `"mask"` 的视图不参与。两个视图都有像素时，定位分两层：
-
-- 测量级融合（`bin`、`nut`、`peg`、`table`）：两个视图的邻域点云都反投影到世界坐标系合成一片，在合并点云上量支撑面、顶面、中位数。单个视图被手臂等遮挡时，污染点是少数，被多数派统计自动投出去。模型在两个视图里指的不是同一个点（两条视线最近距离超过 1 厘米）时不合并，退回逐视图融合。
-- 决策级融合（`object`、`cube_center`、`door_axis`、`door_handle`）：两个视图各自量平面、求交点，再融合。两台相机都是平视，主视图统一是 frontview。`object` 和 `cube_center` 的顶面沿主视线窄柱搜索，柱内遮挡不会被多数派投出，所以不合并点云；门板竖直，侧向视线和门板接近平行，求交不稳。主视图被 mask 或量不出来时用另一视图兜底；两个视图的分歧超过 3 厘米时取 z 低的那一路（手臂等遮挡都在桌面上方，被挡的视图量出来的点偏高）。
-
-定位记录里带 `view`（实际用的视图；测量级合并时是两台相机名按字母序拼起来，如 `backview+frontview`）、`disagreement_m`（两视图独立定位的距离）和 `ray_gap_m`（两条视线的距离）。
+每个标注点只有一个 frontview 像素。定位把像素邻域反投影成点云，按角色量支撑面、物体顶面、箱底、柱顶或门板平面，再求对应视线和平面的交点。`object` 和 `cube_center` 的顶面沿视线窄柱搜索，避免把后方物体当成目标；门板上的点使用带方向的竖直平面求交。定位记录里的 `view` 固定为 `frontview`。
 
 | 角色 | 量什么 |
 | --- | --- |
@@ -83,11 +77,11 @@
 | 门的转轴、把手 | 竖直的门板平面，法向取模型给的 `approach` |
 | 两指落点对（`grip`） | 成对还原两个落点（见下） |
 
-两指落点成对还原（`recover_landings`）：双目且两台相机各看到一侧时，分别用自己的深度还原；单目或另一视图被 mask 时，Nut 用支撑面加半厚、PickPlace 结合物品顶面先验和可见指腹表面确定共同水平面，再求第二条像素射线与这个平面的交点。没有高度先验的任务退回落点附近点云和固定距离估计。执行取两落点的中点，统计误差也用中点配真值，合拢方向和 yaw 统一由恢复后的两点连线确定。深度恢复时 Stack 用开局保持的夹爪朝向作为初始连线方向，其他任务用世界 x 轴；单目分支再用两个像素的射线校正方向，旧数据里显式 `yaw` 仍兼容。
+两指落点成对还原（`recover_landings`）：Lift / Stack 用支撑面加方块半高，Nut 用支撑面加半厚，PickPlace 结合物品顶面先验和可见指腹表面确定共同水平面，再求两条像素射线与这个平面的交点。这样即使初始手臂挡住目标，也不会把夹爪表面误当成落点。执行取两落点的中点，统计误差也用中点配真值，合拢方向和 yaw 统一由恢复后的两点连线确定。深度恢复时 Stack 用开局保持的夹爪朝向作为初始连线方向，其他任务用世界 x 轴，再用两个像素的射线校正方向；旧数据里显式 `yaw` 仍兼容。
 
 合爪前指向要抓的东西，合爪后到松爪前指向放置目标。多物体时，每抓下一个之前用当前帧的深度重新量它，开局挡在它前面的物体可能已经搬走了；两指落点也成对重测。
 
-评测时初始画面只问一次，模型给出全部步骤。Wipe 没擦干净可以再问一轮。所有评测脚本都有 `--api-base`（vLLM 服务地址）、`--episodes` 和 `--cameras`；`--oracle` 不加载模型，用真值步骤代替模型、其余流程不变，用来检查计划本身和执行器能不能做成。
+评测时初始画面只问一次，模型给出全部步骤。Wipe 没擦干净可以再问一轮。所有评测脚本都有 `--api-base`（vLLM 服务地址）和 `--episodes`；`--oracle` 不加载模型，用真值步骤代替模型、其余流程不变，用来检查计划本身和执行器能不能做成。
 
 ## Lift
 
@@ -125,7 +119,7 @@ python3 eval_pickplace_mllm_vllm.py --env PickPlaceCan --oracle --episodes 20
 
 ## NutAssembly
 
-`--env` 可选 `NutAssembly`、`NutAssemblySingle`、`NutAssemblySquare`（默认）、`NutAssemblyRound`。抓螺母把手只写两指落点对，不再重复写抓取 `yaw`；套柱子时用 `held` 对准螺母中心，柱顶是单点（`peg`），搬运到柱子上方仍保留控制把手方向的 `yaw`。
+`--env` 可选 `NutAssembly`、`NutAssemblySingle`、`NutAssemblySquare`（默认）、`NutAssemblyRound`。抓螺母把手只写两指落点对，不再重复写抓取 `yaw`；套柱子时用 `align_point` 对准螺母中心，柱顶是单点（`peg`），搬运到柱子上方仍保留控制把手方向的 `yaw`。
 
 ```
 ~/.pyenv/versions/3.11.13/bin/python3 collect_nut_mllm.py --env NutAssemblySquare --episodes 50 --out data/mllm

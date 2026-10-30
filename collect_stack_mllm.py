@@ -1,55 +1,17 @@
-"""采集 robosuite Stack 数据，用来训练能按任务改步骤的 MLLM。
+"""采集 robosuite Stack 的单目 MLLM 数据。
 
-- 输入：每台相机一张 RGB，按 inputs 里的顺序排。指令以同样数量的 <image> 占位开头，
-  多张图时占位后面写明每张来自哪台相机。默认 frontview 加 frontview 正对面的 backview
-- 指令：红块还在桌上时，步骤是移到红块上方、下降、合爪、抬高、移到绿块上方、下降、
-  松爪、抬开、停住。已经抓住并且对准绿块时，前面的步骤不再写。叠好之后 subtasks 为空。
-  话术后面带字段说明（target_1、target_2 这些字段各是什么），模型按说明写 answer
-- 输出：每个 subtask 带一个 desc，用 20 字以内说明这一步做什么
+每条成功叠放只保存开局的一帧 frontview RGB。红块和绿块按左右、前后、对角、
+一近一远等相对位置摆放，各自再绕竖直轴旋转。失败轨迹不发布。
 
-夹的时候写两指落点，叠的时候写物体中心加距离（用户要求的取舍）：
-- 抓红块的步骤（move_above、move_down、lift）带两指落点的像素，是两指合拢时
-  贴住红块两侧表面的点，target_kind 是 grip，两落点的中点是抓取位置。
-  两指沿当前朝向的合拢轴贴住红块，一个朝 frontview，一个朝对面
-- 单目只开 frontview：两个落点都写在这一张图上，target_2 挡住了也照写，不做 mask
-- 双目 frontview 加 backview：每个落点各给两台相机的像素，target_1、target_1_back、
-  target_2、target_2_back。某台相机看不到那个落点时对应字段写 "mask"，不脑补这张图的
-  像素，用另一台相机的；两台都看不到时 frontview 保留像素兜底
-- 放绿块的步骤写绿块中心：target_1（双目时还有 target_1_back），target_kind 是 cube_center；
-  move_down 的 offset_z 是相对方块中心的高度（含一点下压），move_above 的 clearance 是悬停高度
+- 输入：image 和 instruction，指令以一个 <image> 占位开头。
+- 抓红块：move_above、move_down、lift 写 target_1、target_2 两指落点，
+  target_kind=grip；两个像素都来自 frontview，背侧落点被挡住也按形状写出。
+- 放绿块：写绿块中心 target_1，target_kind=cube_center；move_down 的 offset_z
+  是相对该中心的高度，move_above 的 clearance 是悬停高度。
+- 每个 subtask 带 desc。叠好后 subtasks 为空。
 
-评测时模型按同样的格式给出像素。每台相机用自己的深度还原自己看得到的点
-（被 mask 的视图不参与），融合后交给 task_plan.execute_plan。执行器不认识 Stack，只按步骤走。
-
-输入例子。每台相机一张 RGB，默认 frontview 加 backview，对应样本的 image、image_back 字段；
-指令开头的 <image> 每行一个，和图片一一对应，多张图时占位后面注明每张来自哪台相机；话术后面带 answer 各字段的说明：
-
-    <image>
-    <image>
-    第一张图是正面相机（frontview），第二张图是背面相机（backview）。把红色方块叠到绿色方块上。回答的 JSON 中，抓红块的步骤里 target_1、target_2 是贴住红块两侧的两指落点，每个落点各给两台相机的像素：target_1 在正面相机图上，target_1_back 在背面相机图上，target_2、target_2_back 同理；某台相机看不到那个落点时对应字段写 "mask"，不要猜它的像素。两落点的中点是抓取点；放绿块的步骤只写 target_1、target_1_back（绿块中心），target_kind 是 cube_center，offset_z 是相对这个中心的高度。
-
-单目只开 frontview，一个占位后面接话术和字段说明：
-
-    <image>
-    把红色方块叠到绿色方块上。回答的 JSON 中，抓红块的步骤里 target_1、target_2 是贴住红块两侧的两指落点的像素，都在正面相机图上，中点是抓取点；放绿块的步骤只写 target_1，target_kind 是 cube_center（方块中心），offset_z 是相对这个中心的高度。
-
-输出例子（红块还在桌上、夹爪还没对准时；朝前的落点在 backview 里被红块挡住写 "mask"，朝后的落点在 frontview 里被挡住写 "mask"）：
-
-    {"subtasks": [{"type": "move_above", "desc": "移到红块正上方", "target_1": "[212 296]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[270 289]", "target_kind": "grip", "clearance": 0.12}, {"type": "move_down", "desc": "竖直降到红块处", "target_1": "[212 296]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[270 289]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住红块"}, {"type": "lift", "desc": "竖直抬起红块", "target_1": "[212 296]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[270 289]", "target_kind": "grip", "delta_z": 0.1}, {"type": "move_above", "desc": "移到绿块正上方", "target_1": "[320 275]", "target_1_back": "[195 268]", "target_kind": "cube_center", "clearance": 0.12}, {"type": "move_down", "desc": "把红块放到绿块上", "target_1": "[320 275]", "target_1_back": "[195 268]", "target_kind": "cube_center", "offset_z": 0.041}, {"type": "open_gripper", "desc": "松爪放下红块"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[320 275]", "target_1_back": "[195 268]", "target_kind": "cube_center", "clearance": 0.12}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
-
-单目输出里没有 *_back 字段，两个落点都写在 frontview 图上，挡住也照写。
-
-每条成功叠放只存开局那一帧（phase 为 initial）。红块和绿块按左右、前后、对角、
-一近一远这几类相对位置分开摆，各自再绕竖直轴转一个角度。中途的悬停、搬运、放下不存。
-
-例如凑满 50 条成功叠放再停，图片和样本写到 data/stack_mllm：
-
-python collect_stack_mllm.py --episodes 50 --out data/stack_mllm
-
-叠放失败的轨迹整条丢掉，图片和样本都不写盘。
-
-多个任务可以写进同一个 --out。样本 id 和图片名带 stack_ 前缀，
-samples.jsonl 按任务合并，后跑的采集不会盖掉已经写下的其他任务。
+评测使用同一 frontview 的深度把像素还原成世界坐标，再交给 task_plan.execute_plan。
+例如：python collect_stack_mllm.py --episodes 50 --out data/stack_mllm
 """
 
 import argparse
@@ -69,19 +31,14 @@ from mllm_dataset import finish_image_staging, make_image_staging_dir, make_samp
 from collect_common import order_landings_at
 from collect_lift_mllm import (
     ABOVE_XY_TOL,
-    BACK_CAMERA,
     CAMERAS,
     DEFAULT_CAMERA,
     GRASP_Z_TOL,
-    MASK,
     START_CLEARANCE,
     START_X_RANGE,
     START_Y_RANGE,
     YAW_RANGE,
     arm_controller,
-    add_camera_arg,
-    apply_cameras,
-    back_enabled,
     format_pixel,
     grip_view_pixels,
     hold,
@@ -94,7 +51,6 @@ from collect_lift_mllm import (
     round_pixel,
     set_free_xyaw,
     save_rgb,
-    view_pixel,
     with_views,
     world_to_pixel_matrices,
 )
@@ -260,14 +216,6 @@ def sample_start_pos(rng, cube_a, cube_b, rest_z):
 
 def plan_desc():
     """跟在指令话术后面的字段说明：两指落点和方块中心各写在哪些步骤上。"""
-    tail = "放绿块的步骤只写 target_1、target_1_back（绿块中心），target_kind 是 cube_center，offset_z 是相对这个中心的高度"
-    if back_enabled():
-        return (
-            "抓红块的步骤里 target_1、target_2 是贴住红块两侧的两指落点，"
-            "每个落点各给两台相机的像素：target_1 在正面相机图上，target_1_back 在背面相机图上，"
-            "target_2、target_2_back 同理；某台相机看不到那个落点时对应字段写 \"mask\"，不要猜它的像素。"
-            "两落点的中点是抓取点；" + tail
-        )
     return (
         "抓红块的步骤里 target_1、target_2 是贴住红块两侧的两指落点的像素，都在正面相机图上；"
         "另一个落点被红块挡住时也根据方块形状和朝向补出它的像素，不写 mask。两落点的中点是抓取点；"
@@ -284,22 +232,15 @@ def grip_step(kind, desc, pixels, params):
     return out
 
 
-def place_step(kind, desc, pixel, params, pixel_back=None):
+def place_step(kind, desc, pixel, params):
     """放绿块的步骤：target_1 写方块中心，target_kind 是 cube_center，叠的时候用中心加距离。"""
     out = {"type": kind, "desc": desc, "target_1": pixel, "target_kind": "cube_center"}
-    if pixel_back is not None:
-        out["target_1_back"] = pixel_back
     out.update(params)
     return out
 
 
-def remaining_subtasks(cube_a, cube_b, eef, grip_pixels, pix_b, rest_z, offset, grasped, done, pix_b_back=None):
-    """从当前画面接着做的步骤。已经完成的不写。
-
-    grip_pixels 是 grip_view_pixels 的返回：两个夹爪落点各自在两台相机上的像素，写进抓红块的步骤。
-    pix_b 是绿块中心在 frontview 的像素字符串，pix_b_back 是它在 backview 的（单目时不传），
-    写进放绿块步骤的 target_1、target_1_back。
-    """
+def remaining_subtasks(cube_a, cube_b, eef, grip_pixels, pix_b, rest_z, offset, grasped, done):
+    """从当前画面接着做的步骤。已经完成的不写。"""
     if done:
         return []
     above_a = xy_close(eef, cube_a)
@@ -328,17 +269,17 @@ def remaining_subtasks(cube_a, cube_b, eef, grip_pixels, pix_b, rest_z, offset, 
     if not (grasped and above_b):
         steps.append(place_step(
             "move_above", "移到绿块正上方", pix_b,
-            {"clearance": round(float(DEFAULT_CLEARANCE), 2)}, pix_b_back,
+            {"clearance": round(float(DEFAULT_CLEARANCE), 2)},
         ))
     if not (grasped and at_place):
         steps.append(place_step(
             "move_down", "把红块放到绿块上", pix_b,
-            {"offset_z": round(float(offset), 3)}, pix_b_back,
+            {"offset_z": round(float(offset), 3)},
         ))
     steps.append({"type": "open_gripper", "desc": "松爪放下红块"})
     steps.append(place_step(
         "move_above", "向上抬开夹爪", pix_b,
-        {"clearance": round(float(DEFAULT_CLEARANCE), 2)}, pix_b_back,
+        {"clearance": round(float(DEFAULT_CLEARANCE), 2)},
     ))
     steps.append({"type": "stabilize", "desc": "停在原地保持稳定", "duration": STABILIZE_DURATION})
     return steps
@@ -348,22 +289,14 @@ def plan_for(env, obs, rest_z, offset, matrices, style, grasped, done, half, axi
     """从当前画面生成标注。
 
     half 是红块半边长，axis 是合拢轴（末端朝向矩阵的第一列）。两指落点贴住红块两侧，
-    target_1 写朝 frontview 那侧，camera_pos 是 frontview 相机位置，用来排两个落点的先后。
-    遮挡判定要访问 env 的模型（mj_ray 打视线）。
+    target_1 写朝 frontview 那侧，camera_pos 用来排两个落点的先后。
     """
     cube_a, cube_b, eef = positions_from_obs(obs)
     side = np.asarray(axis, dtype=float) * float(half)
     land_1, land_2 = order_landings_at(cube_a, camera_pos, (cube_a + side, cube_a - side))
-    grip_pixels = grip_view_pixels(env, land_1, land_2, matrices)
-    pix_b = view_pixel(env, cube_b, DEFAULT_CAMERA, matrices[DEFAULT_CAMERA], own_body=env.cubeB_body_id)
-    pix_b_back = None
-    if BACK_CAMERA in matrices:
-        pix_b_back = view_pixel(env, cube_b, BACK_CAMERA, matrices[BACK_CAMERA], own_body=env.cubeB_body_id)
-        if pix_b == MASK and pix_b_back == MASK:
-            pix_b = format_pixel(project_world(cube_b, matrices[DEFAULT_CAMERA])[0])
-    subtasks = remaining_subtasks(
-        cube_a, cube_b, eef, grip_pixels, pix_b, rest_z, offset, grasped, done, pix_b_back
-    )
+    grip_pixels = grip_view_pixels(land_1, land_2, matrices)
+    pix_b = format_pixel(project_world(cube_b, matrices[DEFAULT_CAMERA])[0])
+    subtasks = remaining_subtasks(cube_a, cube_b, eef, grip_pixels, pix_b, rest_z, offset, grasped, done)
     if done:
         instruction = style[2]
     elif grasped:
@@ -379,9 +312,6 @@ def plan_for(env, obs, rest_z, offset, matrices, style, grasped, done, half, axi
         "cubeA_pixel": round_pixel(project_world(cube_a, matrices[DEFAULT_CAMERA])[0]),
         "cubeB_pixel": round_pixel(project_world(cube_b, matrices[DEFAULT_CAMERA])[0]),
     }
-    if BACK_CAMERA in matrices:
-        plan["cubeA_pixel_back"] = round_pixel(project_world(cube_a, matrices[BACK_CAMERA])[0])
-        plan["cubeB_pixel_back"] = round_pixel(project_world(cube_b, matrices[BACK_CAMERA])[0])
     return plan
 
 
@@ -452,11 +382,6 @@ class DatasetWriter:
             "answer": plan["answer"],
             "success": False,
         }
-        if "cubeA_pixel_back" in plan:
-            record["image_back"] = "images/{}_back.png".format(sample_id)
-            record["camera_back"] = BACK_CAMERA
-            record["cubeA_pixel_back"] = plan["cubeA_pixel_back"]
-            record["cubeB_pixel_back"] = plan["cubeB_pixel_back"]
         rgbs = {name: np.array(obs[name + "_image"], copy=True) for name in CAMERAS}
         self.pending.append((record, rgbs))
         return record
@@ -468,27 +393,16 @@ class DatasetWriter:
             return
         for record, rgbs in pending:
             save_rgb(self.image_dir / Path(record["image"]).name, rgbs[DEFAULT_CAMERA])
-            if record.get("image_back") and BACK_CAMERA in rgbs:
-                save_rgb(self.image_dir / Path(record["image_back"]).name, rgbs[BACK_CAMERA])
             record["success"] = True
             self.samples.append(record)
         self.episodes.append({"episode": episode, "success": True})
 
     def close(self, publish=True):
-        if BACK_CAMERA in CAMERAS:
-            pixels = (
-                "move_above、move_down、lift 里每个空间字段各给两台相机的像素，格式是 \"[x y]\"，x 向右、y 向下："
-                "target_1 对应 image（frontview），target_1_back 对应 image_back（backview）。"
-                "抓红块的步骤还有 target_2、target_2_back，是另一指落点在这两张图上的像素。"
-                "某台相机看不到那个点时对应字段是 \"mask\"。"
-            )
-            frame = "target_1、target_2 是 frontview 像素，target_1_back、target_2_back 是 backview 像素，被挡时是 \"mask\"。cubeA_pos、cubeB_pos 是世界坐标，米"
-        else:
-            pixels = (
-                "move_above、move_down、lift 各自带 target_1 像素，格式是 \"[x y]\"，x 向右、y 向下，对应 image（frontview）。"
-                "抓红块的步骤还有 target_2，是另一指落点在同一张图上的像素，被红块挡住也照写。"
-            )
-            frame = "target_1、target_2 都是 frontview 像素。cubeA_pos、cubeB_pos 是世界坐标，米"
+        pixels = (
+            "move_above、move_down、lift 各自带 target_1 像素，格式是 \"[x y]\"，x 向右、y 向下，对应 image（frontview）。"
+            "抓红块的步骤还有 target_2，是另一指落点在同一张图上的像素，被红块挡住也照写。"
+        )
+        frame = "target_1、target_2 都是 frontview 像素。cubeA_pos、cubeB_pos 是世界坐标，米"
         meta = {
             "env": "Stack",
             "robot": "Panda",
@@ -519,14 +433,12 @@ class DatasetWriter:
             "transport_dz_m": TRANSPORT_DZ,
             "coordinate_frame": frame,
             "camera_world_to_pixel": {name: matrix_to_list(matrix) for name, matrix in self.world_to_pixel.items()},
-            "instruction": "指令以若干个 <image> 占位开头，每行一个，和 inputs 里的图片一一对应；多张图时占位后面注明每张来自哪台相机。话术后面带 answer 各字段的说明（两指落点和方块中心各写在哪些步骤上）。红块还没抓住时，指令是把红色方块叠到绿色方块上。抓住之后改成把拿着的红块放到绿块上。叠好之后说明已经完成。同一条轨迹里用同一套说法。",
+            "instruction": "指令以一个 <image> 占位开头，对应 inputs 里的 frontview 图片。话术后面带 answer 各字段的说明。红块还没抓住时，指令是把红色方块叠到绿色方块上。抓住之后改成把拿着的红块放到绿块上。叠好之后说明已经完成。同一条轨迹里用同一套说法。",
             "num_episodes": len(self.episodes),
             "num_discarded_episodes": self.discarded,
             "num_samples": len(self.samples),
             "episodes": self.episodes,
         }
-        if BACK_CAMERA in CAMERAS:
-            meta["camera_back"] = BACK_CAMERA
         finish_image_staging(self.out_dir, self.image_dir, publish)
         if publish:
             self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
@@ -649,9 +561,7 @@ def main():
     parser.add_argument("--episode-offset", type=int, default=0, help="首个 episode 编号；并行分片时用不同偏移避免样本 ID 冲突")
     parser.add_argument("--episode-stride", type=int, default=1, help="每次尝试后的 episode 编号步长；并行分片使用 worker 总数")
     parser.add_argument("--image-size", type=int, default=1024)
-    add_camera_arg(parser)
     args = parser.parse_args()
-    apply_cameras(args)
 
     rng = np.random.default_rng(args.seed)
     env = make_env(args.image_size, args.seed, use_camera=True)

@@ -1,15 +1,13 @@
-"""测评视频按采集输入的相机顺序并排，标出模型回答里的原始像素。
+"""在单目 frontview 测评视频中标出模型回答里的原始像素。
 
-默认左边 frontview、右边 backview，单目时只保留 frontview。每个标记直接来自
-subtasks 的 target_1、target_2、held、pivot、path；mask 的视图不画，三维定位、
-深度采样和后续重定位都不会改写这些模型输出。
+每个标记直接来自 subtasks 的 target_1、target_2、align_point、pivot、path；
+三维定位、深度采样和后续重定位都不会改写这些模型输出。
 """
 
 import os
 
 import numpy as np
 
-GAP = 4
 PALETTE = (
     (255, 72, 72),
     (60, 210, 95),
@@ -91,24 +89,21 @@ def _pixel_key(pixel):
 
 
 def plan_markers(subtasks):
-    """把解析后的模型计划展开成逐视图像素标记；完全相同的重复标注只画一次。"""
+    """把解析后的模型计划展开成 frontview 像素标记；完全相同的重复标注只画一次。"""
     markers = []
     seen = set()
-    fields = (("pixel", "target_1"), ("pixel_2", "target_2"), ("held", "held"), ("pivot", "pivot"))
+    fields = (("pixel", "target_1"), ("pixel_2", "target_2"), ("align_point", "align_point"), ("pivot", "pivot"))
     for step in subtasks or []:
-        entries = [(key, label, step.get(key), step.get(key + "_back")) for key, label in fields]
-        back_path = step.get("path_back") or []
-        for index, pixel in enumerate(step.get("path") or []):
-            pixel_back = back_path[index] if index < len(back_path) else None
-            entries.append(("path", "path[{}]".format(index), pixel, pixel_back))
-        for _key, label, front, back in entries:
+        entries = [(key, label, step.get(key)) for key, label in fields]
+        entries.extend(("path", "path[{}]".format(index), pixel) for index, pixel in enumerate(step.get("path") or []))
+        for _key, label, pixel in entries:
             if _key not in step:
                 continue
-            key = (label, _pixel_key(front), _pixel_key(back))
+            key = (label, _pixel_key(pixel))
             if key in seen:
                 continue
             seen.add(key)
-            markers.append({"label": label, "pixel": front, "pixel_back": back, "color": PALETTE[len(markers) % len(PALETTE)]})
+            markers.append({"label": label, "pixel": pixel, "color": PALETTE[len(markers) % len(PALETTE)]})
     return markers
 
 
@@ -126,7 +121,7 @@ def draw_view(rgb, markers, camera):
     draw = ImageDraw.Draw(image)
     placed = []
     for item in markers:
-        pixel = item.get("pixel") if camera == "frontview" else item.get("pixel_back")
+        pixel = item.get("pixel")
         if pixel is None:
             continue
         u, v = (float(value) for value in np.asarray(pixel).reshape(2))
@@ -145,18 +140,13 @@ def draw_view(rgb, markers, camera):
 def _dots(canvas, markers, camera):
     height, width = canvas.shape[:2]
     for item in markers:
-        pixel = item.get("pixel") if camera == "frontview" else item.get("pixel_back")
+        pixel = item.get("pixel")
         if pixel is None:
             continue
         u, v = (int(round(float(value))) for value in np.asarray(pixel).reshape(2))
         if 1 <= u < width - 1 and 1 <= v < height - 1:
             canvas[v - 1 : v + 2, u - 1 : u + 2] = item["color"]
     return canvas
-
-
-def side_by_side(left, right):
-    gap = np.full((left.shape[0], GAP, 3), 12, dtype=np.uint8)
-    return np.ascontiguousarray(np.concatenate([left, gap, right], axis=1))
 
 
 class EvalVideo:
@@ -167,14 +157,7 @@ class EvalVideo:
         self.image_size = int(image_size)
         self.frames = []
         self.markers = []
-        self.cameras = None
         self._warned = False
-
-    def _ensure(self):
-        if self.cameras is None:
-            from collect_lift_mllm import CAMERAS
-
-            self.cameras = list(CAMERAS)
 
     def add(self, obs):
         if obs is None:
@@ -191,7 +174,6 @@ class EvalVideo:
     def set_plan(self, subtasks, obs=None):
         """模型答案解析成功后立即记录原始像素，并重画提问那一帧。"""
         try:
-            self._ensure()
             self.markers = plan_markers(subtasks)
             if obs is not None and self.frames:
                 self.frames[-1] = self._compose(obs)
@@ -199,17 +181,7 @@ class EvalVideo:
             print("video markers failed: {}".format(exc), flush=True)
 
     def _compose(self, obs):
-        self._ensure()
-        views = []
-        for camera in self.cameras:
-            rgb = self._rgb_or_none(obs, camera)
-            if rgb is not None:
-                views.append(draw_view(rgb, self.markers, camera))
-        if not views:
-            raise RuntimeError("缺少相机图像")
-        if len(views) == 1:
-            return views[0]
-        return side_by_side(views[0], views[1])
+        return draw_view(self._rgb(obs, "frontview"), self.markers, "frontview")
 
     def _rgb(self, obs, camera):
         key = camera + "_image"
@@ -220,47 +192,31 @@ class EvalVideo:
             raise RuntimeError("相机图像是 {}，测评要求 {:d}x{:d}".format(image.shape, self.image_size, self.image_size))
         return image.copy()
 
-    def _rgb_or_none(self, obs, camera):
-        if camera + "_image" not in obs:
-            return None
-        return self._rgb(obs, camera)
-
-
 def _self_test():
     size = 128
     front = np.full((size, size, 3), 80, dtype=np.uint8)
-    back = np.full((size, size, 3), 60, dtype=np.uint8)
     subtasks = [
         {
             "type": "move_down",
             "pixel": np.array([48.0, 55.0]),
-            "pixel_back": None,
             "pixel_2": np.array([68.0, 55.0]),
-            "pixel_2_back": np.array([35.0, 45.0]),
-            "held": np.array([80.0, 70.0]),
-            "held_back": np.array([60.0, 70.0]),
+            "align_point": np.array([80.0, 70.0]),
         },
-        {"type": "turn", "pivot": np.array([20.0, 90.0]), "pivot_back": np.array([90.0, 90.0])},
+        {"type": "turn", "pivot": np.array([20.0, 90.0])},
         {"type": "wipe", "path": [np.array([30.0, 100.0]), np.array([50.0, 100.0])]},
     ]
     markers = plan_markers(subtasks)
-    assert [item["label"] for item in markers] == ["target_1", "target_2", "held", "pivot", "path[0]", "path[1]"]
-    left = draw_view(front, markers, "frontview")
-    right = draw_view(back, markers, "backview")
-    frame = side_by_side(left, right)
-    assert frame.shape == (size, size * 2 + GAP, 3)
+    assert [item["label"] for item in markers] == ["target_1", "target_2", "align_point", "pivot", "path[0]", "path[1]"]
+    frame = draw_view(front, markers, "frontview")
+    assert frame.shape == (size, size, 3)
     assert np.array_equal(frame[55, 48], PALETTE[0])
-    assert np.array_equal(frame[45, size + GAP + 35], PALETTE[1])
-    assert np.array_equal(draw_view(front, markers[:1], "backview")[55, 48], front[55, 48])
+    assert np.array_equal(frame[55, 68], PALETTE[1])
     video = EvalVideo(None, size)
-    video.cameras = ["frontview", "backview"]
-    obs = {"frontview_image": front, "backview_image": back}
+    obs = {"frontview_image": front}
     video.add(obs)
     video.set_plan(subtasks, obs)
     assert len(video.frames) == 1 and video.frames[0].shape == frame.shape
     assert np.array_equal(video.frames[0][55, 48], PALETTE[0])
-    video.cameras = ["frontview"]
-    assert video._compose(obs).shape == (size, size, 3)
     print("eval_video self-test ok", flush=True)
     return frame
 

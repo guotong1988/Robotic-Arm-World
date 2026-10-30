@@ -24,15 +24,10 @@ gl_backend.configure()
 import numpy as np
 
 from collect_lift_mllm import (
-    BACK_CAMERA,
     DEFAULT_CAMERA,
-    MASK,
-    add_camera_arg,
-    apply_cameras,
     format_pixel,
     grip_view_pixels,
     project_world,
-    view_pixel,
     with_views,
     world_to_pixel_matrices,
 )
@@ -98,54 +93,42 @@ def reverse_plan(env, obs, offset, matrices, half, axis, camera_pos):
     """抓绿块、放到红块上的真值步骤。复用正向的步骤生成，只把两块对调。
 
     抓绿块的步骤写两指落点对（贴绿块两侧），放红块的步骤写红块中心，和正向任务一致。
-    被相机挡住、看不到的落点写 "mask"；两台相机都看不到时 frontview 保留像素兜底。
+    所有像素都来自 frontview，被挡住的落点也按方块形状写出。
     """
     cube_a, cube_b, eef = positions_from_obs(obs)
     side = np.asarray(axis, dtype=float) * float(half)
     # 两指落点贴被叠的绿块两侧，朝 frontview 的一侧写 target_1。
     land_1, land_2 = order_landings_at(cube_b, camera_pos, (cube_b + side, cube_b - side))
-    grip_pixels = grip_view_pixels(env, land_1, land_2, matrices)
-    pix_place = view_pixel(env, cube_a, DEFAULT_CAMERA, matrices[DEFAULT_CAMERA], own_body=env.cubeA_body_id)
-    pix_place_back = None
-    if BACK_CAMERA in matrices:
-        pix_place_back = view_pixel(env, cube_a, BACK_CAMERA, matrices[BACK_CAMERA], own_body=env.cubeA_body_id)
-        if pix_place == MASK and pix_place_back == MASK:
-            pix_place = format_pixel(project_world(cube_a, matrices[DEFAULT_CAMERA])[0])
-    steps = remaining_subtasks(
-        cube_b, cube_a, eef, grip_pixels, pix_place, float(cube_b[2]), offset, False, False, pix_place_back
-    )
+    grip_pixels = grip_view_pixels(land_1, land_2, matrices)
+    pix_place = format_pixel(project_world(cube_a, matrices[DEFAULT_CAMERA])[0])
+    steps = remaining_subtasks(cube_b, cube_a, eef, grip_pixels, pix_place, float(cube_b[2]), offset, False, False)
     # format_plan 直接返回模型输出格式的 JSON 文本，oracle 时喂给 parse_plan。
     return format_plan(steps)
 
 
 def step_before(subtasks, kind):
-    """kind 这一步之前最近一个带像素的步骤的像素和所在视图。front 被 mask 时回退 backview。"""
+    """kind 这一步之前最近一个带 frontview 像素的步骤。"""
     pixel = None
-    view = None
     for step in subtasks:
         if step["type"] == kind:
-            return pixel, view
+            return pixel
         if "pixel" in step:
-            if step["pixel"] is not None:
-                pixel, view = step["pixel"], DEFAULT_CAMERA
-            elif step.get("pixel_back") is not None:
-                pixel, view = step["pixel_back"], BACK_CAMERA
-    return None, None
+            pixel = step["pixel"]
+    return None
 
 
-def classify_behavior(subtasks, gt_pix, gt_pix_back):
-    """按合爪、松爪前的像素判断抓了哪块、放到哪块上。像素在哪个视图就用哪个视图的真值。"""
-    pick, pick_view = step_before(subtasks, "close_gripper")
-    place, place_view = step_before(subtasks, "open_gripper")
+def classify_behavior(subtasks, gt_pix):
+    """按合爪、松爪前的 frontview 像素判断抓了哪块、放到哪块上。"""
+    pick = step_before(subtasks, "close_gripper")
+    place = step_before(subtasks, "open_gripper")
 
-    def nearest(pixel, view):
+    def nearest(pixel):
         if pixel is None:
             return None
-        gt = gt_pix if view == DEFAULT_CAMERA else gt_pix_back
-        return OBJECT_NAMES[nearest_object(pixel, gt)[0]]
+        return OBJECT_NAMES[nearest_object(pixel, gt_pix)[0]]
 
-    picked = nearest(pick, pick_view)
-    placed_on = nearest(place, place_view)
+    picked = nearest(pick)
+    placed_on = nearest(place)
     if picked == "green" and placed_on == "red":
         behavior = "reverse"
     elif picked == "red" and placed_on == "green":
@@ -179,12 +162,6 @@ def run_episode(env, client, rng, episode, image_size, oracle, instruction=None,
         # 以下真值只用来统计，不进模型，不进控制。
         gt_a, gt_b, _ = positions_from_obs(obs)
         gt_pix = [project_world(gt_a, matrix)[0], project_world(gt_b, matrix)[0]]
-        gt_pix_back = [None, None]
-        if BACK_CAMERA in matrices:
-            gt_pix_back = [
-                project_world(gt_a, matrices[BACK_CAMERA])[0],
-                project_world(gt_b, matrices[BACK_CAMERA])[0],
-            ]
         gt_answer = reverse_plan(
             env, obs, place_offset(env), matrices, half_z(env.cubeA, 0.02), axis, cam_pos
         )
@@ -200,11 +177,11 @@ def run_episode(env, client, rng, episode, image_size, oracle, instruction=None,
             subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
             record["steps"] = [step["type"] for step in subtasks]
             record["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-            record["picked"], record["placed_on"], record["behavior"] = classify_behavior(subtasks, gt_pix, gt_pix_back)
+            record["picked"], record["placed_on"], record["behavior"] = classify_behavior(subtasks, gt_pix)
             points = perceive(subtasks, views, image_size, axis=axis)
             targets = []
             for point in points:
-                target, line = point_target(point, gt_pix, gt_pix_back, gt_a, gt_b)
+                target, line = point_target(point, gt_pix, gt_a, gt_b)
                 targets.append(target)
                 print("episode {:02d} {}".format(episode, line), flush=True)
             record["targets"] = targets
@@ -311,7 +288,6 @@ def main():
     parser.add_argument("--out", default="data/stack_reverse_eval")
     parser.add_argument("--no-video", action="store_true", help="不把每条测评的 frontview 录成 mp4")
     parser.add_argument("--oracle", action="store_true", help="用反向真值步骤代替模型，检查抓绿放红能否做成")
-    add_camera_arg(parser)
     args = parser.parse_args()
 
     check_parser()
@@ -330,7 +306,6 @@ def main():
         )
         print("api {} model {}".format(client.api_base, client.resolve_model()), flush=True)
 
-    apply_cameras(args)
     rng = np.random.default_rng(args.seed)
     env = make_env(args.image_size, args.seed, use_camera=True, camera_depths=True)
     image_size = camera_size(env)

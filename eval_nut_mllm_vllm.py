@@ -4,7 +4,7 @@
     python3 eval_nut_mllm_vllm.py --oracle --env NutAssembly --episodes 5
 
 一张 frontview RGB 加一句「把方形螺母套到方柱上。」，模型写出带 yaw 的抓取、
-带 held 的对准柱子、松爪退开的全部步骤。抓取点、held 的螺母中心
+带 align_point 的对准柱子、松爪退开的全部步骤。抓取点、align_point 的螺母中心
 用深度图量出的桌面加半个螺母厚，柱顶用柱子上量到的顶面，都取视线交点。
 流程详见 eval_task_core.py 和 depth_locate.py。
 """

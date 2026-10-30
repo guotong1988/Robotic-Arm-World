@@ -26,15 +26,9 @@ import robosuite.macros as macros
 from robosuite.utils.transform_utils import mat2quat
 
 from collect_lift_mllm import (
-    BACK_CAMERA,
     CAMERAS,
     DEFAULT_CAMERA,
-    MASK,
-    OCCLUSION_TOL,
-    add_camera_arg,
-    apply_cameras,
     arm_controller,
-    back_enabled,
     format_pixel,
     grip_view_pixels,
     input_fields,
@@ -45,7 +39,6 @@ from collect_lift_mllm import (
     rotated_about_z,
     round_pixel,
     save_rgb,
-    view_pixel,
     with_views,
     world_to_pixel_matrices,
 )
@@ -76,11 +69,11 @@ WRIST_CENTER = 45.0
 # 手腕 yaw 离中心不超过这个角度就算安全，度。q7 限位是 ±166。
 WRIST_SAFE = 140.0
 _ANSWER_KIND = (
-    "每个像素字段注明指的是哪类东西：target_kind、held_kind、pivot_kind、path_kind，取值 object（放在桌面或箱底上的物体中心）、"
+    "每个像素字段注明指的是哪类东西：target_kind、align_point_kind、pivot_kind、path_kind，取值 object（放在桌面或箱底上的物体中心）、"
     "cube_center（方块的中心）、bin（箱子里格子的底面）、nut（平放的螺母中心）、peg（柱子顶端中心）、table（贴在桌面上的点）、"
     "door_handle（门把手上的抓取点）、door_axis（门锁转轴、铰链）、grip（夹爪合拢时贴住物体表面的落点）。"
     "双落点 grip 步骤不写 yaw，合拢方向由两点连线确定。单点 move_above（clearance，米）、move_down（offset_z，米）"
-    "可带 yaw（度，夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度）和 held（手里物体上要对准目标的那一点的像素）。"
+    "可带 yaw（度，夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度）和 align_point（手里物体上要对准目标的那一点的像素）。"
     "lift 的 delta_z 是还要抬的高度，米。"
     "reach 沿 approach（世界坐标方向）伸向 target，停在 standoff 米处。turn 绕过 pivot 像素、方向为 axis 的转轴转 angle 度。"
     "wipe 贴着桌面依次走过 path 里的像素，offset_z 是往下压的量。另外有 close_gripper、open_gripper、stabilize。完成后 subtasks 为空。"
@@ -116,11 +109,6 @@ def plan_desc(task):
         text = fn()
         if text:
             return text
-    if back_enabled():
-        return (
-            "target_1 是要对准的点在正面相机图上的像素，target_1_back 是同一点在背面相机图上的像素；"
-            "某台相机看不到那个点时对应字段写 \"mask\"，不要猜它的像素"
-        )
     return "target_1 是要对准的点在正面相机图上的像素"
 
 
@@ -142,30 +130,16 @@ def order_landings(env, center, pair):
 
 
 def answer_spec():
-    """样本 answer 的说明。类别始终写；backview 没开时不写 *_back。"""
     lead = (
         "JSON 字符串。subtasks 是从这一帧还要做的步骤，每个 subtask 的 desc 用 20 字以内说明这一步做什么；"
         "各字段的含义跟在指令话术后面，不在 answer 里重复。像素都写成 \"[x y]\"，x 向右、y 向下，原点在左上角。"
     )
-    if back_enabled():
-        views = (
-            "每个空间字段给两个视图的像素：target_1 对应 image（frontview），target_1_back 对应 image_back（backview 背面机位）；"
-            "held、pivot、path 同理各有 held_back、pivot_back、path_back。"
-            "某台相机看不到那个点时对应字段写 \"mask\"，表示不要猜这张图的像素，用另一台相机的；两台都看不到时 frontview 字段保留像素兜底。"
-        )
-    else:
-        views = "每个空间字段给 frontview 的像素：target_1 对应 image；held、pivot、path 同理。"
+    views = "每个空间字段给 frontview 的像素：target_1 对应 image；align_point、pivot、path 同理。"
     return lead + views + _ANSWER_KIND
 
 
 def coordinate_frame():
-    if back_enabled():
-        return (
-            "subtasks 里的 target_1、pivot、held、path 是 frontview 像素，"
-            "target_1_back、pivot_back、held_back、path_back 是 backview 像素，被挡的视图是字面量 \"mask\"；"
-            "points 里的 pos 是世界坐标，米"
-        )
-    return "subtasks 里的 target_1、pivot、held、path 是 frontview 像素；points 里的 pos 是世界坐标，米"
+    return "subtasks 里的 target_1、pivot、align_point、path 是 frontview 像素；points 里的 pos 是世界坐标，米"
 
 
 def wrap_angle(deg, period):
@@ -243,52 +217,25 @@ def point_kind(task, name):
 def render_step(task, env, step, points, matrices, eef, eef_ori, current):
     """抽象步骤写成这一帧的 subtask。current 表示正在做这一步，已经到位就返回 None。
 
-    每个空间字段给 frontview 像素；开了 backview 时再给 target_1_back，held/pivot/path 同理。
-    双目时某台相机看不到那个点（视线中途被挡住），对应字段写 "mask"，不脑补这张图的像素；
-    两台都被挡时 frontview 保留像素兜底。单目不做遮挡判定，挡住也照写。
+    每个空间字段只写 frontview 像素，被挡住时也根据物体形状写出像素。
     每个像素字段带 *_kind 类别标注（任务实现 point_kind 时），评测按类别选深度量法。
-    中心类的点命中所属物体自身不算挡（任务实现 point_body(env, name) 给出所属 body）；
-    表面类（door_handle、grip 落点）任何提前命中都算挡。
-    任务实现 grip_points(env, name) 且 name 是夹爪落点时，写两个落点各自在两台相机上的像素
-    （target_1、target_1_back、target_2、target_2_back），target_kind 标 grip，执行器取两点的中点，
+    任务实现 grip_points(env, name) 且 name 是夹爪落点时，写 target_1、target_2，
+    target_kind 标 grip，执行器取两点的中点，
     并由两点连线推导 yaw，所以抓取标签不再重复写 yaw。每步带 desc，说明这一步做什么。
     """
 
-    # 表面类的点贴着的几何有厚度（门把手杆件），命中目标前方一点点不算挡。
-    KIND_OCCLUSION_TOL = {"door_handle": 0.03}
-
-    def pixel_pair(name):
-        """name 在 frontview、backview 的像素字符串。单目时 back 是 None；双目被挡的是 MASK。"""
-        kind = point_kind(task, name)
-        own = None
-        if kind != "door_handle":
-            body_fn = getattr(task, "point_body", None)
-            if body_fn is not None:
-                own = body_fn(env, name)
-        tol = KIND_OCCLUSION_TOL.get(kind, OCCLUSION_TOL)
-        front = view_pixel(env, points[name], DEFAULT_CAMERA, matrices[DEFAULT_CAMERA], own_body=own, tol=tol)
-        if BACK_CAMERA not in matrices:
-            return front, None
-        back = view_pixel(env, points[name], BACK_CAMERA, matrices[BACK_CAMERA], own_body=own, tol=tol)
-        if front == MASK and back == MASK:
-            front = format_pixel(project_world(points[name], matrices[DEFAULT_CAMERA])[0])
-        return front, back
-
     def put_views(out, key, name):
-        front, back = pixel_pair(name)
-        out[key] = front
-        if back is not None:
-            out[key + "_back"] = back
+        out[key] = format_pixel(project_world(points[name], matrices[DEFAULT_CAMERA])[0])
 
     def put_grip(out, name):
-        """落点型的引用点：写两个夹爪落点各自在两台相机上的像素，返回这对世界坐标。"""
+        """落点型的引用点：写两个夹爪落点在 frontview 上的像素，返回这对世界坐标。"""
         fn = getattr(task, "grip_points", None)
         if fn is None:
             return None
         pair = fn(env, name)
         if pair is None:
             return None
-        out.update(grip_view_pixels(env, pair[0], pair[1], matrices))
+        out.update(grip_view_pixels(pair[0], pair[1], matrices))
         out["target_kind"] = "grip"
         return pair
 
@@ -311,15 +258,15 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
             tol = PLACE_DOWN_TOL if extra >= 0.02 else MOVE_DOWN_TOL
         if "yaw" in step and grip_pair is None:
             out["yaw"] = int(round(float(step["yaw"])))
-        if "held" in step:
-            put_views(out, "held", step["held"])
-            held_kind = point_kind(task, step["held"])
-            if held_kind is not None:
-                out["held_kind"] = held_kind
+        if "align_point" in step:
+            put_views(out, "align_point", step["align_point"])
+            align_point_kind = point_kind(task, step["align_point"])
+            if align_point_kind is not None:
+                out["align_point_kind"] = align_point_kind
         if current:
             base = points[step["ref"]] if grip_pair is None else 0.5 * (grip_pair[0] + grip_pair[1])
             goal = np.asarray(base, dtype=float) + np.array([0.0, 0.0, extra])
-            moving = eef if "held" not in step else np.asarray(points[step["held"]], dtype=float)
+            moving = eef if "align_point" not in step else np.asarray(points[step["align_point"]], dtype=float)
             ori_ok = "yaw" not in step or _ori_close(eef_ori, topdown_ori(step["yaw"]))
             if float(np.linalg.norm(moving - goal)) <= tol and ori_ok:
                 return None
@@ -371,14 +318,11 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
         names = task.wipe_path(env)
         if not names:
             return None
-        pairs = [pixel_pair(name) for name in names]
         out = {
             "type": "wipe",
             "desc": step_desc(task, env, step),
-            "path": [front for front, _ in pairs],
+            "path": [format_pixel(project_world(points[name], matrices[DEFAULT_CAMERA])[0]) for name in names],
         }
-        if BACK_CAMERA in matrices:
-            out["path_back"] = [back for _, back in pairs]
         out["offset_z"] = round(float(step["offset_z"]), 3)
         path_kind = point_kind(task, names[0])
         if path_kind is not None:
@@ -416,7 +360,7 @@ def attach_execution_world(task, env, abstract, concrete):
             world["pixel"], world["pixel_2"] = pair
         elif "pixel" in concrete:
             world["pixel"] = points[ref]
-    for abstract_key, concrete_key in (("held", "held"), ("pivot", "pivot")):
+    for abstract_key, concrete_key in (("align_point", "align_point"), ("pivot", "pivot")):
         if abstract_key in abstract and concrete_key in concrete:
             world[concrete_key] = points[abstract[abstract_key]]
     if abstract["type"] == "wipe" and "path" in concrete:
@@ -524,8 +468,6 @@ class TaskWriter:
             return
         for record, rgbs in pending:
             save_rgb(self.image_dir / Path(record["image"]).name, rgbs[DEFAULT_CAMERA])
-            if record.get("image_back") and BACK_CAMERA in rgbs:
-                save_rgb(self.image_dir / Path(record["image_back"]).name, rgbs[BACK_CAMERA])
             record["success"] = True
             self.samples.append(record)
         entry = {"episode": int(episode), "success": True, "num_samples": len(pending)}
@@ -580,9 +522,6 @@ def run_episode(env, task, episode, rng, style, matrices, image_size, writer=Non
                 "pos": [round(float(value), 4) for value in points[name]],
                 "pixel": round_pixel(pixel),
             }
-            if BACK_CAMERA in matrices:
-                pixel_back, _ = project_world(points[name], matrices[BACK_CAMERA])
-                shown[name]["pixel_back"] = round_pixel(pixel_back)
         sample = {
             "id": sample_id,
             "task": task.task,
@@ -597,9 +536,6 @@ def run_episode(env, task, episode, rng, style, matrices, image_size, writer=Non
             "answer": format_plan(subtasks),
             "success": False,
         }
-        if BACK_CAMERA in CAMERAS:
-            sample["image_back"] = "images/{}_back.png".format(sample_id)
-            sample["camera_back"] = BACK_CAMERA
         sample.update(task.record_extra(env))
         writer.add(sample, {name: state["obs"][name + "_image"] for name in CAMERAS})
         state["last_key"] = key
@@ -678,11 +614,9 @@ def task_meta(task, matrices, image_size):
         "primitives": list(task.primitives),
         "coordinate_frame": coordinate_frame(),
         "camera_world_to_pixel": {name: matrix_to_list(matrix) for name, matrix in matrices.items()},
-        "instruction": "指令以若干个 <image> 占位开头，每行一个，和 inputs 里的图片一一对应；多张图时占位后面注明每张来自哪台相机。话术后面带 answer 各字段的说明。" + task.instruction_note,
+        "instruction": "指令以一个 <image> 占位开头，和 inputs 里的 frontview 图片对应。话术后面带 answer 各字段的说明。" + task.instruction_note,
         "sampling": "每条成功轨迹只保存 phase=initial 的一帧。泛化来自开局布局：物体位置、朝向和目标位置，不存轨迹中途的画面。",
     }
-    if back_enabled():
-        meta["camera_back"] = BACK_CAMERA
     meta.update(task.meta_extra())
     return meta
 
@@ -696,11 +630,9 @@ def add_common_args(parser, default_out):
     parser.add_argument("--episode-stride", type=int, default=1, help="每次尝试后的 episode 编号步长；并行分片使用 worker 总数")
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--bucket-cm", type=float, default=2.0, help="保留参数。现在每条成功轨迹只存开局一帧，不再按位移抽帧")
-    add_camera_arg(parser)
 
 
 def run_collection(task, args):
-    apply_cameras(args)
     rng = np.random.default_rng(args.seed)
     env = make_env(task, args.image_size, args.seed, use_camera=True)
     matrices = world_to_pixel_matrices(env, args.image_size)

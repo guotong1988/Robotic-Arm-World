@@ -8,22 +8,15 @@ wipe 的 path 是还没擦掉的污渍，按曲线顺序每隔约 3 厘米取一
 
 Wipe 换的是擦板，没有夹爪，计划里不会出现 close_gripper、open_gripper。
 
-输入例子。每台相机一张 RGB，默认 frontview 加 backview，对应样本的 image、image_back 字段；
-指令开头的 <image> 每行一个，和图片一一对应，多张图时占位后面注明每张来自哪台相机；话术后面带 answer 各字段的说明：
+输入是一张 frontview RGB，对应样本的 image 字段；指令以一个 <image> 占位开头，
+话术后面带 answer 各字段的说明：
 
     <image>
-    <image>
-    第一张图是正面相机（frontview），第二张图是背面相机（backview）。把桌上的污渍擦干净。回答的 JSON 中，target_1 是要对准的点在正面相机图上的像素，target_1_back 是同一点在背面相机图上的像素；某台相机看不到那个点时对应字段写 "mask"，不要猜它的像素。
+    把桌上的污渍擦干净。回答的 JSON 中，target_1 和 path 是对应点在正面相机图上的像素。
 
-单目只开 frontview，一个占位后面接话术和字段说明：
+输出例子（还没开始擦时；path 按曲线每隔约 3 厘米取点，这里只示意几个点）：
 
-    <image>
-    把桌上的污渍擦干净。回答的 JSON 中，target_1 是要对准的点在正面相机图上的像素。
-
-输出例子（还没开始擦时；path 按曲线每隔约 3 厘米取点，这里只示意几个点。
-双目时每个空间字段各给两台相机的像素，某台相机看不到那个点时对应字段写 "mask"）：
-
-    {"subtasks": [{"type": "move_above", "desc": "移到目标点上方", "target_1": "[220 310]", "target_1_back": "[285 305]", "target_kind": "table", "clearance": 0.1, "yaw": 0}, {"type": "move_down", "desc": "降到目标点处", "target_1": "[220 310]", "target_1_back": "[285 305]", "target_kind": "table", "offset_z": 0.0}, {"type": "wipe", "desc": "沿路径擦拭桌面", "path": ["[220 310]", "[250 300]", "[280 292]", "[310 286]"], "path_back": ["[285 305]", "[262 296]", "[238 289]", "[215 283]"], "offset_z": -0.01, "path_kind": "table"}, {"type": "lift", "desc": "竖直抬起物体", "delta_z": 0.1, "target_1": "[310 286]", "target_1_back": "[215 283]", "target_kind": "table"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+    {"subtasks": [{"type": "move_above", "desc": "移到目标点上方", "target_1": "[220 310]", "target_kind": "table", "clearance": 0.1, "yaw": 0}, {"type": "move_down", "desc": "降到目标点处", "target_1": "[220 310]", "target_kind": "table", "offset_z": 0.0}, {"type": "wipe", "desc": "沿路径擦拭桌面", "path": ["[220 310]", "[250 300]", "[280 292]", "[310 286]"], "offset_z": -0.01, "path_kind": "table"}, {"type": "lift", "desc": "竖直抬起物体", "delta_z": 0.1, "target_1": "[310 286]", "target_kind": "table"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
 每条成功轨迹只存开局那一帧。污渍在桌面上换成横线、竖线、斜线、弧线或两段分开的痕迹，
 长短和位置每条都不一样。中途画面不存。

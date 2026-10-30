@@ -3,15 +3,14 @@
 每条测评做这些事：
 
 1. 按 collect_common 的方式摆好场景，手臂移到随机出发点（和采集同一个 prepare_scene）
-2. 指令和采集一样以每台相机一个 <image> 占位开头（图走 image_url），话术后面带字段说明；
-   模型写出从这一帧起还要做的全部步骤：每个空间字段给两个视图的像素（target_1、target_1_back，
-   被遮挡的视图写 "mask"），抓取步骤给两指落点对（target_1、target_2，target_kind=grip），
+2. 指令以一个 <image> 占位开头（图走 image_url），话术后面带字段说明；
+   模型写出从这一帧起还要做的全部步骤：空间字段给 frontview 像素，
+   抓取步骤给两指落点对（target_1、target_2，target_kind=grip），
    每步带一句 desc
 3. 计划里的像素只用深度相机换成世界坐标（depth_locate）：按像素的角色（模型在计划里
    用 *_kind 标注的类别优先，没标注按任务和计划结构推断。要抓的物体、格子底面、柱顶、
    门板上的点、两指落点……）从附近的深度点量出它所在的平面，
    取视线和平面的交点。标注点常被挡住或在物体内部，所以不直接读该像素的深度；
-   两个视图各自定位再融合（主视图 frontview，被 mask 的视图不参与）；
    两指落点成对还原（grip），执行取两落点的中点，统计误差也用中点配真值
 4. 交给 task_plan.execute_plan，末端用世界坐标 OSC 跟踪，执行中不再问模型；
    多物体时每抓下一个之前用当前帧的深度重量它（开局挡在它前面的物体可能已经搬走）
@@ -20,7 +19,7 @@
 
 仿真真值只用于事后统计像素和世界误差，不进模型输入，也不参与定位和控制。
 --oracle 用真值步骤代替模型回答，其余流程不变，用来确认深度定位和执行器本身够用。
-录像按采集输入的相机顺序并排，逐视图标出模型回答的原始像素，不叠加深度点云。
+录像使用 frontview 单画面，标出模型回答的原始像素，不叠加深度点云。
 """
 
 import time
@@ -34,11 +33,8 @@ import numpy as np
 
 from collect_common import eef_pose, make_env, prepare_scene, render_plan, task_instruction
 from collect_lift_mllm import (
-    BACK_CAMERA,
     CAMERAS,
     DEFAULT_CAMERA,
-    add_camera_arg,
-    apply_cameras,
     format_pixel,
     project_world,
     round_pixel,
@@ -68,7 +64,7 @@ def plan_pixels(subtasks):
 
     def add(pixel):
         if pixel is None:
-            # 被 mask 的视图没有像素，跳过统计
+            # 兼容旧数据里的空像素，跳过统计。
             return
         pixel = np.asarray(pixel, dtype=float).reshape(2)
         if not any(np.allclose(pixel, other) for other in seen):
@@ -81,8 +77,8 @@ def plan_pixels(subtasks):
             if "pixel_2" in step:
                 # 两指落点对的第二个落点也收进统计。
                 add(step["pixel_2"])
-            if "held" in step:
-                add(step["held"])
+            if "align_point" in step:
+                add(step["align_point"])
         elif kind == "reach":
             add(step["pixel"])
         elif kind == "turn":
@@ -94,7 +90,7 @@ def plan_pixels(subtasks):
 
 
 def gt_points(task, env, matrices):
-    """任务的真值点和它们在各视图里的像素、frontview 相机深度。只给事后统计用，不进模型，不参与定位。"""
+    """任务的真值点和它们在 frontview 里的像素、相机深度。只给事后统计用，不进模型，不参与定位。"""
     out = []
     for name, world in task.points(env).items():
         pixel, depth = project_world(world, matrices[DEFAULT_CAMERA])
@@ -104,9 +100,6 @@ def gt_points(task, env, matrices):
             "pixel": np.asarray(pixel, dtype=float),
             "depth": depth,
         }
-        if BACK_CAMERA in matrices:
-            pixel_back, _ = project_world(world, matrices[BACK_CAMERA])
-            item["pixel_back"] = np.asarray(pixel_back, dtype=float)
         out.append(item)
     return out
 
@@ -146,7 +139,6 @@ def yaw_error_180(pred, gt):
 def match_targets(points, gt, grip_gt=None):
     """每个定位点配像素距离最近的同类真值点，记录像素和世界误差。
 
-    模型没给某个视图的像素时（pixel 或 pixel_back 为 None，被 mask），那一项误差跳过。
     grip_gt 是可选的落点对真值函数，只用于补充宽度、朝向诊断。
     """
     targets = []
@@ -154,13 +146,10 @@ def match_targets(points, gt, grip_gt=None):
         pool = gt_pool(gt, point["role"])
         # 两指落点用中点配真值：中点是物体中心；单点步骤没有 center 字段，原样。
         front = point.get("center_pixel", point.get("pixel"))
-        back = point.get("center_pixel_back", point.get("pixel_back"))
         world = point.get("center_world", point["world"])
 
         def metric(item):
-            if front is not None:
-                return float(np.linalg.norm(front - item["pixel"]))
-            return float(np.linalg.norm(back - item["pixel_back"]))
+            return float(np.linalg.norm(front - item["pixel"]))
 
         nearest = min(pool, key=metric)
         err = pos_error(world, nearest["world"])
@@ -176,10 +165,6 @@ def match_targets(points, gt, grip_gt=None):
             target["pixel"] = round_pixel(front)
             target["gt_pixel"] = round_pixel(nearest["pixel"])
             target["pixel_err"] = round(float(np.linalg.norm(front - nearest["pixel"])), 2)
-        if back is not None and nearest.get("pixel_back") is not None:
-            target["pixel_back"] = round_pixel(back)
-            target["gt_pixel_back"] = round_pixel(nearest["pixel_back"])
-            target["pixel_back_err"] = round(float(np.linalg.norm(back - nearest["pixel_back"])), 2)
         if point["role"] == "grip" and point.get("land_2") is not None:
             first = np.asarray(point["land_1"], dtype=float)
             second = np.asarray(point["land_2"], dtype=float)
@@ -325,21 +310,21 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                         "grasped": bool(state["grasped"]),
                         "eef_pos": np.round(eef, 4).tolist(),
                         "object_pos": np.round(center, 4).tolist(),
-                        "held_offset_actual": np.round(offset, 4).tolist(),
+                        "align_point_offset_actual": np.round(offset, 4).tolist(),
                     }
                     if phase == "close":
                         grasp_context["offset"] = offset.copy()
                         for later in subtasks[index + 1 :]:
                             if later["type"] == "open_gripper":
                                 break
-                            predicted = later.get("world", {}).get("held")
+                            predicted = later.get("world", {}).get("align_point")
                             if predicted is not None:
                                 predicted_offset = np.asarray(predicted, dtype=float) - eef
-                                entry["held_offset_pred"] = np.round(predicted_offset, 4).tolist()
-                                entry["held_offset_err_m"] = round(float(np.linalg.norm(predicted_offset - offset)), 4)
+                                entry["align_point_offset_pred"] = np.round(predicted_offset, 4).tolist()
+                                entry["align_point_offset_err_m"] = round(float(np.linalg.norm(predicted_offset - offset)), 4)
                                 break
                     elif phase == "lift" and grasp_context["offset"] is not None:
-                        entry["held_offset_drift_m"] = round(
+                        entry["align_point_offset_drift_m"] = round(
                             float(np.linalg.norm(offset - grasp_context["offset"])), 4
                         )
                     elif phase == "pre_place":
@@ -352,7 +337,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                     if step["type"] == "close_gripper":
                         grasp_context["name"] = grip_name(index)
                         grasp_context["offset"] = None
-                    elif step["type"] == "move_down" and "held" in step:
+                    elif step["type"] == "move_down" and "align_point" in step:
                         grasp_snapshot("pre_place", index)
                     if index in starts and "obs" in latest:
                         point = relocate(
@@ -465,13 +450,13 @@ def print_episode(record):
                 )
             else:
                 print(
-                    "  round {} {} {} grasped={} held_offset_err={} offset_drift={}".format(
+                    "  round {} {} {} grasped={} align_point_offset_err={} offset_drift={}".format(
                         rr["round"],
                         item["phase"],
                         item["object"],
                         item["grasped"],
-                        format_cm(item.get("held_offset_err_m")),
-                        format_cm(item.get("held_offset_drift_m")),
+                        format_cm(item.get("align_point_offset_err_m")),
+                        format_cm(item.get("align_point_offset_drift_m")),
                     ),
                     flush=True,
                 )
@@ -536,10 +521,9 @@ def add_common_args(parser, default_out):
     parser.add_argument("--system", default="", help="可选的 system prompt，默认不发")
     parser.add_argument("--text-template", default="{instruction}", help="拼在图片后面的文本，默认就是指令原文")
     parser.add_argument("--out", default=default_out)
-    parser.add_argument("--no-video", action="store_true", help="不把每条测评录成并排 mp4")
+    parser.add_argument("--no-video", action="store_true", help="不把每条测评录成 frontview mp4")
     parser.add_argument("--oracle", action="store_true", help="用真值步骤代替模型，检查执行器")
     parser.add_argument("--self-test", action="store_true", help="只检查像素收集和解析")
-    add_camera_arg(parser)
     return parser
 
 
@@ -561,7 +545,6 @@ def make_client(args):
 
 
 def run_eval(task, args, client):
-    apply_cameras(args)
     check_parser()
     rng = np.random.default_rng(args.seed)
     env = make_env(task, args.image_size, args.seed, use_camera=True, camera_depths=True)
@@ -628,7 +611,7 @@ def self_test():
     pixels = [tuple(np.round(p, 1)) for p in plan_pixels(door)]
     assert pixels == [(150.0, 240.0), (160.0, 250.0), (120.0, 200.0)], pixels
     # Nut：抓螺母的步骤带两指落点对（target_1、target_2、target_kind=grip），
-    # 两落点都收；套柱子用 held
+    # 两落点都收；套柱子用 align_point
     nut = parse_plan(
         format_plan(
             [
@@ -654,10 +637,10 @@ def self_test():
                     "target_kind": "grip",
                     "delta_z": 0.17,
                 },
-                {"type": "move_above", "target_1": "[320 280]", "clearance": 0.05, "yaw": 12, "held": "[205 312]"},
-                {"type": "move_down", "target_1": "[320 280]", "offset_z": -0.165, "held": "[205 312]"},
+                {"type": "move_above", "target_1": "[320 280]", "clearance": 0.05, "yaw": 12, "align_point": "[205 312]"},
+                {"type": "move_down", "target_1": "[320 280]", "offset_z": -0.165, "align_point": "[205 312]"},
                 {"type": "open_gripper"},
-                {"type": "move_above", "target_1": "[320 280]", "clearance": 0.06, "held": "[205 312]"},
+                {"type": "move_above", "target_1": "[320 280]", "clearance": 0.06, "align_point": "[205 312]"},
                 {"type": "stabilize", "duration": 0.5},
             ]
         ),

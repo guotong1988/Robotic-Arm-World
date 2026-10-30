@@ -6,13 +6,13 @@
 每条测评做这些事：
 
 1. 按 collect_stack_mllm.py 的方式摆好两个方块，手臂移到随机出发点
-2. 只把相机 RGB 和「两个 <image> 分别来自哪台相机 + 把红色方块叠到绿色方块上」放进对话，
-   只问一次；指令和采集一样以每台相机一个 <image> 占位开头
+2. 只把 frontview RGB 和「把红色方块叠到绿色方块上」放进对话，
+   只问一次；指令和采集一样以一个 <image> 占位开头
 3. 模型写出全部步骤：抓哪个像素、抬多高、放到哪个像素、放置高度、松爪、抬开。这些数都来自模型，
    抓红块的步骤给两指落点对（target_1、target_2），放绿块的步骤给绿块中心（target_1）
-4. 每个像素用深度相机换成世界坐标：放绿块的中心像素走平面量法（视线和「桌面到顶面中点」
-   那个水平面求交，两个视图各自定位再融合，被 mask 的视图不参与）；抓红块的落点对走
-   recover_landings 成对还原，取两落点的中点执行。不读仿真里的物体位置，不用真值挑物体
+4. 每个像素用 frontview 深度图换成世界坐标：放绿块的中心像素走平面量法（视线和
+   「桌面到顶面中点」那个水平面求交）；抓红块的落点对走 recover_landings 成对还原，
+   取两落点的中点执行。不读仿真里的物体位置，不用真值挑物体
 5. 交给 task_plan.execute_plan，末端用世界坐标 OSC 跟踪，执行过程中不再看图、不再问模型
 6. 以 robosuite 的 Stack 成功判定为准：红块离开桌面、压在绿块上、夹爪已经松开
 
@@ -32,10 +32,7 @@ gl_backend.configure()
 import numpy as np
 
 from collect_lift_mllm import (
-    BACK_CAMERA,
     DEFAULT_CAMERA,
-    add_camera_arg,
-    apply_cameras,
     format_pixel,
     project_world,
     round_pixel,
@@ -68,6 +65,7 @@ from eval_lift_mllm_vllm import (
 )
 from eval_video import EvalVideo
 from depth_locate import (
+    CUBE_HALF_HEIGHT,
     backproject_disk,
     make_views,
     measure_views,
@@ -107,79 +105,47 @@ def locate(pixel, depth, matrix, image_size):
 
 
 def spatial_pixels(subtasks):
-    """计划里所有空间步骤的像素组 (front, back, front2, back2)，按第一个可见视图的像素去重后保序。
-
-    front/back 是 target_1 在 frontview/backview 的像素，被 mask 的是 None；
-    抓红块的步骤 front2/back2 是 target_2 在这两台相机上的像素，放绿块的步骤两个都是 None。
-    """
+    """计划里的 frontview 像素组 (target_1, target_2)，去重保序。"""
     seen = []
     keys = set()
-
-    def opt(value):
-        return None if value is None else np.asarray(value, dtype=float)
-
     for step in subtasks:
         if step["type"] not in SPATIAL:
             continue
-        front, back = opt(step.get("pixel")), opt(step.get("pixel_back"))
-        first = front if front is not None else back
-        if first is None:
-            continue
+        first = np.asarray(step["pixel"], dtype=float)
         key = tuple(np.round(first, 3))
         if key in keys:
             continue
         keys.add(key)
-        seen.append((front, back, opt(step.get("pixel_2")), opt(step.get("pixel_2_back"))))
+        second = step.get("pixel_2")
+        seen.append((first, None if second is None else np.asarray(second, dtype=float)))
     return seen
-
-
-def locate_merged(front, back, views, image_size):
-    """测量级融合：两个视图的邻域点云合成一片，量桌面和顶面，视线用 frontview（被 mask 时用另一路）。"""
-    usable = [(cam, pix) for cam, pix in ((DEFAULT_CAMERA, front), (BACK_CAMERA, back)) if pix is not None and cam in views]
-    # usable 里 frontview 排在最前；front 被 mask 时只剩 backview 一路。
-    ray_cam, ray_pixel = usable[0]
-    ray_matrix = views[ray_cam][1]
-
-    def disk(radius):
-        clouds = [backproject_disk(views[cam][0], views[cam][1], pix, radius) for cam, pix in usable]
-        return np.concatenate(clouds) if len(clouds) > 1 else clouds[0]
-
-    scale = float(image_size) / 512.0
-    obj = disk(max(2, int(round(OBJECT_RADIUS * scale))))
-    table = disk(max(4, int(round(TABLE_RADIUS * scale))))
-    table_z = float(np.percentile(table[:, 2], TABLE_PERCENTILE))
-    top_z = float(np.percentile(obj[:, 2], TOP_PERCENTILE))
-    height = float(np.clip(top_z - table_z, MIN_HEIGHT, MAX_HEIGHT))
-    world = ray_at_height(ray_pixel, table_z + 0.5 * height, ray_matrix)
-    if not plausible(world):
-        raise ParseError("反投影超出工作空间：{}".format(np.round(world, 4).tolist()))
-    tag = "+".join(sorted(cam for cam, _ in usable)) if len(usable) > 1 else ray_cam
-    return world, {"table_z": round(table_z, 4), "top_z": round(top_z, 4), "height": round(height, 4), "view": tag}
 
 
 def perceive(subtasks, views, image_size, axis=None):
     """每个像素各自定位：中心像素走平面量法，两指落点对走 recover_landings 成对还原。
 
-    中心像素两条视线一致时合并两路点云做测量级融合，否则逐视图融合。
-    融合结果同时写回 step["world"]["pixel"]（落点对还写 world["pixel_2"]，执行取两点中点），
+    中心像素直接从 frontview 邻域点云测量支撑面和顶面。
+    定位结果同时写回 step["world"]["pixel"]（落点对还写 world["pixel_2"]，执行取两点中点），
     execute_plan 直接用；返回的点给统计用，也当 execute_plan 兜底用的 landmarks。
     axis 是抓取步骤里两落点的连线方向（世界系），stack 用当前保持的 hold_ori 第一列。
     """
     points = []
     by_key = {}
-    for front, back, front2, back2 in spatial_pixels(subtasks):
-        if front2 is not None or back2 is not None:
+    for front, front2 in spatial_pixels(subtasks):
+        if front2 is not None:
             # 两指落点对：成对还原，两点的中点是抓取位置。
             land_front, land_back, info = recover_landings(
-                {"front": front, "front_back": back, "same": front2, "back": back2}, views, image_size, axis
+                {"front": front, "same": front2},
+                views,
+                image_size,
+                axis,
+                plane_offset=CUBE_HALF_HEIGHT,
             )
             world = 0.5 * (land_front + land_back)
             center_pixel, _ = project_world(world, views[DEFAULT_CAMERA][1])
             point = {
                 "pixel": front,
-                "pixel_back": back,
                 "center_pixel": center_pixel,
-                "center_pixel_back": project_world(world, views[BACK_CAMERA][1])[0] if BACK_CAMERA in views else None,
                 "world": world,
                 "land_1": land_front,
                 "land_2": land_back,
@@ -190,21 +156,15 @@ def perceive(subtasks, views, image_size, axis=None):
             # 中心点使用共享的自洽顶面估计：只在中心竖直小柱里找顶面，
             # 不把旁边手臂的高差点直接当方块顶面。object 两视图独立估计后融合，
             # 被手臂污染的一路偏高时由共享规则剔除。
-            pixels = {DEFAULT_CAMERA: front, BACK_CAMERA: back}
-            world, info = measure_views("object", pixels, views, image_size)
-            point = {"pixel": front, "pixel_back": back, "world": world, "info": dict(info, kind="object")}
+            world, info = measure_views("object", {DEFAULT_CAMERA: front}, views, image_size)
+            point = {"pixel": front, "world": world, "info": dict(info, kind="object")}
             located = {"pixel": world}
         points.append(point)
-        key_source = front if front is not None else back
-        by_key[tuple(np.round(key_source, 3))] = (point, located)
+        by_key[tuple(np.round(front, 3))] = (point, located)
     for step in subtasks:
         if step["type"] not in SPATIAL:
             continue
-        value = step.get("pixel")
-        if value is None:
-            value = step.get("pixel_back")
-        if value is None:
-            continue
+        value = step["pixel"]
         entry = by_key.get(tuple(np.round(np.asarray(value, dtype=float), 3)))
         if entry is not None:
             step.setdefault("world", {}).update(entry[1])
@@ -216,22 +176,13 @@ def nearest_object(pixel, gt_pixels):
     return int(np.argmin(dists)), dists
 
 
-def point_target(point, gt_pix, gt_pix_back, gt_a, gt_b):
-    """把一个定位点对照真值方块整理成统计记录。像素误差按「点代表的那个位置」算：
-    落点对用两落点中点的像素，中心点用自己的像素；frontview 被 mask 时用 backview 的。"""
+def point_target(point, gt_pix, gt_a, gt_b):
+    """把一个定位点对照真值方块整理成统计记录。"""
     stat_pixel = point.get("center_pixel")
     if stat_pixel is None:
         stat_pixel = point.get("pixel")
-    stat_back = point.get("center_pixel_back")
-    if stat_back is None:
-        stat_back = point.get("pixel_back")
-    if stat_pixel is not None:
-        index, dists = nearest_object(stat_pixel, gt_pix)
-        stat_gt = gt_pix[index]
-    else:
-        stat_pixel = stat_back
-        index, dists = nearest_object(stat_pixel, gt_pix_back)
-        stat_gt = gt_pix_back[index]
+    index, dists = nearest_object(stat_pixel, gt_pix)
+    stat_gt = gt_pix[index]
     gt = gt_a if index == 0 else gt_b
     err = pos_error(point["world"], gt)
     target = {
@@ -245,11 +196,6 @@ def point_target(point, gt_pix, gt_pix_back, gt_a, gt_b):
         "err_m": {k: round(v, 4) for k, v in err.items()},
         "depth": point["info"],
     }
-    if stat_back is not None and gt_pix_back[index] is not None:
-        delta = np.asarray(stat_back, dtype=float) - np.asarray(gt_pix_back[index], dtype=float)
-        target["pixel_back"] = round_pixel(stat_back)
-        target["gt_pixel_back"] = round_pixel(gt_pix_back[index])
-        target["pixel_back_err"] = round(float(np.linalg.norm(delta)), 2)
     if target["kind"] == "grip" and point.get("land_2") is not None:
         first = np.asarray(point["land_1"], dtype=float)
         second = np.asarray(point["land_2"], dtype=float)
@@ -305,12 +251,6 @@ def run_episode(env, client, rng, episode, image_size, oracle, video_path=None):
         # 以下真值只用来统计，不进模型，不进控制。
         gt_a, gt_b, _ = positions_from_obs(obs)
         gt_pix = [project_world(gt_a, matrix)[0], project_world(gt_b, matrix)[0]]
-        gt_pix_back = [None, None]
-        if BACK_CAMERA in matrices:
-            gt_pix_back = [
-                project_world(gt_a, matrices[BACK_CAMERA])[0],
-                project_world(gt_b, matrices[BACK_CAMERA])[0],
-            ]
         gt_plan = plan_for(
             env,
             obs,
@@ -343,7 +283,7 @@ def run_episode(env, client, rng, episode, image_size, oracle, video_path=None):
             points = perceive(subtasks, views, image_size, axis=axis)
             targets = []
             for point in points:
-                target, line = point_target(point, gt_pix, gt_pix_back, gt_a, gt_b)
+                target, line = point_target(point, gt_pix, gt_a, gt_b)
                 targets.append(target)
                 print("episode {:02d} {}".format(episode, line), flush=True)
             record["targets"] = targets
@@ -507,10 +447,9 @@ def main():
     parser.add_argument("--system", default="", help="可选的 system prompt，默认不发")
     parser.add_argument("--text-template", default="{instruction}", help="拼在图片后面的文本，默认就是指令原文")
     parser.add_argument("--out", default="data/stack_eval")
-    parser.add_argument("--no-video", action="store_true", help="不把每条测评录成并排 mp4")
+    parser.add_argument("--no-video", action="store_true", help="不把每条测评录成 frontview mp4")
     parser.add_argument("--oracle", action="store_true", help="用真值步骤代替模型，检查深度定位和执行器")
     parser.add_argument("--self-test", action="store_true", help="只检查解析和坐标换算")
-    add_camera_arg(parser)
     args = parser.parse_args()
 
     if args.self_test:
@@ -532,7 +471,6 @@ def main():
         )
         print("api {} model {}".format(client.api_base, client.resolve_model()), flush=True)
 
-    apply_cameras(args)
     rng = np.random.default_rng(args.seed)
     env = make_env(args.image_size, args.seed, use_camera=True, camera_depths=True)
     image_size = camera_size(env)

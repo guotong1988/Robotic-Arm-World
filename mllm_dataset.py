@@ -1,8 +1,7 @@
 """把各任务的样本并进同一个目录，给训练读。
 
-训练看 samples.jsonl 里的：image、image_back、instruction、answer。
-image 是 frontview，image_back 是 backview（frontview 正对面，双目时才有），
-都是相对这个目录的路径。instruction 以每台相机一个 <image> 占位开头。
+训练看 samples.jsonl 里的：image、instruction、answer。
+image 是 frontview，路径相对这个目录。instruction 以一个 <image> 占位开头。
 task 用来区分任务，也用来重跑时替换旧样本。
 只采一个任务时，meta.json 仍是原来的扁平格式，评测能直接读相机矩阵。
 两个任务都在时，各自的统计和相机矩阵放在 meta.json 的 tasks 下面。
@@ -47,8 +46,8 @@ def _shared_value(bodies, key):
 
 
 def _row_images(row):
-    """一条样本引用的所有图片相对路径：frontview、backview（有的话）。"""
-    return [rel for rel in (row.get("image"), row.get("image_back")) if rel]
+    """一条样本引用的 frontview 图片相对路径。"""
+    return [row["image"]] if row.get("image") else []
 
 
 def _prune_images(out_dir, task, merged, dropped_images):
@@ -178,7 +177,7 @@ def _publish_task(out_dir, task, samples, task_meta):
 
     bodies = list(tasks.values())
     combined = {
-        "inputs": _shared_value(bodies, "inputs") or ["image", "image_back", "instruction"],
+        "inputs": _shared_value(bodies, "inputs") or ["image", "instruction"],
         "output": {
             "answer": "JSON 字符串，带 subtasks，每个 subtask 带一句 desc；字段说明跟在指令话术后面。训练读 samples.jsonl 的 image、instruction、answer；task 是小写的环境名，各任务的步骤说明在 tasks 里。",
         },

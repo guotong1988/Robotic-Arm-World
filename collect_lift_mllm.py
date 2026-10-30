@@ -2,8 +2,7 @@
 
 每条样本对应某一时刻的场景：
 
-- 输入：每台相机一张 RGB，按 inputs 里的顺序排。指令以同样数量的 <image> 占位开头，
-  多张图时占位后面写明每张来自哪台相机。默认 frontview 加 frontview 正对面的 backview
+- 输入：一张 frontview RGB，指令以一个 <image> 占位开头
 - 指令：夹爪不在方块正上方时，先移动到目标上方，再抬剩余高度；已经对准后只写还要抬多少。
   话术后面带字段说明（target_1、target_2 这些字段各是什么），模型按说明写 answer
 - 输出：一条抓取计划。每个 subtask 带一个 desc，用 20 字以内说明这一步做什么。
@@ -11,20 +10,9 @@
 
 落点是两指合拢时贴住方块表面的那两点。两指沿世界 x 轴合拢，一个朝 frontview，一个朝对面。
 target_1 是夹爪1（朝 frontview 那侧）的落点，target_2 是夹爪2（朝后）的落点。
-每个落点各给两台相机的像素：target_1 在正面相机图上，target_1_back 在背面相机图上，
-target_2、target_2_back 同理。像素 x 向右、y 向下，原点在图像左上角。
-
-某台相机看不到那个点时（视线中途被挡住），对应的像素字段写 "mask"，表示不要猜这张图里的
-像素，用另一台相机的。三维重建时每台相机只还原自己看得到的点，两台相机合起来覆盖方块
-两侧，谁也不脑补被挡的像素。两台都看不到时 frontview 保留像素（兜底，没法都不写）。
-
-- 单目只开 frontview：两个落点都写在这一张图上，target_2 挡住了也照写，不做 mask
-- 双目 frontview 加 backview：每个落点写两台相机的像素，被挡的那台写 "mask"。
-  朝前的落点 target_1 在 frontview 里可见、在 backview 里被方块挡住（mask）；
-  朝后的落点正好反过来
-
-评测时模型按同样的格式给出像素。每台相机用自己的深度还原自己看得到的落点
-（被 mask 的视图不参与），然后按这两个点做逆运动学。
+两个落点都写在正面相机图上。像素 x 向右、y 向下，原点在图像左上角。
+被挡住的落点也根据方块形状和朝向写出像素，不使用 mask。
+评测时模型按同样的格式给出像素，用 frontview 深度还原后做逆运动学。
 
 每条抓取先定一个目标抬升高度。
 某一帧如果方块已经抬起了一段，指令和 lift 的 delta_z 写的都是剩下的高度。
@@ -32,24 +20,14 @@ target_2、target_2_back 同理。像素 x 向右、y 向下，原点在图像�
 计划里不再包含 move_above、move_down、close_gripper。夹爪还在侧面时，指令是
 「<image> 先移动到目标上方，再将方块向上抬起 14 厘米」，计划从 move_above 开始。
 
-输入例子。每台相机一张 RGB，默认 frontview 加 backview，对应样本的 image、image_back 字段；
-指令开头的 <image> 每行一个，和图片一一对应，多张图时占位后面注明每张来自哪台相机；话术后面带 answer 各字段的说明：
-
-    <image>
-    <image>
-    第一张图是正面相机（frontview），第二张图是背面相机（backview）。先移动到目标上方，再将方块向上抬起 14 厘米。回答的 JSON 中，target_1、target_2 是两个夹爪落点，每个落点各给两台相机的像素：target_1 在正面相机图上，target_1_back 在背面相机图上，target_2、target_2_back 同理；某台相机看不到那个落点时对应字段写 "mask"，不要猜它的像素。两落点的中点是抓取位置。
-
-单目只开 frontview，一个占位后面接话术和字段说明：
+输入例子。样本只有 image 字段，一个占位后面接话术和字段说明：
 
     <image>
     先移动到目标上方，再将方块向上抬起 14 厘米。回答的 JSON 中，target_1 是夹爪1落点的像素，target_2 是夹爪2落点的像素，都在正面相机图上，两落点的中点是抓取位置。
 
-输出例子（还没抓起、夹爪还在侧面时）。每个 subtask 的 desc 说明这一步做什么；
-朝前的落点在 backview 里被方块挡住写 "mask"，朝后的落点在 frontview 里被挡住写 "mask"：
+输出例子（还没抓起、夹爪还在侧面时）：
 
-    {"subtasks": [{"type": "move_above", "desc": "移到方块正上方", "target_1": "[282 311]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[215 305]", "target_kind": "grip"}, {"type": "move_down", "desc": "竖直降到方块处", "target_1": "[282 311]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[215 305]", "target_kind": "grip"}, {"type": "close_gripper", "desc": "合爪夹住方块"}, {"type": "lift", "desc": "竖直向上抬起方块", "target_1": "[282 311]", "target_1_back": "mask", "target_2": "mask", "target_2_back": "[215 305]", "target_kind": "grip", "delta_z": 0.14}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
-
-单目输出里没有 *_back 字段，两个落点都写在 frontview 图上，挡住也照写。
+    {"subtasks": [{"type": "move_above", "desc": "移到方块正上方", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip"}, {"type": "move_down", "desc": "竖直降到方块处", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip"}, {"type": "close_gripper", "desc": "合爪夹住方块"}, {"type": "lift", "desc": "竖直向上抬起方块", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip", "delta_z": 0.14}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
 每条成功抓取只存开局那一帧（phase 为 initial），不存悬停、下降、合爪、上抬这些中途画面。
 泛化放在开局：方块抽到桌面的不同区域，朝向绕竖直轴随机转；抬升高度在低、中、高三档里抽。
@@ -91,69 +69,16 @@ from grip_ik import GRIP_YAW, box_contacts, grasp_eef, joint_position_config, pa
 # 存成正着的图。必须在创建环境之前设置，观测相机会按这个约定渲染。
 macros.IMAGE_CONVENTION = "opencv"
 
-# Lift 的默认渲染机位。table arena 里这台相机对着桌面正前方。
 DEFAULT_CAMERA = "frontview"
-# 第二机位：frontview 正对面的 backview。精确镜像的 -x 轴机位会被机器人机身挡住，
-# 所以往 +y 偏一截，视线仍对着桌面中心。这样朝后的夹爪落点在这台相机里是露出来的，
-# 评测时两台深度能拼出方块前后两面。
-BACK_CAMERA = "backview"
-BACK_CAMERA_POS = np.array([-1.25, 0.48, 1.80])
-BACK_CAMERA_LOOKAT = np.array([0.0, 0.0, 0.82])
-BACK_CAMERA_FOVY = 45.0
-# 采集和评测渲染的相机，输入图片也按这个顺序。列表原地修改，已导入 CAMERAS 的模块能看到。
-# 默认 frontview 加 backview 双目；--cameras frontview 退回单目，不做遮挡判定，被挡也照写像素。
-CAMERAS = [DEFAULT_CAMERA, BACK_CAMERA]
-
-
-def back_enabled():
-    return BACK_CAMERA in CAMERAS
-
-
-def set_cameras(spec):
-    """spec 是相机名，逗号分隔。frontview 单目，或 frontview 加 backview 双目。"""
-    if isinstance(spec, (list, tuple)):
-        names = [str(name).strip() for name in spec if str(name).strip()]
-    else:
-        names = [part.strip() for part in str(spec).split(",") if part.strip()]
-    allowed = (
-        [DEFAULT_CAMERA],
-        [DEFAULT_CAMERA, BACK_CAMERA],
-    )
-    if names not in allowed:
-        raise ValueError("相机应为 frontview 或 frontview,backview，收到 {}".format(spec))
-    CAMERAS[:] = names
-
-
-def add_camera_arg(parser):
-    parser.add_argument(
-        "--cameras",
-        default="{},{}".format(DEFAULT_CAMERA, BACK_CAMERA),
-        help="渲染并写入的相机，逗号分隔。frontview 单目（不做遮挡判定）；frontview,backview 加对面机位，被挡的视图写 mask。",
-    )
-
-
-def apply_cameras(args):
-    set_cameras(getattr(args, "cameras", "{},{}".format(DEFAULT_CAMERA, BACK_CAMERA)))
-    print("cameras {}".format(",".join(CAMERAS)), flush=True)
-
-
-# 相机的中文名，用在指令开头的 <image> 说明里。
-CAMERA_CN = {
-    DEFAULT_CAMERA: "正面相机（frontview）",
-    BACK_CAMERA: "背面相机（backview）",
-}
-_NUM_CN = ("一", "二", "三")
+CAMERAS = [DEFAULT_CAMERA]
+# 原机位沿朝向桌面的方向平移：抬高 15 cm，同时向目标靠近 15 cm，保持俯角。
+FRONT_CAMERA_POS = np.array([0.75917886, 0.0, 1.91035886])
+FRONT_CAMERA_LOOKAT = np.array([0.0, 0.0, 0.9125])
+FRONT_CAMERA_FOVY = 45.0
 
 
 def image_prefix():
-    """指令开头的图片占位：每台相机一个 <image>。多张图时说明每张来自哪台相机。"""
-    markers = "".join("<image>\n" for _ in CAMERAS)
-    if len(CAMERAS) == 1:
-        return markers
-    views = "，".join(
-        "第{}张图是{}".format(_NUM_CN[index], CAMERA_CN[name]) for index, name in enumerate(CAMERAS)
-    )
-    return markers + views + "。"
+    return "<image>\n"
 
 
 def with_views(clause, note=None):
@@ -165,11 +90,7 @@ def with_views(clause, note=None):
 
 
 def input_fields():
-    fields = ["image"]
-    if back_enabled():
-        fields.append("image_back")
-    fields.append("instruction")
-    return fields
+    return ["image", "instruction"]
 
 
 def _lookat_quat(pos, lookat):
@@ -205,29 +126,22 @@ def _install_camera(name, pos, lookat, fovy):
 
         def patched_init(self, *args, _orig=orig_init, _name=name, _pos=np.array(pos), _quat=quat, _fovy=fovy, **kwargs):
             _orig(self, *args, **kwargs)
-            if self.worldbody.find(".//camera[@name='{}']".format(_name)) is None:
-                self.worldbody.append(
-                    ET.Element(
-                        "camera",
-                        attrib={
-                            "name": _name,
-                            "mode": "fixed",
-                            "pos": "{:.4f} {:.4f} {:.4f}".format(*_pos),
-                            "quat": "{:.6f} {:.6f} {:.6f} {:.6f}".format(*_quat),
-                            "fovy": "{:.1f}".format(_fovy),
-                        },
-                    )
-                )
+            camera = self.worldbody.find(".//camera[@name='{}']".format(_name))
+            if camera is None:
+                camera = ET.Element("camera", attrib={"name": _name})
+                self.worldbody.append(camera)
+            camera.attrib.update({
+                "mode": "fixed",
+                "pos": "{:.6f} {:.6f} {:.6f}".format(*_pos),
+                "quat": "{:.8f} {:.8f} {:.8f} {:.8f}".format(*_quat),
+                "fovy": "{:.1f}".format(_fovy),
+            })
 
         cls.__init__ = patched_init
         setattr(cls, flag, True)
 
 
-def ensure_back_camera():
-    _install_camera(BACK_CAMERA, BACK_CAMERA_POS, BACK_CAMERA_LOOKAT, BACK_CAMERA_FOVY)
-
-
-ensure_back_camera()
+_install_camera(DEFAULT_CAMERA, FRONT_CAMERA_POS, FRONT_CAMERA_LOOKAT, FRONT_CAMERA_FOVY)
 # Panda 默认 OSC 每个控制步的位置、姿态缩放，和 default_panda.json 一致。
 POS_SCALE = 0.05
 ORI_SCALE = 0.5
@@ -462,72 +376,12 @@ def format_pixel(pixel_xy):
     return "[{}]".format(coords)
 
 
-# 双目时某台相机看不到目标点，对应的像素字段写这个字面量：不脑补这张图的像素，用另一台相机的。
-MASK = "mask"
-# 视线中途的命中比到目标点的距离短这么多（米）以上，才算被挡。
-# 目标在物体表面上时（夹爪落点、把手），命中目标自身或贴住它的夹爪只差零点几毫米，不算挡。
-OCCLUSION_TOL = 0.008
-
-
-def occluded(env, point, camera, own_body=None, tol=OCCLUSION_TOL):
-    """从 camera 到 point 的视线中途是否被别的几何体挡住（True 表示这台相机看不到该点）。
-
-    沿视线打一条 mujoco 射线：任何命中比 point 近 tol 以上，就是被挡。
-    own_body 是 point 所属刚体的 body id：点在这个刚体内部时（中心点），
-    命中它自己的前表面不算遮挡，要排除掉。表面点传 None，任何提前命中都算挡。
-    """
-    pnt = np.array(env.sim.data.cam_xpos[env.sim.model.camera_name2id(camera)], dtype=float)
-    point = np.asarray(point, dtype=float).reshape(3)
-    vec = point - pnt
-    dist = float(np.linalg.norm(vec))
-    if dist <= 1e-9:
-        return False
-    unit = vec / dist
-    bodyexclude = -1 if own_body is None else int(own_body)
-    geomid = np.zeros(1, dtype=np.int32)
-    # env.sim 的 model/data 是 robosuite 的包装对象，原生 MjModel/MjData 在 ._model / ._data 上。
-    hit = mujoco.mj_ray(
-        env.sim.model._model,
-        env.sim.data._data,
-        pnt,
-        unit,
-        None,  # geomgroup：不过滤，谁挡都算
-        1,  # flg_static：桌子、箱体这些静态几何也算遮挡
-        bodyexclude,
-        geomid,
-    )
-    if hit < 0.0:
-        return False
-    return float(hit) < dist - float(tol)
-
-
-def view_pixel(env, point, camera, matrix, own_body=None, tol=OCCLUSION_TOL):
-    """point 投到 camera 的像素字符串；双目且被挡住时返回 MASK。单目不判定，挡住也照写。"""
-    if back_enabled() and occluded(env, point, camera, own_body=own_body, tol=tol):
-        return MASK
-    pixel, _ = project_world(point, matrix)
-    return format_pixel(pixel)
-
-
-def grip_view_pixels(env, front, back, matrices):
-    """两个夹爪落点各自在两台相机上的像素：{"target_1", "target_1_back", "target_2", "target_2_back"}。
-
-    front 是朝 frontview 的落点，back 是朝后的落点，都在方块表面上（任何提前命中都算挡）。
-    单目时两个落点都写 frontview 像素，没有 *_back 字段。双目时被挡的写 MASK；
-    两台相机都看不到同一个落点时，frontview 保留像素兜底（都不写就没法执行了）。
-    """
-    pixels = {"target_1": view_pixel(env, front, DEFAULT_CAMERA, matrices[DEFAULT_CAMERA])}
-    if not back_enabled():
-        pixels["target_2"] = view_pixel(env, back, DEFAULT_CAMERA, matrices[DEFAULT_CAMERA])
-        return pixels
-    pixels["target_1_back"] = view_pixel(env, front, BACK_CAMERA, matrices[BACK_CAMERA])
-    pixels["target_2"] = view_pixel(env, back, DEFAULT_CAMERA, matrices[DEFAULT_CAMERA])
-    pixels["target_2_back"] = view_pixel(env, back, BACK_CAMERA, matrices[BACK_CAMERA])
-    if pixels["target_1"] == MASK and pixels["target_1_back"] == MASK:
-        pixels["target_1"] = format_pixel(project_world(front, matrices[DEFAULT_CAMERA])[0])
-    if pixels["target_2"] == MASK and pixels["target_2_back"] == MASK:
-        pixels["target_2"] = format_pixel(project_world(back, matrices[DEFAULT_CAMERA])[0])
-    return pixels
+def grip_view_pixels(front, back, matrices):
+    """两个夹爪落点的 frontview 像素。"""
+    return {
+        "target_1": format_pixel(project_world(front, matrices[DEFAULT_CAMERA])[0]),
+        "target_2": format_pixel(project_world(back, matrices[DEFAULT_CAMERA])[0]),
+    }
 
 
 def matrix_to_list(matrix):
@@ -535,7 +389,7 @@ def matrix_to_list(matrix):
 
 
 def grip_landings(env):
-    """朝 frontview 的落点和朝 backview 的落点，世界坐标，米。两点在方块表面上，沿世界 x 轴。"""
+    """方块前侧和背侧的两个夹爪落点，世界坐标，米。两点在方块表面上，沿世界 x 轴。"""
     center = np.array(env.sim.data.body_xpos[env.cube_body_id], dtype=float)
     half = np.asarray(env.cube.size, dtype=float)
     rot = np.array(env.sim.data.body_xmat[env.cube_body_id], dtype=float).reshape(3, 3)
@@ -543,13 +397,6 @@ def grip_landings(env):
 
 
 def plan_desc():
-    """跟在指令话术后面的字段说明：target_1、target_2 是哪个夹爪在哪台相机上的落点。"""
-    if back_enabled():
-        return (
-            "target_1、target_2 是两个夹爪落点，每个落点各给两台相机的像素："
-            "target_1 在正面相机图上，target_1_back 在背面相机图上，target_2、target_2_back 同理；"
-            "某台相机看不到那个落点时对应字段写 \"mask\"，不要猜它的像素。两落点的中点是抓取位置"
-        )
     return (
         "target_1 是夹爪1落点的像素，target_2 是夹爪2落点的像素，都在正面相机图上；"
         "target_2 被方块挡住时也根据方块形状和朝向补出它的像素，不写 mask。两落点的中点是抓取位置"
@@ -559,7 +406,7 @@ def plan_desc():
 def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels):
     """从当前画面接着做的步骤。已经做完的不再写入。落点像素写在要动位置的步骤上。
 
-    pixels 是 grip_view_pixels 的返回：{"target_1", ...}，值是 "[x y]" 或 "mask"，键序就是写出顺序。
+    pixels 是 grip_view_pixels 的返回：{"target_1", ...}，值是 frontview 的 "[x y]"，键序就是写出顺序。
     每步带 desc，说明这一步做什么。
     """
 
@@ -639,7 +486,7 @@ class DatasetWriter:
         """先缓存在内存里，等这条轨迹成功了才写盘。"""
         cube_pos, eef_pos = positions_from_obs(obs)
         front, back = grip_landings(self.env)
-        pixels = grip_view_pixels(self.env, front, back, self.world_to_pixel)
+        pixels = grip_view_pixels(front, back, self.world_to_pixel)
         cube_pos = [round(float(value), 4) for value in cube_pos]
         eef_pos = [round(float(value), 4) for value in eef_pos]
         sample_id = make_sample_id(self.task, episode, phase, step)
@@ -665,12 +512,7 @@ class DatasetWriter:
             "answer": format_answer(pixels, cube_pos, eef_pos, phase, above, lift_height),
             "success": False,
         }
-        if back_enabled():
-            record["image_back"] = "images/{}_back.png".format(sample_id)
-            record["camera_back"] = BACK_CAMERA
-            record["grip_pixel_back"] = pixels["target_2_back"]
-        else:
-            record["grip_pixel_2"] = pixels["target_2"]
+        record["grip_pixel_2"] = pixels["target_2"]
         rgbs = {name: np.array(obs[name + "_image"], copy=True) for name in CAMERAS}
         self.pending.append((record, rgbs))
         return record
@@ -682,8 +524,6 @@ class DatasetWriter:
             return
         for record, rgbs in pending:
             save_rgb(self.image_dir / Path(record["image"]).name, rgbs[DEFAULT_CAMERA])
-            if record.get("image_back") and BACK_CAMERA in rgbs:
-                save_rgb(self.image_dir / Path(record["image_back"]).name, rgbs[BACK_CAMERA])
             record["success"] = True
             self.samples.append(record)
         self.episodes.append(
@@ -696,43 +536,20 @@ class DatasetWriter:
 
     def close(self, publish=True):
         desc_note = "每个 subtask 都带 desc，用 20 字以内说明这一步做什么；各字段的含义跟在指令话术后面，不在 answer 里重复。"
-        if back_enabled():
-            pixels = (
-                "要动位置的步骤带两个夹爪落点的像素，每个落点各给两台相机：target_1 对应 image（frontview），"
-                "target_1_back 对应 image_back（backview），target_2、target_2_back 同理。像素是整数，形如 \"[x y]\"，"
-                "x 向右、y 向下，原点在图像左上角。某台相机看不到那个落点时对应字段写 \"mask\"，"
-                "表示不要猜这张图的像素，用另一台相机的；两台都看不到时 frontview 字段保留像素兜底。" + desc_note
-            )
-            frame = (
-                "target_1、target_2 是 frontview 像素，target_1_back、target_2_back 是 backview 像素，"
-                "被挡的视图是字面量 \"mask\"。grip_front、grip_back 是两个落点的世界坐标，米"
-            )
-            units = {
-                "target_1": "pixel",
-                "target_1_back": "pixel",
-                "target_2": "pixel",
-                "target_2_back": "pixel",
-                "grip_front": "meter",
-                "grip_back": "meter",
-            }
-        else:
-            pixels = (
-                "要动位置的步骤带 target_1 和 target_2，都是 frontview 的整数像素，形如 \"[x y]\"，x 向右、y 向下，原点在图像左上角。"
-                "target_1 是朝向相机的落点，target_2 是方块背面的落点，挡住了也照写。" + desc_note
-            )
-            frame = "target_1、target_2 都是 frontview 像素。grip_front、grip_back 是两个落点的世界坐标，米"
-            units = {"target_1": "pixel", "target_2": "pixel", "grip_front": "meter", "grip_back": "meter"}
+        pixels = (
+            "要动位置的步骤带 target_1 和 target_2，都是 frontview 的整数像素，形如 \"[x y]\"，x 向右、y 向下，原点在图像左上角。"
+            "target_1 是朝向相机的落点，target_2 是方块背面的落点，挡住了也照写。" + desc_note
+        )
+        frame = "target_1、target_2 都是 frontview 像素。grip_front、grip_back 是两个落点的世界坐标，米"
+        units = {"target_1": "pixel", "target_2": "pixel", "grip_front": "meter", "grip_back": "meter"}
         sources = {
             "cube_pos": "obs['cube_pos']，世界坐标，米",
             "grip_front": "方块表面朝 +x（frontview）的夹爪落点，世界坐标，米",
-            "grip_back": "方块表面朝 -x（backview）的夹爪落点，世界坐标，米",
-            "grip_pixel": "grip_front 投到 frontview 的像素字符串，和 subtasks 里的 target_1 一致；被挡时是 \"mask\"",
+            "grip_back": "方块表面朝 -x（背侧）的夹爪落点，世界坐标，米",
+            "grip_pixel": "grip_front 投到 frontview 的像素字符串，和 subtasks 里的 target_1 一致",
             "eef_pos": "obs['robot0_eef_pos']",
         }
-        if back_enabled():
-            sources["grip_pixel_back"] = "grip_back 投到 backview 的像素字符串，和 subtasks 里的 target_2_back 一致；被挡时是 \"mask\""
-        else:
-            sources["grip_pixel_2"] = "grip_back 投到 frontview 的像素字符串，和 subtasks 里的 target_2 一致。这个点常被方块挡住"
+        sources["grip_pixel_2"] = "grip_back 投到 frontview 的像素字符串，和 subtasks 里的 target_2 一致。这个点常被方块挡住"
         meta = {
             "env": "Lift",
             "robot": "Panda",
@@ -747,14 +564,12 @@ class DatasetWriter:
             "units": units,
             "camera_world_to_pixel": {name: matrix_to_list(matrix) for name, matrix in self.world_to_pixel.items()},
             "position_source": sources,
-            "instruction": "指令以若干个 <image> 占位开头，每行一个，和 inputs 里的图片一一对应；多张图时占位后面注明每张来自哪台相机。话术后面带 answer 各字段的说明（target_1、target_2 是哪个夹爪在哪台相机上的落点）。夹爪不在方块正上方时，指令是先移动到目标上方，再抬剩余高度。对准之后只写剩余高度。lift_height_m 是还要抬的高度，lifted_m 是已经抬起的高度，target_lift_m 是总目标。above_cube 表示末端是否已在方块正上方。方块位置、手臂出发位置和悬停高度每条抓取都会变。夹爪竖直朝下，两指沿世界 x 轴合拢。",
+            "instruction": "指令以一个 <image> 占位开头，和 inputs 里的 frontview 图片对应。话术后面带 answer 各字段的说明（target_1、target_2 是两个夹爪落点）。夹爪不在方块正上方时，指令是先移动到目标上方，再抬剩余高度。对准之后只写剩余高度。lift_height_m 是还要抬的高度，lifted_m 是已经抬起的高度，target_lift_m 是总目标。above_cube 表示末端是否已在方块正上方。方块位置、手臂出发位置和悬停高度每条抓取都会变。夹爪竖直朝下，两指沿世界 x 轴合拢。",
             "num_episodes": len(self.episodes),
             "num_discarded_episodes": self.discarded,
             "num_samples": len(self.samples),
             "episodes": self.episodes,
         }
-        if back_enabled():
-            meta["camera_back"] = BACK_CAMERA
         finish_image_staging(self.out_dir, self.image_dir, publish)
         if publish:
             self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
@@ -933,9 +748,7 @@ def main():
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--height-min", type=float, default=0.06, help="抬升高度下限，米")
     parser.add_argument("--height-max", type=float, default=0.18, help="抬升高度上限，米")
-    add_camera_arg(parser)
     args = parser.parse_args()
-    apply_cameras(args)
 
     rng = np.random.default_rng(args.seed)
     env = make_env(args.image_size, args.seed)

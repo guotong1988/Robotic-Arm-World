@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 各任务测评并行后台执行，结果写到 $OUT/<任务>/（results.jsonl、summary.json、videos/）。
-# 视频与 collect.sh 的相机输入对齐：frontview、backview 并排，逐视图标出模型原始像素，不画点云。
+# 视频与 collect.sh 的单目输入对齐：frontview 标出模型原始像素，不画点云。
 # 日志各自写到 $OUT/logs；任一任务失败则脚本以非零退出。
 # 所有任务连同一个 vLLM 服务，地址用 API_BASE 环境变量覆盖。
 # 直接运行会整体转到后台（nohup），立即返回，总日志是 $LOG/eval.log。
@@ -39,13 +39,12 @@ else
     DEFAULT_OUT=data/eval
 fi
 OUT=${OUT:-$DEFAULT_OUT}
-CAMERAS=${CAMERAS:-frontview}
 LOG=$OUT/logs
 mkdir -p $LOG
 
 if [ "$FG" -ne 1 ]; then
     nohup env PY="$PY" API_BASE="$API_BASE" EPISODES="$EPISODES" TIMEOUT="$TIMEOUT" SEED="$SEED" \
-        IMAGE_SIZE="$IMAGE_SIZE" OUT="$OUT" CAMERAS="$CAMERAS" ORACLE="${ORACLE:-}" \
+        IMAGE_SIZE="$IMAGE_SIZE" OUT="$OUT" ORACLE="${ORACLE:-}" \
         bash "$0" "$MODE" --fg > $LOG/eval.log 2>&1 &
     echo "后台执行 pid $!，模式 $MODE，总日志 $LOG/eval.log，各任务日志在 $LOG"
     exit 0
@@ -67,15 +66,15 @@ run() {
   pids+=($!)
 }
 
-run lift $PY eval_lift_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/lift --cameras $CAMERAS $EXTRA
-run stack $PY eval_stack_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/stack --cameras $CAMERAS $EXTRA
-run door $PY eval_door_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/door --cameras $CAMERAS $EXTRA
-run wipe $PY eval_wipe_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/wipe --cameras $CAMERAS $EXTRA
+run lift $PY eval_lift_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/lift $EXTRA
+run stack $PY eval_stack_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/stack $EXTRA
+run door $PY eval_door_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/door $EXTRA
+run wipe $PY eval_wipe_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --episodes $EPISODES --out $OUT/wipe $EXTRA
 for env in PickPlaceMilk PickPlaceBread PickPlaceCereal PickPlaceCan PickPlace; do
-    run pickplace_$env $PY eval_pickplace_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --env $env --episodes $EPISODES --out $OUT/pickplace_$env --cameras $CAMERAS $EXTRA
+    run pickplace_$env $PY eval_pickplace_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --env $env --episodes $EPISODES --out $OUT/pickplace_$env $EXTRA
 done
 for env in NutAssemblySquare NutAssemblyRound NutAssembly; do
-    run nut_$env $PY eval_nut_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --env $env --episodes $EPISODES --out $OUT/nut_$env --cameras $CAMERAS $EXTRA
+    run nut_$env $PY eval_nut_mllm_vllm.py --api-base $API_BASE --timeout $TIMEOUT --env $env --episodes $EPISODES --out $OUT/nut_$env $EXTRA
 done
 
 fail=0

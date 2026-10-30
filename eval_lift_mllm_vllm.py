@@ -11,19 +11,17 @@ vLLM 服务示例：
 
 每条测评做这些事：
 
-1. 按 collect_lift_mllm.py 的方式摆好 Lift / Panda，渲染 frontview 和 backview（正对面机位）的 512x512 RGB
+1. 按 collect_lift_mllm.py 的方式摆好 Lift / Panda，渲染 frontview 的 RGB
 2. 按当前画面重算指令，和采集时一样：没对准就先移动到目标上方，对准后只写还要抬多少
-3. 只把两张 RGB 和这条指令放进对话
-4. 只在初始画面问一次模型，取出两个夹爪落点的像素。单目是 target_1 和 target_2（背面那个即使被挡住也要给）；
-   对面双目时每个落点各写两台相机的像素：target_1、target_1_back 是第一个落点，target_2、target_2_back 是第二个，
-   某台相机看不到那个落点时对应字段写 "mask"，不脑补这张图的像素。抬升高度用指令里已经写明的数字
-5. 用这一帧的深度把像素换成两个落点的世界坐标。单目时背面那个点被方块挡住，用落点附近点云估计它的深度；
-   双目时两张深度拼成一块点云，每个落点用看得到它的那台相机还原。之后不再问模型。
-   按这两个点做逆运动学：走到落点中点上方、下降、合爪、抬起并稳住
+3. 只把 frontview RGB 和这条指令放进对话
+4. 只在初始画面问一次模型，取出 target_1 和 target_2 两个夹爪落点的像素；
+   背侧落点即使被方块挡住也要根据形状写出像素。抬升高度用指令里已经写明的数字
+5. 用这一帧的深度把像素换成两个落点的世界坐标，背侧落点用附近点云估计深度；
+   之后不再问模型。按这两个点做逆运动学：走到落点中点上方、下降、合爪、抬起并稳住
 6. 抓住方块，并且方块抬过桌面 4 厘米，才算成功
 
-每条测评按控制频率收成 mp4，写到输出目录的 videos/。画面按采集输入的相机顺序并排，
-逐视图标出模型回答的原始像素，不叠加深度点云。--no-video 可以关掉。
+每条测评按控制频率收成 mp4，写到输出目录的 videos/。frontview 画面标出模型回答的
+原始像素，不叠加深度点云。--no-video 可以关掉。
 
 模型给的是像素，不是世界坐标。仿真里的落点只用于 --oracle 出答案和事后统计误差，不参与定位和控制。
 move_above 在落点中点上方 12 厘米，这个高度落在采集时的悬停范围内。
@@ -46,17 +44,12 @@ gl_backend.configure()
 import numpy as np
 
 from collect_lift_mllm import (
-    BACK_CAMERA,
     CAMERAS,
     DEFAULT_CAMERA,
     INSTRUCTION_STYLES,
-    MASK,
     STABILIZE_DURATION,
     above_cube,
-    add_camera_arg,
-    apply_cameras,
     arm_controller,
-    back_enabled,
     format_answer,
     format_pixel,
     grip_landings,
@@ -73,7 +66,7 @@ from collect_lift_mllm import (
     unproject_pixel,
     world_to_pixel_matrices,
 )
-from depth_locate import fuse_estimates, make_views, recover_landings
+from depth_locate import CUBE_HALF_HEIGHT, make_views, recover_landings
 from eval_video import EvalVideo
 from grip_ik import GRIP_YAW, IKArm, choose_grasp, grasp_candidates, pad_offset, topdown_ori
 
@@ -132,24 +125,6 @@ def parse_pixel(value, image_size):
     return pixel
 
 
-# _view_field 的返回值哨兵：字段根本没写（区别于写了但被 mask 的 None）。
-_MISSING = object()
-
-
-def _view_field(item, keys, image_size):
-    """按 keys 顺序取像素字段。字段没写返回 _MISSING；写了 "mask" 或 null 返回 None（这台相机看不到，不脑补）。"""
-    for key in keys:
-        if key not in item:
-            continue
-        value = item[key]
-        if value is None:
-            return None
-        if isinstance(value, str) and value.strip().lower() == MASK:
-            return None
-        return parse_pixel(value, image_size)
-    return _MISSING
-
-
 def normalize_subtasks(items, image_size):
     if not isinstance(items, list):
         raise ValueError("subtasks 应为数组")
@@ -162,20 +137,14 @@ def normalize_subtasks(items, image_size):
             raise ValueError("未知子任务 {}".format(kind))
         step = {"type": kind}
         if kind in ("move_above", "move_down", "lift"):
-            # 每个落点每视图一个字段：target_1、target_1_back 是第一个落点，target_2、target_2_back 是第二个。
-            pixel = _view_field(item, ("target_1", "target"), image_size)
-            if pixel is _MISSING:
+            if "target_1" in item:
+                step["pixel"] = parse_pixel(item["target_1"], image_size)
+            elif "target" in item:
+                step["pixel"] = parse_pixel(item["target"], image_size)
+            else:
                 raise ValueError("{} 缺少 target_1".format(kind))
-            step["pixel"] = pixel
-            pixel_back = _view_field(item, ("target_1_back",), image_size)
-            if pixel_back is not _MISSING:
-                step["pixel_back"] = pixel_back
-            pixel_2 = _view_field(item, ("target_2",), image_size)
-            if pixel_2 is not _MISSING:
-                step["pixel_2"] = pixel_2
-            pixel_2_back = _view_field(item, ("target_2_back",), image_size)
-            if pixel_2_back is not _MISSING:
-                step["pixel_2_back"] = pixel_2_back
+            if "target_2" in item:
+                step["pixel_2"] = parse_pixel(item["target_2"], image_size)
         if kind == "lift":
             if "delta_z" not in item:
                 raise ValueError("lift 缺少 delta_z")
@@ -218,23 +187,13 @@ def _plan_from_object(obj, image_size):
         raise ValueError("缺少 subtasks")
     steps = normalize_subtasks(obj["subtasks"], image_size)
     target = None
-    target_back = None
     target_2 = None
-    target_2_back = None
     for step in steps:
         if "pixel" in step:
             target = step["pixel"]
-            target_back = step.get("pixel_back")
             target_2 = step.get("pixel_2")
-            target_2_back = step.get("pixel_2_back")
             break
-    return {
-        "target": target,
-        "target_back": target_back,
-        "target_2": target_2,
-        "target_2_back": target_2_back,
-        "subtasks": steps,
-    }
+    return {"target": target, "target_2": target_2, "subtasks": steps}
 
 
 def _parse_plan(text, image_size):
@@ -358,7 +317,7 @@ def image_content(image):
 
 
 def chat_messages(images, instruction, system, text_template):
-    """RGB 图（一张或一个列表：frontview、backview）加指令。"""
+    """frontview RGB 加指令。保留单元素列表输入以兼容调用方。"""
     if not isinstance(images, (list, tuple)):
         images = [images]
     text = user_text(instruction, text_template)
@@ -471,7 +430,7 @@ class VLLMClient:
         return self.model
 
     def complete(self, images, instruction):
-        """images 可以是一张 RGB，也可以是按 frontview、backview 顺序的列表。"""
+        """images 是一张 frontview RGB 或只含这一张图的列表。"""
         messages = chat_messages(images, instruction, self.system, self.text_template)
         drop_thinking = [self._drop_thinking_flag]
 
@@ -513,7 +472,6 @@ def camera_image(obs, size, camera=DEFAULT_CAMERA):
 
 
 def camera_images(obs, size):
-    """按 CAMERAS 顺序的所有视图：frontview、backview。"""
     return [camera_image(obs, size, name) for name in CAMERAS]
 
 
@@ -565,46 +523,35 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episod
     gt_front, gt_back = grip_landings(env)
     gt_pixel, _ = project_world(gt_front, matrices[DEFAULT_CAMERA])
     gt_pixel_2, _ = project_world(gt_back, matrices[DEFAULT_CAMERA])
-    gt_pixel_back = gt_pixel_2_back = None
-    if BACK_CAMERA in matrices:
-        gt_pixel_back, _ = project_world(gt_front, matrices[BACK_CAMERA])
-        gt_pixel_2_back, _ = project_world(gt_back, matrices[BACK_CAMERA])
     started = time.perf_counter()
     if oracle:
-        # 和采集同一条路径：遮挡判定、mask、双 mask 时 frontview 兜底都在 grip_view_pixels 里。
-        pixels = grip_view_pixels(env, gt_front, gt_back, matrices)
+        pixels = grip_view_pixels(gt_front, gt_back, matrices)
         text = format_answer(pixels, gt_cube, gt_eef, phase, above, delta_z)
     else:
         text = client.complete(images, instruction)
     print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
     print("episode {:02d} answer ({:.3f}s):\n{}".format(episode, time.perf_counter() - started, text), flush=True)
     plan = parse_answer(text, image_size=size)
-    if plan["target"] is None and plan["target_back"] is None:
-        raise ParseError("target_1 在所有视图都被 mask 或缺失")
-    if back_enabled():
-        if plan["target_2"] is None and plan["target_2_back"] is None:
-            raise ParseError("target_2 在所有视图都被 mask 或缺失")
-    elif plan["target_2"] is None:
+    if plan["target"] is None:
+        raise ParseError("缺少 target_1")
+    if plan["target_2"] is None:
         raise ParseError("缺少 target_2")
     views = make_views(env, obs, matrices)
     front, back, located = recover_landings(
         {
             "front": plan["target"],
-            "front_back": plan["target_back"],
             "same": plan["target_2"],
-            "back": plan["target_2_back"],
         },
         views,
         size,
+        plane_offset=CUBE_HALF_HEIGHT,
     )
     elapsed = time.perf_counter() - started
     return {
         "answer": text,
         "plan": {
             "pixel": plan["target"],
-            "pixel_back": plan["target_back"],
             "pixel_2": plan["target_2"],
-            "pixel_2_back": plan["target_2_back"],
             "front": front,
             "back": back,
             "target": 0.5 * (front + back),
@@ -616,8 +563,6 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episod
         "gt_back": gt_back,
         "gt_pixel": gt_pixel,
         "gt_pixel_2": gt_pixel_2,
-        "gt_pixel_back": gt_pixel_back,
-        "gt_pixel_2_back": gt_pixel_2_back,
         "located": located,
         "front_err": pos_error(front, gt_front),
         "back_err": pos_error(back, gt_back),
@@ -850,7 +795,7 @@ def pack_query(stage, instruction, pred, reached, pos_err):
         "subtasks": [
             {
                 key: round_pixel(value)
-                if key in ("pixel", "pixel_2", "pixel_back", "pixel_2_back") and value is not None
+                if key in ("pixel", "pixel_2") and value is not None
                 else value
                 for key, value in step.items()
             }
@@ -876,11 +821,7 @@ def pack_query(stage, instruction, pred, reached, pos_err):
         record["pixel_err"] = round(float(np.linalg.norm(delta)), 2)
         if pred.get("cube_depth_m") is not None:
             record["cube_depth_m"] = round(float(pred["cube_depth_m"]), 6)
-    for name, pred_key, gt_key in (
-        ("pixel_2", "pixel_2", "gt_pixel_2"),
-        ("pixel_back", "pixel_back", "gt_pixel_back"),
-        ("pixel_2_back", "pixel_2_back", "gt_pixel_2_back"),
-    ):
+    for name, pred_key, gt_key in (("pixel_2", "pixel_2", "gt_pixel_2"),):
         pixel = pred["plan"].get(pred_key)
         gt_pixel_n = pred.get(gt_key)
         if pixel is not None and gt_pixel_n is not None:
@@ -1047,76 +988,40 @@ def probe_dataset(client, dataset, count, seed):
     print("probe {} samples from {}".format(len(picked), path), flush=True)
     for index in picked:
         row = rows[int(index)]
-        images = [read_image(root / row["image"])]
-        for key in ("image_back",):
-            if row.get(key) and (root / row[key]).is_file():
-                images.append(read_image(root / row[key]))
-        text = client.complete(images, row["instruction"])
+        image = read_image(root / row["image"])
+        text = client.complete(image, row["instruction"])
         try:
             plan = parse_answer(text, image_size=image_size)
         except ParseError as exc:
             print("{} parse failed: {}".format(row["id"], exc), flush=True)
             continue
-        if plan["target"] is None and plan["target_back"] is None:
+        if plan["target"] is None:
             print("{} 没有像素".format(row["id"]), flush=True)
             continue
-        # 数据集没有深度图。新样本用两个落点的真值深度分别反投影；旧样本仍按方块中心。
-        if "grip_front" in row and "grip_back" in row:
-            # 每个落点各选一个看得见的视图：落点1 优先 frontview，落点2 优先 backview。
-            picks = (
-                ((plan["target"], DEFAULT_CAMERA), (plan["target_back"], BACK_CAMERA)),
-                ((plan["target_2_back"], BACK_CAMERA), (plan["target_2"], DEFAULT_CAMERA)),
-            )
-            worlds = []
-            pred_pixel = None
-            gt_pixel = None
-            for candidates, gt in zip(picks, (row["grip_front"], row["grip_back"])):
-                chosen = None
-                for pixel, camera in candidates:
-                    if pixel is not None and camera in matrices:
-                        chosen = (pixel, camera)
-                        break
-                if chosen is None:
-                    worlds.append(None)
-                    continue
-                pixel, camera = chosen
-                if pred_pixel is None:
-                    pred_pixel = pixel
-                    gt_pixel = round_pixel(project_world(gt, matrices[camera])[0])
-                _, view_depth = project_world(gt, matrices[camera])
-                try:
-                    worlds.append(unproject_pixel(pixel, view_depth, matrices[camera]))
-                except ValueError as exc:
-                    print("{} {} {}".format(row["id"], camera, exc), flush=True)
-                    worlds.append(None)
-            if any(item is None for item in worlds) or gt_pixel is None:
+        # 数据集没有深度图，用 frontview 真值深度反投影来检查像素误差。
+        matrix = matrices[DEFAULT_CAMERA]
+        pred_pixel = plan["target"]
+        try:
+            if "grip_front" in row and "grip_back" in row and plan["target_2"] is not None:
+                worlds = []
+                for pixel, gt in zip((plan["target"], plan["target_2"]), (row["grip_front"], row["grip_back"])):
+                    _, view_depth = project_world(gt, matrix)
+                    worlds.append(unproject_pixel(pixel, view_depth, matrix))
+                world = 0.5 * (worlds[0] + worlds[1])
+                gt_world = 0.5 * (np.asarray(row["grip_front"], dtype=float) + np.asarray(row["grip_back"], dtype=float))
+                gt_pixel = round_pixel(project_world(row["grip_front"], matrix)[0])
+            elif "cube_pos" in row:
+                gt_world = row["cube_pos"]
+                _, view_depth = project_world(gt_world, matrix)
+                world = unproject_pixel(pred_pixel, view_depth, matrix)
+                gt_pixel = row.get("cube_pixel")
+                if gt_pixel is None:
+                    gt_pixel = round_pixel(project_world(gt_world, matrix)[0])
+            else:
+                print("{} 没有落点或方块坐标，跳过".format(row["id"]), flush=True)
                 continue
-            world = 0.5 * (np.asarray(worlds[0]) + np.asarray(worlds[1]))
-            gt_world = 0.5 * (np.asarray(row["grip_front"], dtype=float) + np.asarray(row["grip_back"], dtype=float))
-        elif "cube_pos" in row:
-            estimates = {}
-            pred_pixel = pred_camera = None
-            for camera, pixel in ((DEFAULT_CAMERA, plan["target"]), (BACK_CAMERA, plan["target_back"])):
-                if pixel is None or camera not in matrices:
-                    continue
-                if pred_pixel is None:
-                    pred_pixel, pred_camera = pixel, camera
-                _, view_depth = project_world(row["cube_pos"], matrices[camera])
-                try:
-                    estimates[camera] = (unproject_pixel(pixel, view_depth, matrices[camera]), {})
-                except ValueError as exc:
-                    print("{} {} {}".format(row["id"], camera, exc), flush=True)
-            if not estimates:
-                continue
-            world, _ = fuse_estimates("object", estimates)
-            gt_world = row["cube_pos"]
-            # cube_pixel 是 frontview 的；预测用了 backview 时就按那台相机的矩阵投影真值。
-            gt_pixel = row.get("cube_pixel") if pred_camera == DEFAULT_CAMERA else None
-            if gt_pixel is None:
-                gt_pixel, _ = project_world(row["cube_pos"], matrices[pred_camera])
-                gt_pixel = round_pixel(gt_pixel)
-        else:
-            print("{} 没有落点或方块坐标，跳过".format(row["id"]), flush=True)
+        except ValueError as exc:
+            print("{} frontview {}".format(row["id"], exc), flush=True)
             continue
         if not plausible(world):
             print("{} 反投影超出工作空间 {}".format(row["id"], np.round(world, 4).tolist()), flush=True)
@@ -1317,18 +1222,16 @@ def add_common_args(parser):
     parser.add_argument("--system", default="", help="可选的 system prompt，默认不发")
     parser.add_argument("--text-template", default="{instruction}", help="拼在图片后面的文本，默认就是指令原文")
     parser.add_argument("--out", default="data/lift_eval")
-    parser.add_argument("--no-video", action="store_true", help="不把每条测评录成并排 mp4")
+    parser.add_argument("--no-video", action="store_true", help="不把每条测评录成 mp4")
     parser.add_argument("--oracle", action="store_true", help="用环境真值代替模型，检查控制器")
     parser.add_argument("--probe", type=int, default=0, help="正式测评前，先在采集样本上测方块位置和子任务")
     parser.add_argument("--dataset", default="data/lift_mllm")
     parser.add_argument("--self-test", action="store_true", help="只检查解析和坐标换算")
-    add_camera_arg(parser)
     return parser
 
 
 def run_eval(args, client, backend, extra_summary=None):
     """跑 probe 和正式测评，并把结果写到 args.out。oracle 时跳过 probe。"""
-    apply_cameras(args)
     if args.oracle:
         print("oracle mode, skip model server", flush=True)
     elif args.probe > 0:
@@ -1384,16 +1287,11 @@ def self_test():
     instruction = "将方块向上抬起 14 厘米。"
     assert user_text(instruction, "{instruction}") == "\n" + instruction
     assert user_text("<image>\n" + instruction, "{instruction}") == "\n" + instruction
-    assert user_text("<image><image>\n" + instruction, "{instruction}") == "\n" + instruction
-    views_note = "第一张图是正面相机（frontview），第二张图是背面相机（backview）。"
-    assert user_text("<image>\n<image>\n" + views_note + instruction, "{instruction}") == "\n" + views_note + instruction
     rgb = np.zeros((8, 8, 3), dtype=np.uint8)
     messages = chat_messages(rgb, instruction, "", "{instruction}")
     assert len(messages[-1]["content"]) == 2
     assert messages[-1]["content"][0]["type"] == "image_url"
     assert messages[-1]["content"][1]["type"] == "text"
-    dual = chat_messages([rgb, rgb], instruction, "", "{instruction}")
-    assert [part["type"] for part in dual[-1]["content"]] == ["image_url", "image_url", "text"]
     seen = {}
 
     def capture(payload):
@@ -1446,24 +1344,11 @@ def self_test():
     plan = parse_answer("```json\n" + comma + "\n```", image_size=512)
     assert np.allclose(plan["target"], [320.0, 180.0])
     assert plan["subtasks"][0]["type"] == "move_down"
-    two_views = '{"subtasks": [{"type": "move_down", "target": "[282 314]", "target_1_back": "[150 262]"}, {"type": "close_gripper"}]}'
-    plan = parse_answer(two_views, image_size=512)
-    assert np.allclose(plan["target"], [282, 314])
-    assert np.allclose(plan["target_back"], [150, 262])
-    assert np.allclose(plan["subtasks"][0]["pixel_back"], [150, 262])
-    assert plan["target_2"] is None and plan["target_2_back"] is None
-    # 被 mask 的视图解析成 None：不脑补这张图的像素，执行时用另一台相机。
-    masked = (
-        '{"subtasks": [{"type": "move_down", "target_1": "mask", "target_1_back": "[150 262]", '
-        '"target_2": "[301 318]", "target_2_back": "mask"}, {"type": "close_gripper"}]}'
-    )
-    plan = parse_answer(masked, image_size=512)
-    assert plan["target"] is None
-    assert np.allclose(plan["target_back"], [150, 262])
-    assert np.allclose(plan["target_2"], [301, 318])
-    assert plan["target_2_back"] is None
-    assert plan["subtasks"][0]["pixel"] is None
-    assert plan["subtasks"][0]["pixel_2_back"] is None
+    try:
+        parse_answer('{"subtasks": [{"type": "move_down", "target_1": "mask"}]}', image_size=512)
+        raise AssertionError("单目像素被 mask 时应拒绝")
+    except ParseError:
+        pass
     empty = '{"subtasks": []}'
     assert parse_answer(empty, image_size=512)["target"] is None
     prose = '计划：\n{"subtasks": [{"type": "lift", "target": "[200 180]", "delta_z": 0.1}, {"type": "stabilize", "duration": 0.5}]}'
@@ -1533,49 +1418,18 @@ def self_test():
     assert packed["cube_x_err_m"] == 0.01 and packed["cube_y_err_m"] == -0.02 and packed["cube_z_err_m"] == 0.01
     assert packed["pixel"] == [251, 189] and packed["gt_pixel"] == [250, 188]
     assert packed["pixel_err"] > 0.0
-    backed = parse_answer(two_views, image_size=512)
-    packed = pack_query(
-        "move_down",
-        "将方块向上抬起 14 厘米。",
-        {
-            "answer": two_views,
-            "plan": {
-                "pixel": backed["target"],
-                "pixel_back": backed["target_back"],
-                "target": [-0.0974, 0.0752, 0.8216],
-                "subtasks": backed["subtasks"],
-            },
-            "gt_cube_pos": [0.0, 0.0, 0.82],
-            "gt_eef_pos": [0.0, 0.0, 0.95],
-            "gt_pixel": [250.0, 188.0],
-            "gt_pixel_back": [149.0, 261.0],
-            "cube_depth_m": 1.6,
-            "cube_err": err,
-            "seconds": 0.1,
-        },
-        True,
-        0.01,
-    )
-    assert isinstance(backed["subtasks"][0]["pixel_back"], np.ndarray)
-    assert packed["subtasks"][0]["pixel"] == [282, 314]
-    assert packed["subtasks"][0]["pixel_back"] == [150, 262]
-    assert packed["pixel_back"] == [150, 262] and packed["gt_pixel_back"] == [149, 261]
     json.dumps(packed)
     assert query_pos_error(packed)["y"] == -0.02
     assert completion_text({"choices": [{"message": {"content": text}}]}) == text
     assert completion_text({"response": comma}) == comma
-    # 新命名：每个落点各写两台相机，target_1/target_1_back 是一个，target_2/target_2_back 是另一个。
     named = (
         '{"desc": "target_1 是夹爪1落点的像素", "subtasks": ['
-        '{"type": "move_down", "desc": "降到方块处", "target_1": "[282 314]", "target_1_back": "[150 262]", '
-        '"target_2": "[301 318]", "target_2_back": "[166 268]"}, '
+        '{"type": "move_down", "desc": "降到方块处", "target_1": "[282 314]", "target_2": "[301 318]"}, '
         '{"type": "close_gripper", "desc": "合爪"}]}'
     )
     plan = parse_answer(named, image_size=512)
     assert np.allclose(plan["target"], [282, 314])
-    assert np.allclose(plan["target_back"], [150, 262])
     assert np.allclose(plan["target_2"], [301, 318])
-    assert np.allclose(plan["target_2_back"], [166, 268])
     print("self-test ok", flush=True)
 
 
