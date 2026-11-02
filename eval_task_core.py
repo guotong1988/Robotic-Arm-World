@@ -81,6 +81,8 @@ def plan_pixels(subtasks):
                 add(step["align_point"])
         elif kind == "reach":
             add(step["pixel"])
+            if "pixel_2" in step:
+                add(step["pixel_2"])
         elif kind == "turn":
             add(step["pivot"])
         elif kind == "wipe":
@@ -169,26 +171,29 @@ def match_targets(points, gt, grip_gt=None):
             first = np.asarray(point["land_1"], dtype=float)
             second = np.asarray(point["land_2"], dtype=float)
             axis = second - first
-            width = float(np.linalg.norm(axis[:2]))
-            yaw = closing_yaw(first, second)
+            side = point["info"].get("method") == "door_handle_plane"
+            width = float(np.linalg.norm(axis if side else axis[:2]))
             target["land_1"] = np.round(first, 4).tolist()
             target["land_2"] = np.round(second, 4).tolist()
             target["grip_width_m"] = round(width, 4)
-            target["closing_yaw_deg"] = round(yaw, 2)
+            if not side:
+                target["closing_yaw_deg"] = round(closing_yaw(first, second), 2)
             pair = grip_gt(nearest["name"]) if grip_gt is not None else None
             if pair is not None:
                 gt_first, gt_second = (np.asarray(item, dtype=float) for item in pair)
-                gt_width = float(np.linalg.norm((gt_second - gt_first)[:2]))
-                gt_yaw = closing_yaw(gt_first, gt_second)
-                yaw_err = yaw_error_180(yaw, gt_yaw)
+                gt_axis = gt_second - gt_first
+                gt_width = float(np.linalg.norm(gt_axis if side else gt_axis[:2]))
                 target["gt_land_1"] = np.round(gt_first, 4).tolist()
                 target["gt_land_2"] = np.round(gt_second, 4).tolist()
                 target["gt_grip_width_m"] = round(gt_width, 4)
-                target["gt_closing_yaw_deg"] = round(gt_yaw, 2)
                 target["grip_width_err_m"] = round(width - gt_width, 4)
                 target["grip_width_abs_err_m"] = round(abs(width - gt_width), 4)
-                target["closing_yaw_err_deg"] = round(yaw_err, 2)
-                target["closing_yaw_abs_err_deg"] = round(abs(yaw_err), 2)
+                if not side:
+                    gt_yaw = closing_yaw(gt_first, gt_second)
+                    yaw_err = yaw_error_180(target["closing_yaw_deg"], gt_yaw)
+                    target["gt_closing_yaw_deg"] = round(gt_yaw, 2)
+                    target["closing_yaw_err_deg"] = round(yaw_err, 2)
+                    target["closing_yaw_abs_err_deg"] = round(abs(yaw_err), 2)
         targets.append(target)
     return targets
 
@@ -259,20 +264,20 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                         flush=True,
                     )
                     if "gt_grip_width_m" in target:
-                        print(
-                            "episode {:02d} {} pair width gt={} pred={} err={} "
-                            "yaw gt={:.1f}deg pred={:.1f}deg err={:+.1f}deg".format(
-                                episode,
-                                target["point"],
-                                format_cm(target["gt_grip_width_m"]),
-                                format_cm(target["grip_width_m"]),
-                                format_cm(target["grip_width_err_m"]),
+                        message = "episode {:02d} {} pair width gt={} pred={} err={}".format(
+                            episode,
+                            target["point"],
+                            format_cm(target["gt_grip_width_m"]),
+                            format_cm(target["grip_width_m"]),
+                            format_cm(target["grip_width_err_m"]),
+                        )
+                        if "closing_yaw_deg" in target:
+                            message += " yaw gt={:.1f}deg pred={:.1f}deg err={:+.1f}deg".format(
                                 target["gt_closing_yaw_deg"],
                                 target["closing_yaw_deg"],
                                 target["closing_yaw_err_deg"],
-                            ),
-                            flush=True,
-                        )
+                            )
+                        print(message, flush=True)
                 starts = set(pick_starts(task.task, subtasks))
                 relocated = []
                 grasp_diagnostics = []
@@ -493,9 +498,9 @@ def print_summary(summary):
     for name, stats in summary["points"].items():
         extra = ""
         if stats.get("grip_width_abs_err_m") is not None:
-            extra = "  宽度误差 {}  yaw误差 {:.1f}deg".format(
-                format_cm(stats["grip_width_abs_err_m"]), stats["closing_yaw_abs_err_deg"]
-            )
+            extra = "  宽度误差 {}".format(format_cm(stats["grip_width_abs_err_m"]))
+            if stats.get("closing_yaw_abs_err_deg") is not None:
+                extra += "  yaw误差 {:.1f}deg".format(stats["closing_yaw_abs_err_deg"])
         print(
             "{} n={} 像素误差 {}  水平误差 {}  高度误差 {}{}".format(
                 name,
@@ -594,12 +599,12 @@ def self_test():
     assert closing_yaw([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]) == 0.0
     assert abs(yaw_error_180(-170.0, 170.0) - 20.0) < 1e-9
     assert abs(yaw_error_180(170.0, -170.0) + 20.0) < 1e-9
-    # Door：reach 的 target_1、turn 的 pivot 都要收进来
+    # Door：reach 的上下双落点、turn 的 pivot 都要收进来
     door = parse_plan(
         format_plan(
             [
-                {"type": "reach", "target_1": "[150 240]", "approach": [-0.14, -0.99, 0.0], "standoff": 0.1},
-                {"type": "reach", "target_1": "[150 240]", "approach": [-0.14, -0.99, 0.0], "standoff": 0.0},
+                {"type": "reach", "target_1": "[150 231]", "target_2": "[150 249]", "approach": [-0.14, -0.99, 0.0], "standoff": 0.1},
+                {"type": "reach", "target_1": "[150 231]", "target_2": "[150 249]", "approach": [-0.14, -0.99, 0.0], "standoff": 0.0},
                 {"type": "close_gripper"},
                 {"type": "turn", "pivot": "[160 250]", "axis": [-0.14, -0.99, 0.0], "angle": -83},
                 {"type": "turn", "pivot": "[120 200]", "axis": [0.0, 0.0, 1.0], "angle": 23},
@@ -609,7 +614,7 @@ def self_test():
         image_size=512,
     )["subtasks"]
     pixels = [tuple(np.round(p, 1)) for p in plan_pixels(door)]
-    assert pixels == [(150.0, 240.0), (160.0, 250.0), (120.0, 200.0)], pixels
+    assert pixels == [(150.0, 231.0), (150.0, 249.0), (160.0, 250.0), (120.0, 200.0)], pixels
     # Nut：抓螺母的步骤带两指落点对（target_1、target_2、target_kind=grip），
     # 两落点都收；套柱子用 align_point
     nut = parse_plan(

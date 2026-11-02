@@ -18,17 +18,19 @@ Lift 的每一步指向同一个方块，Stack 先指向红块再指向绿块，
 - close_gripper / open_gripper
 - lift：把该像素对应的点再抬高 delta_z，米，夹爪保持闭合
 - stabilize：停住 duration 秒
-- reach：夹爪沿 approach（世界坐标方向）伸向该像素，停在离它 standoff 米处。两指上下合拢
+- reach：夹爪沿 approach（世界坐标方向）伸向目标，停在离它 standoff 米处。两指上下合拢；
+  Door 双落点的中点是抓取中心，target_1 在上、target_2 在下，连线与 approach 共同确定侧抓姿态
 - turn：夹爪连同手里的东西绕转轴转 angle 度。转轴过 pivot 像素，方向是 axis，右手定则
 - wipe：贴着桌面依次走过 path 里的像素，offset_z 是相对这些点再往下压多少，米
 
 move_above、move_down 的单点目标可以带 yaw：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转 yaw 度。
-双落点目标不写 yaw，由两点连线推导；单点不带 yaw 时保持当前朝向。还可以带 align_point，是手里物体上某一点在提问那一帧的像素。
+竖直抓取的双落点目标不写 yaw，由两点水平连线推导；Door reach 不走这条 yaw 路径。
+单点不带 yaw 时保持当前朝向。还可以带 align_point，是手里物体上某一点在提问那一帧的像素。
 这时对准目标的是这个点，不是夹爪：合爪时该点相对夹爪的位置，按夹爪之后转过的角度一起转，
 再从目标里减掉。计划开头已经抓着东西时，用开头的夹爪位姿。
 
 每个像素字段还可以带类别：target_kind、align_point_kind、pivot_kind、path_kind，
-注明这个像素指的是哪类东西（object、cube_center、bin、nut、peg、table、door_handle、door_axis）。
+注明这个像素指的是哪类东西（object、cube_center、bin、nut、peg、table、door_handle、door_axis、grip）。
 评测按类别选对应的深度量法（depth_locate）；不写时按任务和计划结构推断。
 """
 
@@ -360,6 +362,19 @@ def approach_ori(approach):
     return np.column_stack([x_axis, np.cross(z_axis, x_axis), z_axis])
 
 
+def side_grip_ori(first, second, approach):
+    """侧抓姿态：approach 是夹爪 z 轴，上落点到下落点的连线投影是夹爪 x 轴。"""
+    z_axis = np.asarray(approach, dtype=float)
+    z_axis = z_axis / np.linalg.norm(z_axis)
+    closing = np.asarray(second, dtype=float) - np.asarray(first, dtype=float)
+    x_axis = closing - float(np.dot(closing, z_axis)) * z_axis
+    norm = float(np.linalg.norm(x_axis))
+    if norm < 1e-6:
+        raise ParseError("侧抓落点连线与 approach 平行，无法确定合拢方向")
+    x_axis = x_axis / norm
+    return np.column_stack([x_axis, np.cross(z_axis, x_axis), z_axis])
+
+
 def _ori_angle(left, right):
     dot = abs(float(np.dot(mat2quat(left), mat2quat(right))))
     return 2.0 * float(np.arccos(np.clip(dot, 0.0, 1.0)))
@@ -398,6 +413,19 @@ def step_point(step, key, landmarks, matrices):
     if key == "path":
         return [resolve_pixel(pixel, landmarks, matrices[DEFAULT_CAMERA]) for pixel in step["path"]]
     return resolve_pixel(step[key], landmarks, matrices[DEFAULT_CAMERA])
+
+
+def _side_grip_world(step, landmarks, matrices):
+    """返回 Door 侧抓的上、下落点，并校验三维开度和上下顺序。"""
+    first = np.asarray(step_point(step, "pixel", landmarks, matrices), dtype=float)
+    second = np.asarray(step_point(step, "pixel_2", landmarks, matrices), dtype=float)
+    delta = second - first
+    width = float(np.linalg.norm(delta))
+    if not np.isfinite(width) or not MIN_GRIP_WIDTH <= width <= MAX_GRIP_WIDTH:
+        raise ParseError("两个侧抓落点的间距 {:.3f} 米，夹爪夹不了".format(width))
+    if float(delta[2]) >= -0.5 * width:
+        raise ParseError("侧抓落点必须 target_1 在上、target_2 在下")
+    return first, second
 
 
 def _grip_world(step, landmarks, matrices):
@@ -517,8 +545,13 @@ def execute_plan(
             anchor = dest
             grip = command
         elif kind == "reach":
-            ori = approach_ori(step["approach"])
-            target = step_point(step, "pixel", landmarks, matrices)
+            if "pixel_2" in step:
+                first, second = _side_grip_world(step, landmarks, matrices)
+                target = 0.5 * (first + second)
+                ori = side_grip_ori(first, second, step["approach"])
+            else:
+                target = step_point(step, "pixel", landmarks, matrices)
+                ori = approach_ori(step["approach"])
             dest = clip_workspace(target - np.asarray(step["approach"]) * float(step["standoff"]))
             obs, ok, err = goto(env, dest, ori, grip, REACH_TOL, REACH_STEPS, on_step)
             anchor = dest
@@ -593,12 +626,13 @@ def check_parser():
     assert legacy["align_point_kind"] == "object"
     others = parse_plan(format_plan([
         {"type": "move_above", "target_1": "[200 310]", "target_kind": "object", "clearance": 0.1, "yaw": -35},
-        {"type": "reach", "target_1": "[150 240]", "target_kind": "door_handle", "approach": [-0.14, -0.99, 0.0], "standoff": 0.1},
+        {"type": "reach", "target_1": "[150 231]", "target_2": "[150 249]", "target_kind": "grip", "approach": [-0.14, -0.99, 0.0], "standoff": 0.1},
         {"type": "turn", "pivot": "[160 250]", "pivot_kind": "door_axis", "axis": [0.0, 0.0, 1.0], "angle": 23},
         {"type": "wipe", "path": ["[200 300]", "[210 305]"], "path_kind": "table", "offset_z": -0.01},
     ]), image_size=512)["subtasks"]
     assert abs(others[0]["yaw"] + 35.0) < 1e-9
     assert abs(np.linalg.norm(others[1]["approach"]) - 1.0) < 1e-9
+    assert np.allclose(others[1]["pixel_2"], [150, 249])
     assert others[2]["pivot_kind"] == "door_axis"
     assert len(others[3]["path"]) == 2
     assert np.allclose(topdown_ori(0.0), TOPDOWN)
@@ -607,6 +641,9 @@ def check_parser():
     assert np.allclose(_grip_ori(first, second, topdown_ori(-90.0))[:, 0], [1.0, 0.0, 0.0])
     assert np.allclose(_grip_ori(first, second, topdown_ori(90.0))[:, 0], [-1.0, 0.0, 0.0])
     pair_step["world"]["pixel_2"] = np.array([0.2, 0.0, 0.83])
+    side_step = {"world": {"pixel": np.array([0.0, 0.0, 1.10]), "pixel_2": np.array([0.0, 0.0, 1.06])}}
+    side_first, side_second = _side_grip_world(side_step, [], {})
+    assert np.allclose(side_grip_ori(side_first, side_second, [0.0, -1.0, 0.0]), approach_ori([0.0, -1.0, 0.0]))
     for bad in (
         '{"subtasks": [{"type": "fly"}]}',
         '{"subtasks": [{"type": "wipe"}]}',

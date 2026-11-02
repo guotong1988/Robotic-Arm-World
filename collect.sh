@@ -4,8 +4,8 @@
 set -e
 PY=${PY:-/opt/conda/envs/python3.10.13/bin/python3}
 OUT=${OUT:-/data/oss_bucket_3/guotong/mllm_data/}
-EPISODES=${EPISODES:-100}
-WORKERS=${WORKERS:-4}
+EPISODES=${EPISODES:-200}
+WORKERS=${WORKERS:-10}
 SEED=${SEED:-0}
 IMAGE_SIZE=${IMAGE_SIZE:-1024}
 SHARDS=${SHARDS:-$OUT/.collect_shards}

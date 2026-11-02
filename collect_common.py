@@ -55,6 +55,7 @@ from task_plan import (
     execute_plan,
     format_plan,
     parse_plan,
+    side_grip_ori,
     topdown_ori,
 )
 
@@ -72,10 +73,11 @@ _ANSWER_KIND = (
     "每个像素字段注明指的是哪类东西：target_kind、align_point_kind、pivot_kind、path_kind，取值 object（放在桌面或箱底上的物体中心）、"
     "cube_center（方块的中心）、bin（箱子里格子的底面）、nut（平放的螺母中心）、peg（柱子顶端中心）、table（贴在桌面上的点）、"
     "door_handle（门把手上的抓取点）、door_axis（门锁转轴、铰链）、grip（夹爪合拢时贴住物体表面的落点）。"
-    "双落点 grip 步骤不写 yaw，合拢方向由两点连线确定。单点 move_above（clearance，米）、move_down（offset_z，米）"
+    "双落点 grip 步骤不写 yaw：竖直抓取的合拢方向由两点连线确定；Door 的 reach 侧抓由两点连线和 approach 共同确定，target_1 在上、target_2 在下。"
+    "单点 move_above（clearance，米）、move_down（offset_z，米）"
     "可带 yaw（度，夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度）和 align_point（手里物体上要对准目标的那一点的像素）。"
     "lift 的 delta_z 是还要抬的高度，米。"
-    "reach 沿 approach（世界坐标方向）伸向 target，停在 standoff 米处。turn 绕过 pivot 像素、方向为 axis 的转轴转 angle 度。"
+    "reach 沿 approach（世界坐标方向）伸向 target_1/target_2 的中点，停在 standoff 米处。turn 绕过 pivot 像素、方向为 axis 的转轴转 angle 度。"
     "wipe 贴着桌面依次走过 path 里的像素，offset_z 是往下压的量。另外有 close_gripper、open_gripper、stabilize。完成后 subtasks 为空。"
 )
 # 每步 desc 的通用说法。任务实现 step_desc 时用自己的，可以带上物体名。
@@ -220,8 +222,8 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
     每个空间字段只写 frontview 像素，被挡住时也根据物体形状写出像素。
     每个像素字段带 *_kind 类别标注（任务实现 point_kind 时），评测按类别选深度量法。
     任务实现 grip_points(env, name) 且 name 是夹爪落点时，写 target_1、target_2，
-    target_kind 标 grip，执行器取两点的中点，
-    并由两点连线推导 yaw，所以抓取标签不再重复写 yaw。每步带 desc，说明这一步做什么。
+    target_kind 标 grip，执行器取两点的中点。竖直抓取由两点连线推导 yaw；
+    Door 的 reach 由连线和 approach 构造侧抓姿态。抓取标签不再重复写 yaw。每步带 desc，说明这一步做什么。
     """
 
     def put_views(out, key, name):
@@ -291,15 +293,19 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
     if kind == "reach":
         approach = np.asarray(step["approach"], dtype=float)
         out = {"type": "reach", "desc": step_desc(task, env, step)}
-        put_views(out, "target_1", step["ref"])
+        grip_pair = put_grip(out, step["ref"])
+        if grip_pair is None:
+            put_views(out, "target_1", step["ref"])
+            ref_kind = point_kind(task, step["ref"])
+            if ref_kind is not None:
+                out["target_kind"] = ref_kind
         out["approach"] = _vector(approach)
         out["standoff"] = round(float(step["standoff"]), 2)
-        ref_kind = point_kind(task, step["ref"])
-        if ref_kind is not None:
-            out["target_kind"] = ref_kind
         if current:
-            goal = np.asarray(points[step["ref"]], dtype=float) - approach * float(step["standoff"])
-            if float(np.linalg.norm(eef - goal)) <= REACH_TOL and _ori_close(eef_ori, approach_ori(approach)):
+            base = points[step["ref"]] if grip_pair is None else 0.5 * (grip_pair[0] + grip_pair[1])
+            ori = approach_ori(approach) if grip_pair is None else side_grip_ori(grip_pair[0], grip_pair[1], approach)
+            goal = np.asarray(base, dtype=float) - approach * float(step["standoff"])
+            if float(np.linalg.norm(eef - goal)) <= REACH_TOL and _ori_close(eef_ori, ori):
                 return None
         return out
     if kind == "turn":

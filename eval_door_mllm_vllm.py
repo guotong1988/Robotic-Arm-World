@@ -3,11 +3,11 @@
     python3 eval_door_mllm_vllm.py --api-base http://127.0.0.1:8000/v1 --episodes 20
     python3 eval_door_mllm_vllm.py --oracle --episodes 5
 
-一张 frontview RGB 加一句「把门打开。」，模型写出 reach 抓把手、close_gripper、
+一张 frontview RGB 加一句「把门打开。」，模型写出 reach 的上下双落点、close_gripper、
 两次 turn（先绕把手根部转开门锁，再绕铰链把门拉开）、stabilize。
-把手标注点在杆的内部，可见表面比它近十几厘米，不能直接读深度：先用 reach 的
-approach 当门板法向，从深度图量出门板所在的竖直平面，转轴取视线和门板中面的交点，
-把手取和中面外移把手距离的那个平面的交点。流程详见 eval_task_core.py 和 depth_locate.py。
+把手接触点不能直接读可见表面深度：先用 reach 的 approach 当门板法向，从深度图量出
+门板所在的竖直平面，两个落点分别取对应视线和中面外移把手距离后的平面的交点；
+转轴取视线和门板中面的交点。流程详见 eval_task_core.py 和 depth_locate.py。
 """
 
 import argparse

@@ -2,7 +2,8 @@
 
 门带锁。把手是一根绕门板法向转的横杆，要转过约 75 度锁舌才离开门框。
 从上往下压做不到这么大的角度，而且两指沿门法向时手掌会撞上门板，
-所以夹爪横着伸向把手（reach，两指上下合拢夹住横杆），合爪后：
+所以夹爪横着伸向把手（reach，两指上下合拢夹住横杆）。reach 写两个侧抓接触点：
+target_1 在把手横杆上表面，target_2 在下表面，两点中点是抓取中心，合爪后：
 
 1. 绕门锁转轴（pivot 是把手根部，axis 是门板法向）转，把手往上翻约 83 度；
 2. 绕门的铰链（pivot 是铰链那根门框立柱，axis 竖直向上）转约 23 度，把门拉开。
@@ -15,11 +16,11 @@ turn 的 angle 写的是还要转的角度，按当前把手和门的角度算�
 话术后面带 answer 各字段的说明：
 
     <image>
-    把门打开。回答的 JSON 中，target_1 和 pivot 是对应点在正面相机图上的像素。
+    把门打开。回答的 JSON 中，target_1、target_2 和 pivot 是对应点在正面相机图上的像素。
 
 输出例子（把手还没转开时；每个 subtask 的 desc 说明这一步做什么）：
 
-    {"subtasks": [{"type": "reach", "desc": "伸向目标点", "target_1": "[390 220]", "approach": [0.0, -1.0, 0.0], "standoff": 0.1, "target_kind": "door_handle"}, {"type": "reach", "desc": "伸向目标点", "target_1": "[390 220]", "approach": [0.0, -1.0, 0.0], "standoff": 0.0, "target_kind": "door_handle"}, {"type": "close_gripper", "desc": "合爪夹住"}, {"type": "turn", "desc": "绕转轴转动", "pivot": "[400 215]", "axis": [0.0, -1.0, 0.0], "angle": -83, "pivot_kind": "door_axis"}, {"type": "turn", "desc": "绕转轴转动", "pivot": "[430 240]", "axis": [0.0, 0.0, 1.0], "angle": 23, "pivot_kind": "door_axis"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+    {"subtasks": [{"type": "reach", "desc": "伸向目标点", "target_1": "[390 211]", "target_2": "[390 229]", "approach": [0.0, -1.0, 0.0], "standoff": 0.1, "target_kind": "grip"}, {"type": "reach", "desc": "伸向目标点", "target_1": "[390 211]", "target_2": "[390 229]", "approach": [0.0, -1.0, 0.0], "standoff": 0.0, "target_kind": "grip"}, {"type": "close_gripper", "desc": "合爪夹住"}, {"type": "turn", "desc": "绕转轴转动", "pivot": "[400 215]", "axis": [0.0, -1.0, 0.0], "angle": -83, "pivot_kind": "door_axis"}, {"type": "turn", "desc": "绕转轴转动", "pivot": "[430 240]", "axis": [0.0, 0.0, 1.0], "angle": 23, "pivot_kind": "door_axis"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
 每条成功轨迹只存开局那一帧。门在桌面上换位置，朝向在默认朝向附近偏一个角度。
 门锁和门扇仍从关上的状态开始。中途画面不存。
@@ -38,8 +39,9 @@ from collect_common import add_common_args, run_collection
 # 先验知识：锁舌转到约 -1.45 弧度才开，门拉开到 0.4 弧度；抓在把手靠外处，沿门板法向横着伸。不解关节角。
 LATCH_GOAL = -1.45
 HINGE_GOAL = 0.40
-# 抓取点在把手根部到末端的这个比例处。
+# 抓取点在把手根部到末端的这个比例处。把手碰撞盒的竖直半厚是 0.02 米。
 GRASP_FRACTION = 0.85
+HANDLE_HALF_THICKNESS = 0.02
 STANDOFF = 0.10
 UNLATCHED = 1.2
 STYLES = (
@@ -86,12 +88,26 @@ class DoorTask:
             "hinge": np.array([anchor[0], anchor[1], handle[2]]),
         }
 
+    def grip_points(self, env, name):
+        """侧抓接触点：target_1 在上、target_2 在下，中点仍是把手的抓取中心。"""
+        if name != "handle":
+            return None
+        center = self.points(env)[name]
+        offset = np.array([0.0, 0.0, HANDLE_HALF_THICKNESS])
+        return center + offset, center - offset
+
     def landmarks(self, env):
         return list(self.points(env).values())
 
     def point_kind(self, name):
         """把手上的抓取点和门板中面上的转轴、铰链是两种量法。"""
         return "door_handle" if name == "handle" else "door_axis"
+
+    def plan_desc(self):
+        return (
+            "reach 步骤里 target_1 是门把手上方的夹爪落点，target_2 是下方落点，都在正面相机图上；"
+            "两落点的中点是抓取位置，连线表示上下合拢方向，turn 的 pivot 仍写对应转轴的像素"
+        )
 
     def point_body(self, env, name):
         """遮挡判定：把手上的抓取点是表面点，不豁免；转轴、铰链贴着各自所属的 body，命中自身不算挡。"""

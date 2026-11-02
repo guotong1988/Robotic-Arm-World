@@ -21,8 +21,9 @@ depth_locate 不用按任务名硬编码；没写或写了不认识的类别时�
 - door_axis、door_handle：Door 的门锁转轴、铰链在门板中面上，把手抓取点在中面前方。
   门几乎侧对相机，水平面求交很不稳（高度差 1 毫米，水平位置差 5 毫米），改用竖直的门板平面。
   门板法向就是模型给的 approach（门锁转轴方向），沿法向投影后最密的一层点是门板朝相机的那面
-- grip：两指落点是一对，用 recover_landings 成对还原。Lift / Stack 用支撑面加方块半高，
-  Nut 用支撑面加半厚，PickPlace 结合物品顶面先验和可见指腹表面确定共同水平面。
+- grip：两指落点是一对。Lift / Stack 用支撑面加方块半高，Nut 用支撑面加半厚，
+  PickPlace 结合物品顶面先验和可见指腹表面确定共同水平面，再由 recover_landings 成对还原。
+  Door 的 reach 是上下侧抓，两个像素分别与同一个把手竖直平面求交，保留三维间距和上下顺序。
 
 所有像素都来自 frontview，定位直接使用这台相机的深度图，不再做跨视图融合。
 """
@@ -284,6 +285,13 @@ def landing_pair_ok(front, back):
     return PAIR_MIN_WIDTH <= width <= PAIR_MAX_WIDTH
 
 
+def side_landing_pair_ok(first, second):
+    """Door 侧抓落点使用三维开度，并要求 target_1 在上、target_2 在下。"""
+    delta = np.asarray(second, dtype=float) - np.asarray(first, dtype=float)
+    width = float(np.linalg.norm(delta))
+    return PAIR_MIN_WIDTH <= width <= PAIR_MAX_WIDTH and float(delta[2]) < -0.5 * width
+
+
 def grip_axis(step):
     """两落点的连线方向，世界系。带 yaw 的步骤按执行时的朝向算
     （夹爪竖直朝下时两指合拢方向就是朝向矩阵第一列），不带 yaw 的默认世界 x 轴。"""
@@ -357,6 +365,32 @@ def recover_landings(pixels, views, image_size, axis=None, plane_offset=None, pl
     if not landing_pair_ok(front, back):
         back = np.array([front[0] - PAIR_FALLBACK, front[1], front[2]], dtype=float)
     return front, back, {"mode": "mono", "method": "surface_or_fallback", "s_back": round(float(s_back), 4)}
+
+
+def recover_side_landings(pixels, views, image_size, approach):
+    """恢复 Door 上下侧抓落点：两条像素射线与同一个把手竖直平面求交。
+
+    不能直接读两个像素的可见表面深度：落点在把手上下表面，背面和门板遮挡会让
+    可见深度不代表接触点。平面量法与单点 door_handle 相同，但两个点共用一次平面估计。
+    """
+    front_px = pixels.get("front")
+    same_px = pixels.get("same")
+    if front_px is None or same_px is None or DEFAULT_CAMERA not in views:
+        raise ParseError("Door 侧抓缺少 frontview 双落点")
+    depth, matrix = views[DEFAULT_CAMERA]
+    center_px = 0.5 * (np.asarray(front_px, dtype=float) + np.asarray(same_px, dtype=float))
+
+    def disk(radius):
+        return backproject_disk(depth, matrix, center_px, radius)
+
+    normal, offset, info = _door_plane(
+        center_px, disk, matrix, image_size, {"normal": np.asarray(approach, dtype=float)}, HANDLE_OFFSET
+    )
+    first = ray_at_plane(front_px, normal, offset, matrix)
+    second = ray_at_plane(same_px, normal, offset, matrix)
+    if not plausible(first) or not plausible(second) or not side_landing_pair_ok(first, second):
+        raise ParseError("Door 侧抓双落点恢复后的间距或上下顺序无效")
+    return first, second, dict(info, mode="mono", method="door_handle_plane", view=DEFAULT_CAMERA)
 
 
 def locate(role, pixel, depth, matrix, image_size, params=None):
@@ -561,12 +595,20 @@ def _recover_for_task(task_name, pixels, views, image_size, axis):
     return first, second, info
 
 
+def _recover_step_pair(task_name, step, pixels, views, image_size, axis):
+    """按步骤选择水平竖抓或 Door 上下侧抓，侧抓不进入水平 yaw 所用的恢复链路。"""
+    if task_name == "door" and step["type"] == "reach":
+        return recover_side_landings(pixels, views, image_size, step["approach"])
+    return _recover_for_task(task_name, pixels, views, image_size, _pair_axis(axis, step))
+
+
 def locate_plan(task_name, subtasks, views, image_size, axis=None):
     """给计划里每一步填上 step["world"]（各像素量出来的世界坐标），execute_plan 直接用。
 
     views 只有 frontview 的 (深度图, 世界到像素矩阵)。
     带 pixel_2 的步骤是两指落点，按 grip 成对还原，同时填 world 的 pixel 和 pixel_2；
-    axis 是落点对连线方向，None 时按步骤的 yaw 算，都没有用世界 x 轴。
+    竖直抓取的 axis 是落点对连线方向，None 时按步骤的 yaw 算，都没有用世界 x 轴；
+    Door reach 改用 approach 定位上下侧抓点，不使用水平 axis。
     返回定位过的点 [{"pixel", "role", "world", "info"}]，同一点只量一次，给统计用；
     落点对多 world_2 和 pixel_2。
     Door 的门板法向取计划里第一个 reach 的 approach。
@@ -611,7 +653,7 @@ def locate_plan(task_name, subtasks, views, image_size, axis=None):
                 if key_pair in seen:
                     first, second = seen[key_pair]
                 else:
-                    first, second, info = _recover_for_task(task_name, pixels, views, image_size, _pair_axis(axis, step))
+                    first, second, info = _recover_step_pair(task_name, step, pixels, views, image_size, axis)
                     if extra:
                         info.update(extra)
                     seen[key_pair] = (first, second)
@@ -671,7 +713,7 @@ def relocate(task_name, subtasks, start, views, image_size, axis=None):
     if role == "grip":
         pixels = grip_pixels(start_step, views)
         try:
-            first, second, info = _recover_for_task(task_name, pixels, views, image_size, _pair_axis(axis, start_step))
+            first, second, info = _recover_step_pair(task_name, start_step, pixels, views, image_size, axis)
         except ValueError:
             return None
         for step, step_role in zip(subtasks[start:], roles[start:]):
