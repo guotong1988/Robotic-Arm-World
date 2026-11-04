@@ -164,9 +164,9 @@ def wrist_yaw(env):
     return WRIST_CENTER - float(np.degrees(q7))
 
 
-def choose_yaws(current, options):
+def choose_yaws(current, options, wrist_safe=WRIST_SAFE):
     """先验知识，不是逆运动学：两指对称，抓取 yaw 加减 180 度是同一种抓法，并躲开手腕限位。
-    options 是每次抓取的 (抓取 yaw, 抓住后再转多少度)。
+    options 是每次抓取的 (抓取 yaw, 抓住后再转多少度)，wrist_safe 可按任务收紧。
     控制器按最短方向转到下一个 yaw，这里顺着计划把手腕的实际转角一路累加。
     先保证手腕不超出安全范围，再挑总转动最少的一组，接近半圈的大转动容易在半路把手臂带偏。
     返回每次抓取的 (抓取 yaw, 转完后的 yaw)，都折到 ±180。"""
@@ -182,7 +182,7 @@ def choose_yaws(current, options):
             worst = max(worst, abs(yaw - WRIST_CENTER))
             travel += abs(step)
             out.append((wrap_angle(grasp, 360.0), wrap_angle(grasp + float(turn), 360.0)))
-        key = (max(0.0, worst - WRIST_SAFE), travel)
+        key = (max(0.0, worst - float(wrist_safe)), travel)
         if best is None or key < best[0]:
             best = (key, out)
     return best[1]
@@ -439,6 +439,9 @@ def prepare_scene(env, task, rng, on_step):
     for _ in range(int(task.settle_steps)):
         obs, _, _, _ = env.step(neutral)
         on_step(obs)
+    begin = getattr(task, "begin_episode", None)
+    if begin is not None:
+        begin(env)
     start, yaw, safe_z = task.start_pose(env, rng)
     hold_ori = rotated_about_z(base_ori, yaw)
     home = np.array(arm_controller(env).ref_pos, dtype=float)
@@ -554,6 +557,9 @@ def run_episode(env, task, episode, rng, style, matrices, image_size, writer=Non
     def on_step(new_obs):
         state["step"] += 1
         state["obs"] = new_obs
+        observe = getattr(task, "observe_episode", None)
+        if observe is not None and state["plan"]:
+            observe(env, state["plan"], state["index"])
 
     obs, hold_ori = prepare_scene(env, task, rng, tick)
     state["obs"] = obs
@@ -591,6 +597,9 @@ def run_episode(env, task, episode, rng, style, matrices, image_size, writer=Non
             break
     state["index"] = len(state["plan"])
     success = bool(task.success(env))
+    accept = getattr(task, "accept_episode", None)
+    if success and accept is not None:
+        success = bool(accept(env, traces))
     failed = [
         "{}#{}({})".format(step["type"], k, step["err_m"])
         for trace in traces

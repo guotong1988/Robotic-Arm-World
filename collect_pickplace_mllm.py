@@ -9,7 +9,8 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
 免得手指碰到旁边的东西；易拉罐旁边有东西时同样按邻居选方向。采集器内部用 yaw 生成两指落点，
 标签不重复写 yaw，执行时由落点连线恢复。
 抓靠上的位置，两个指腹落点的中点已含抓取高度，所以 move_down 的 offset_z 为 0。
-四样都放时，先拿离其他物品最远的那样。
+四样都放时，先拿离其他物品最远的那样。采集全程监控尚未主动搬过的其他物品，
+被推走超过 2 厘米、高度变化超过 2.5 厘米或转动超过 25 度就整条丢弃，即使最后环境判成功也不保存。
 
 输入是一张 frontview RGB，对应样本的 image 字段；指令以一个 <image> 占位开头，
 话术后面带 answer 各字段的说明：
@@ -62,6 +63,10 @@ WALL_HEIGHT = 0.10
 CARRY_MARGIN = 0.05
 # 松爪时物品离格子底面还有这么高，米。
 DROP_HEIGHT = 0.03
+# 非当前物体相对开局被推走或翻倒到这个程度，整条轨迹都不要。
+DISTURB_XY = 0.02
+DISTURB_Z = 0.025
+DISTURB_ANGLE = np.radians(25.0)
 # 默认桌子和两个箱子的中心在 x=0.10。整体向机械臂移近 15 cm，箱子、
 # 物品采样、目标影子和成功判定仍由同一组环境坐标驱动。
 TABLE_FULL_SIZE = (0.39, 0.49, 0.82)
@@ -97,6 +102,8 @@ class PickPlaceTask:
         self.env_name = env_name
         self.task = env_name.lower()
         self._extents = {}
+        self._initial_poses = {}
+        self._disturbed = set()
         self.all_objects = env_name == "PickPlace"
         self.styles = ALL_STYLES if self.all_objects else SINGLE_STYLES
         self.instruction_note = (
@@ -110,6 +117,42 @@ class PickPlaceTask:
             "bin1_pos": BIN1_POS,
             "bin2_pos": BIN2_POS,
         }
+
+    def begin_episode(self, env):
+        """物体落稳后记录基准位姿；之后只监控还没主动搬过的其他物体。"""
+        self._initial_poses = {
+            name: (
+                np.array(env.sim.data.body_xpos[env.obj_body_id[name]], dtype=float),
+                np.array(env.sim.data.body_xmat[env.obj_body_id[name]], dtype=float).reshape(3, 3),
+            )
+            for name in self.active(env)
+        }
+        self._disturbed = set()
+
+    def observe_episode(self, env, plan, index):
+        """当前物品可以被搬动；其他未放置物品一旦被推走或翻倒，就锁存质量失败。"""
+        if not self.all_objects or not self._initial_poses:
+            return
+        current = plan[index].get("obj") if 0 <= index < len(plan) else None
+        placed = set(self.placed(env))
+        for name, (initial_pos, initial_mat) in self._initial_poses.items():
+            if name == current or name in placed or name in self._disturbed:
+                continue
+            body = env.obj_body_id[name]
+            pos = np.asarray(env.sim.data.body_xpos[body], dtype=float)
+            mat = np.asarray(env.sim.data.body_xmat[body], dtype=float).reshape(3, 3)
+            relative = mat @ initial_mat.T
+            angle = float(np.arccos(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)))
+            if (
+                float(np.linalg.norm((pos - initial_pos)[:2])) > DISTURB_XY
+                or abs(float(pos[2] - initial_pos[2])) > DISTURB_Z
+                or angle > DISTURB_ANGLE
+            ):
+                self._disturbed.add(name)
+
+    def accept_episode(self, env, traces):
+        """环境成功之外，还要求抓放过程中没有碰倒或明显推走其他物品。"""
+        return not self._disturbed
 
     def _bin_center(self, env, index):
         """右边箱子第 index 个格子的底面中心。和环境里 target_bin_placements 的算法一致。"""
@@ -394,7 +437,7 @@ class PickPlaceTask:
         return {"placed": self.placed(env)}
 
     def episode_info(self, env):
-        return {"objects": self.active(env)}
+        return {"objects": self.active(env), "undisturbed": True}
 
     def meta_extra(self):
         return {
@@ -405,7 +448,10 @@ class PickPlaceTask:
         }
 
     def describe(self, env):
-        return "placed={}".format("+".join(self.placed(env)) or "-")
+        text = "placed={}".format("+".join(self.placed(env)) or "-")
+        if self._disturbed:
+            text += " disturbed={}".format("+".join(sorted(self._disturbed)))
+        return text
 
 
 TASKS = {name: (lambda name=name: PickPlaceTask(name)) for name in ENVS}

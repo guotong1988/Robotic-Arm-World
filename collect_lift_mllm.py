@@ -8,8 +8,8 @@
 - 输出：一条抓取计划。每个 subtask 带一个 desc，用 20 字以内说明这一步做什么。
   要动位置的步骤带两个夹爪落点的像素，不带深度
 
-落点是两指合拢时贴住方块表面的那两点。两指沿世界 x 轴合拢，一个朝 frontview，一个朝对面。
-target_1 是夹爪1（朝 frontview 那侧）的落点，target_2 是夹爪2（朝后）的落点。
+落点是两指合拢时贴住方块表面的那两点。合拢轴取方块局部 x/y 轴中更接近默认夹爪方向的面法向，
+保证两点连线垂直于对应侧面。target_1 是夹爪1（朝 frontview 那侧）的落点，target_2 是夹爪2（朝后）的落点。
 两个落点都写在正面相机图上。像素 x 向右、y 向下，原点在图像左上角。
 被挡住的落点也根据方块形状和朝向写出像素，不使用 mask。
 评测时模型按同样的格式给出像素，用 frontview 深度还原后做逆运动学。
@@ -31,7 +31,7 @@ target_1 是夹爪1（朝 frontview 那侧）的落点，target_2 是夹爪2（�
 
 每条成功抓取只存开局那一帧（phase 为 initial），不存悬停、下降、合爪、上抬这些中途画面。
 泛化放在开局：方块抽到桌面的不同区域，朝向绕竖直轴随机转；抬升高度在低、中、高三档里抽。
-手臂在写入这一帧之前会先移到随机的水平位置和高度。夹爪竖直朝下，两指沿世界 x 轴合拢。
+手臂在写入这一帧之前会先移到随机的水平位置和高度。夹爪竖直朝下，合拢方向与选中的方块侧面法向对齐。
 
 例如凑满 50 条成功抓取再停，图片和样本写到 data/lift_mllm：
 
@@ -64,7 +64,7 @@ from robosuite.utils.camera_utils import get_camera_transform_matrix
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat2axisangle
 
-from grip_ik import GRIP_YAW, box_contacts, grasp_eef, joint_position_config, pad_offset, topdown_ori
+from grip_ik import GRIP_YAW, box_contacts, closing_yaw, grasp_eef, joint_position_config, pad_offset, topdown_ori
 
 # 存成正着的图。必须在创建环境之前设置，观测相机会按这个约定渲染。
 macros.IMAGE_CONVENTION = "opencv"
@@ -388,12 +388,30 @@ def matrix_to_list(matrix):
     return [[float(value) for value in row] for row in np.asarray(matrix, dtype=float)]
 
 
-def grip_landings(env):
-    """方块前侧和背侧的两个夹爪落点，世界坐标，米。两点在方块表面上，沿世界 x 轴。"""
+def cube_grip_ori(cube_rot, current_ori):
+    """选离当前无向合拢轴更近的方块局部 x/y 面法向，返回统一后的执行朝向和合拢轴。"""
+    current = np.asarray(current_ori, dtype=float)[:, 0].copy()
+    current[2] = 0.0
+    current /= np.linalg.norm(current)
+    rot = np.asarray(cube_rot, dtype=float).reshape(3, 3)
+    scores = [abs(float(np.dot(current, rot[:, index]))) for index in (0, 1)]
+    axis = rot[:, int(np.argmax(scores))].copy()
+    axis[2] = 0.0
+    axis /= np.linalg.norm(axis)
+    if float(np.dot(current, axis)) < 0.0:
+        axis = -axis
+    return topdown_ori(closing_yaw(axis)), axis
+
+
+def grip_landings(env, current_ori=None):
+    """方块两个相对侧面的真实接触点；连线沿侧面法向，而不是固定世界 x 轴。"""
     center = np.array(env.sim.data.body_xpos[env.cube_body_id], dtype=float)
     half = np.asarray(env.cube.size, dtype=float)
     rot = np.array(env.sim.data.body_xmat[env.cube_body_id], dtype=float).reshape(3, 3)
-    return box_contacts(center, half, rot, np.array([1.0, 0.0, 0.0]))
+    if current_ori is None:
+        current_ori = topdown_ori(GRIP_YAW)
+    _, axis = cube_grip_ori(rot, current_ori)
+    return box_contacts(center, half, rot, axis)
 
 
 def plan_desc():
@@ -544,8 +562,8 @@ class DatasetWriter:
         units = {"target_1": "pixel", "target_2": "pixel", "grip_front": "meter", "grip_back": "meter"}
         sources = {
             "cube_pos": "obs['cube_pos']，世界坐标，米",
-            "grip_front": "方块表面朝 +x（frontview）的夹爪落点，世界坐标，米",
-            "grip_back": "方块表面朝 -x（背侧）的夹爪落点，世界坐标，米",
+            "grip_front": "方块所选侧面朝 frontview 的夹爪落点，世界坐标，米",
+            "grip_back": "方块相对侧面背向 frontview 的夹爪落点，世界坐标，米",
             "grip_pixel": "grip_front 投到 frontview 的像素字符串，和 subtasks 里的 target_1 一致",
             "eef_pos": "obs['robot0_eef_pos']",
         }
@@ -564,7 +582,7 @@ class DatasetWriter:
             "units": units,
             "camera_world_to_pixel": {name: matrix_to_list(matrix) for name, matrix in self.world_to_pixel.items()},
             "position_source": sources,
-            "instruction": "指令以一个 <image> 占位开头，和 inputs 里的 frontview 图片对应。话术后面带 answer 各字段的说明（target_1、target_2 是两个夹爪落点）。夹爪不在方块正上方时，指令是先移动到目标上方，再抬剩余高度。对准之后只写剩余高度。lift_height_m 是还要抬的高度，lifted_m 是已经抬起的高度，target_lift_m 是总目标。above_cube 表示末端是否已在方块正上方。方块位置、手臂出发位置和悬停高度每条抓取都会变。夹爪竖直朝下，两指沿世界 x 轴合拢。",
+            "instruction": "指令以一个 <image> 占位开头，和 inputs 里的 frontview 图片对应。话术后面带 answer 各字段的说明（target_1、target_2 是两个夹爪落点）。夹爪不在方块正上方时，指令是先移动到目标上方，再抬剩余高度。对准之后只写剩余高度。lift_height_m 是还要抬的高度，lifted_m 是已经抬起的高度，target_lift_m 是总目标。above_cube 表示末端是否已在方块正上方。方块位置、手臂出发位置和悬停高度每条抓取都会变。夹爪竖直朝下，合拢方向与选中的方块侧面法向对齐。",
             "num_episodes": len(self.episodes),
             "num_discarded_episodes": self.discarded,
             "num_samples": len(self.samples),
@@ -631,7 +649,7 @@ def collect_episode(env, writer, episode, target_lift, style, rng):
     for _ in range(20):
         obs, _, _, _ = env.step(neutral)
     rest_z = positions_from_obs(obs)[0][2]
-    # 指腹中点相对末端的偏移，和开度无关。两指沿世界 x 合拢，一个落点朝前、一个朝后。
+    # 指腹中点相对末端的偏移，和开度无关。初始参考方向沿世界 x，随后对齐方块侧面法向。
     finger_offset = pad_offset(env)
     hold_ori = topdown_ori(GRIP_YAW)
 
@@ -687,18 +705,20 @@ def collect_episode(env, writer, episode, target_lift, style, rng):
     move_until(env, np.array([home[0], home[1], safe_z]), hold_ori, grip=-1.0, pos_tol=0.02, max_steps=80, on_step=tick)
     move_until(env, np.array([start[0], start[1], safe_z]), hold_ori, grip=-1.0, pos_tol=0.02, max_steps=160, on_step=tick)
     obs, _, _ = move_until(env, start, hold_ori, grip=-1.0, pos_tol=0.02, max_steps=80, on_step=tick)
+    cube_rot = np.asarray(env.sim.data.body_xmat[env.cube_body_id], dtype=float).reshape(3, 3)
+    hold_ori, _ = cube_grip_ori(cube_rot, hold_ori)
 
     record(obs, "initial", force=True)
 
     hover_clearance = float(rng.uniform(*HOVER_CLEARANCE))
-    grasp_pos, _ = grasp_eef(*grip_landings(env), finger_offset)
+    grasp_pos, _ = grasp_eef(*grip_landings(env), finger_offset, yaw=closing_yaw(hold_ori[:, 0]))
     hover = grasp_pos + np.array([0.0, 0.0, hover_clearance])
     state["phase"] = "hover"
     obs, hover_ok, hover_err = move_until(
         env, hover, hold_ori, grip=-1.0, pos_tol=0.015, max_steps=160, on_step=on_step
     )
 
-    grasp, _ = grasp_eef(*grip_landings(env), finger_offset)
+    grasp, _ = grasp_eef(*grip_landings(env), finger_offset, yaw=closing_yaw(hold_ori[:, 0]))
     state["phase"] = "grasp"
     obs, grasp_ok, grasp_err = move_until(
         env, grasp, hold_ori, grip=-1.0, pos_tol=0.012, max_steps=120, on_step=on_step

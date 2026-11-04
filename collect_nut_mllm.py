@@ -22,8 +22,9 @@ NutAssemblySquare、NutAssemblyRound（固定一个）。方形螺母套方柱�
 
     {"subtasks": [{"type": "move_above", "desc": "移到方形螺母上方", "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip", "clearance": 0.1}, {"type": "move_down", "desc": "降到把手上方准备夹", "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住把手"}, {"type": "lift", "desc": "抬起方形螺母", "delta_z": 0.25, "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到方柱正上方", "target_1": "[300 250]", "target_kind": "peg", "clearance": 0.05, "yaw": 12, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "move_down", "desc": "把方形螺母套到方柱上", "target_1": "[300 250]", "target_kind": "peg", "offset_z": -0.165, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "open_gripper", "desc": "松爪放下螺母"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[300 250]", "target_kind": "peg", "clearance": 0.06, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
-每条成功轨迹只存开局那一帧。螺母在靠近机械臂的半边桌面上换位置和朝向，
-对应的柱子在远离机械臂的半边换位置，两者保持间隔。中途画面不存。
+每条高质量成功轨迹只存开局那一帧。除环境成功外，所有执行步骤都要到位，
+每个螺母开始套柱前的中心对准误差也不能超过 2.5 厘米，否则整条丢弃。
+螺母在靠近机械臂的半边桌面上换位置和朝向，对应的柱子在远离机械臂的半边换位置，两者保持间隔。中途画面不存。
 
 例如固定采方形螺母，凑满 50 条成功轨迹再停，图片和样本写到 data/mllm：
 
@@ -70,6 +71,10 @@ SEAT_HEIGHT = 0.035
 RETREAT_CLEARANCE = 0.06
 # 运输时把把手转向机器人，最多转这么多度，度。
 MAX_HANDLE_TURN = 120.0
+# Nut 搬运到远端柱顶时收紧腕部裕量，避免选到贴近限位的 ±180° 姿态。
+NUT_WRIST_SAFE = 120.0
+# 套柱下降前，螺母中心相对柱顶的水平偏差超过这个值，即使后来侥幸套上也不保留。
+MAX_PRE_PLACE_XY = 0.025
 SINGLE_STYLES = (
     ("把{0}套到{1}上。", "把手里的{0}套到{1}上。", "{0}已经套好了。"),
     ("将{0}拿起来，套进{1}。", "将拿着的{0}套进{1}。", "{0}已经套在{1}上了。"),
@@ -89,6 +94,7 @@ class NutTask:
     def __init__(self, env_name):
         self.env_name = env_name
         self.task = env_name.lower()
+        self._pre_place_errors = {}
         self.all_nuts = env_name == "NutAssembly"
         self.styles = ALL_STYLES if self.all_nuts else SINGLE_STYLES
         self.instruction_note = (
@@ -98,6 +104,29 @@ class NutTask:
 
     def env_kwargs(self):
         return {}
+
+    def begin_episode(self, env):
+        self._pre_place_errors = {}
+
+    def observe_episode(self, env, plan, index):
+        """记录每个螺母开始沿柱下降前的实际对准误差，只取第一次，避免下降后接触柱子影响统计。"""
+        if not 0 <= index < len(plan):
+            return
+        step = plan[index]
+        name = step.get("obj")
+        if step["type"] != "move_down" or "align_point" not in step or name in self._pre_place_errors:
+            return
+        points = self.points(env)
+        self._pre_place_errors[name] = float(np.linalg.norm(points[name][:2] - points[name + "_peg"][:2]))
+
+    def accept_episode(self, env, traces):
+        """只保留各步到位、且套柱前真正对准的成功轨迹，过滤靠碰撞滑落后侥幸成功的样本。"""
+        reached = all(step["ok"] for trace in traces for step in trace)
+        names = self.active(env)
+        aligned = len(self._pre_place_errors) == len(names) and all(
+            self._pre_place_errors.get(name, np.inf) <= MAX_PRE_PLACE_XY for name in names
+        )
+        return reached and aligned
 
     def vary_initial(self, env, rng):
         """柱子换到远端的不同位置，螺母换到近端，把手朝向随机。方形对方柱、圆形对圆柱不变。"""
@@ -217,7 +246,11 @@ class NutTask:
         table_z = float(env.table_offset[2])
         done = set(self.placed(env))
         names = [name for name in self.active(env) if name not in done]
-        yaws = choose_yaws(wrist_yaw(env), [self.grasp_turn(env, name, points) for name in names])
+        yaws = choose_yaws(
+            wrist_yaw(env),
+            [self.grasp_turn(env, name, points) for name in names],
+            wrist_safe=NUT_WRIST_SAFE,
+        )
         plan = []
         for name, (yaw, carry_yaw) in zip(names, yaws):
             grasp, peg = name + "_grasp", name + "_peg"
@@ -336,7 +369,10 @@ class NutTask:
         return {"placed": self.placed(env)}
 
     def episode_info(self, env):
-        return {"nuts": self.active(env)}
+        return {
+            "nuts": self.active(env),
+            "pre_place_xy_m": {name: round(value, 4) for name, value in self._pre_place_errors.items()},
+        }
 
     def meta_extra(self):
         return {
@@ -346,7 +382,12 @@ class NutTask:
         }
 
     def describe(self, env):
-        return "placed={}".format("+".join(self.placed(env)) or "-")
+        text = "placed={}".format("+".join(self.placed(env)) or "-")
+        if self._pre_place_errors:
+            text += " pre_place={}".format(
+                ",".join("{}:{:.3f}".format(name, value) for name, value in self._pre_place_errors.items())
+            )
+        return text
 
 
 TASKS = {name: (lambda name=name: NutTask(name)) for name in ENVS}

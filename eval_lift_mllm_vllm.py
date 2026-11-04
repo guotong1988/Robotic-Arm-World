@@ -50,6 +50,7 @@ from collect_lift_mllm import (
     STABILIZE_DURATION,
     above_cube,
     arm_controller,
+    cube_grip_ori,
     format_answer,
     format_pixel,
     grip_landings,
@@ -514,7 +515,7 @@ def write_mp4(path, frames, fps=VIDEO_FPS):
     return path
 
 
-def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episode):
+def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episode, axis=None):
     size = camera_size(env)
     images = camera_images(obs, size)
     gt_cube, gt_eef = positions_from_obs(obs)
@@ -544,6 +545,7 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episod
         },
         views,
         size,
+        axis=axis,
         plane_offset=CUBE_HALF_HEIGHT,
     )
     elapsed = time.perf_counter() - started
@@ -574,7 +576,7 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episod
 def prepare_scene(env, rng, on_step=None):
     """和采集脚本一样：方块落地后，手臂先移到随机出发点。这段不交给模型。
 
-    环境用关节位置控制器，移动走逆运动学。夹爪转到两指沿世界 x 合拢。
+    环境用关节位置控制器，移动走逆运动学。初始合拢方向与选中的方块侧面法向对齐。
     """
     if on_step is None:
         on_step = lambda _obs: None
@@ -592,7 +594,9 @@ def prepare_scene(env, rng, on_step=None):
     obs, _, _ = arm.move(np.array([home[0], home[1], safe_z]), ori, -1.0, 0.02, 120, on_step)
     obs, _, _ = arm.move(np.array([start[0], start[1], safe_z]), ori, -1.0, 0.02, 200, on_step)
     obs, _, _ = arm.move(np.asarray(start, dtype=float), ori, -1.0, 0.02, 120, on_step)
-    return obs, arm, rest_z, finger_offset
+    cube_rot = np.asarray(env.sim.data.body_xmat[env.cube_body_id], dtype=float).reshape(3, 3)
+    ori, _ = cube_grip_ori(cube_rot, ori)
+    return obs, arm, rest_z, finger_offset, ori
 
 
 def track(env, target, hold_ori, grip, tol, max_steps, on_step=None):
@@ -666,7 +670,7 @@ def run_episode(env, client, rng, episode, height_min, height_max, oracle, video
 
     record = None
     try:
-        obs, arm, rest_z, finger_offset = prepare_scene(env, rng, on_step)
+        obs, arm, rest_z, finger_offset, initial_ori = prepare_scene(env, rng, on_step)
         gt_cube, gt_eef = positions_from_obs(obs)
         target_lift = float(rng.uniform(height_min, height_max))
         style = INSTRUCTION_STYLES[int(rng.integers(len(INSTRUCTION_STYLES)))]
@@ -691,6 +695,7 @@ def run_episode(env, client, rng, episode, height_min, height_max, oracle, video
                 above,
                 opening_spoken,
                 episode,
+                axis=initial_ori[:, 0],
             )
             if video is not None:
                 video.set_plan(pred["plan"]["subtasks"], obs)

@@ -29,6 +29,7 @@ from robosuite.utils.placement_samplers import UniformRandomSampler
 
 from mllm_dataset import finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
 from collect_common import order_landings_at
+from grip_ik import box_contacts, closing_yaw, topdown_ori
 from collect_lift_mllm import (
     ABOVE_XY_TOL,
     CAMERAS,
@@ -142,6 +143,32 @@ def place_offset(env):
     """绿块中心到红块中心的放置高度。含一点下压，保证接触。"""
     offset = half_z(env.cubeA, 0.02) + half_z(env.cubeB, 0.025) - PLACE_PRESS
     return round(float(offset), 3)
+
+
+def cube_a_geometry(env, half):
+    """红块自身半尺寸和旋转；half 只在没有尺寸信息时作标量兜底。"""
+    size = getattr(env.cubeA, "size", None)
+    half = np.asarray(half if size is None else size, dtype=float)
+    if half.ndim == 0:
+        half = np.repeat(half, 3)
+    body_id = env.sim.model.body_name2id(env.cubeA.root_body)
+    rot = np.asarray(env.sim.data.body_xmat[body_id], dtype=float).reshape(3, 3)
+    return half, rot
+
+
+def cube_grip_ori(cube_rot, current_ori):
+    """选离当前无向合拢轴更近的红块局部 x/y 面法向，返回统一后的执行朝向和合拢轴。"""
+    current = np.asarray(current_ori, dtype=float)[:, 0].copy()
+    current[2] = 0.0
+    current /= np.linalg.norm(current)
+    rot = np.asarray(cube_rot, dtype=float).reshape(3, 3)
+    scores = [abs(float(np.dot(current, rot[:, index]))) for index in (0, 1)]
+    axis = rot[:, int(np.argmax(scores))].copy()
+    axis[2] = 0.0
+    axis /= np.linalg.norm(axis)
+    if float(np.dot(current, axis)) < 0.0:
+        axis = -axis
+    return topdown_ori(closing_yaw(axis)), axis
 
 
 def positions_from_obs(obs):
@@ -288,12 +315,12 @@ def remaining_subtasks(cube_a, cube_b, eef, grip_pixels, pix_b, rest_z, offset, 
 def plan_for(env, obs, rest_z, offset, matrices, style, grasped, done, half, axis, camera_pos):
     """从当前画面生成标注。
 
-    half 是红块半边长，axis 是合拢轴（末端朝向矩阵的第一列）。两指落点贴住红块两侧，
-    target_1 写朝 frontview 那侧，camera_pos 用来排两个落点的先后。
+    axis 是与红块局部面对齐的合拢轴（末端朝向矩阵的第一列）。box_contacts 用真实
+    半尺寸和旋转求两侧表面接触点，target_1 写朝 frontview 那侧，camera_pos 用来排先后。
     """
     cube_a, cube_b, eef = positions_from_obs(obs)
-    side = np.asarray(axis, dtype=float) * float(half)
-    land_1, land_2 = order_landings_at(cube_a, camera_pos, (cube_a + side, cube_a - side))
+    half, rot = cube_a_geometry(env, half)
+    land_1, land_2 = order_landings_at(cube_a, camera_pos, box_contacts(cube_a, half, rot, axis))
     grip_pixels = grip_view_pixels(land_1, land_2, matrices)
     pix_b = format_pixel(project_world(cube_b, matrices[DEFAULT_CAMERA])[0])
     subtasks = remaining_subtasks(cube_a, cube_b, eef, grip_pixels, pix_b, rest_z, offset, grasped, done)
@@ -339,6 +366,8 @@ def prepare_scene(env, rng, on_step=None):
     move_until(env, np.array([home[0], home[1], safe_z]), hold_ori, -1.0, 0.02, 80, on_step)
     move_until(env, np.array([start[0], start[1], safe_z]), hold_ori, -1.0, 0.02, 160, on_step)
     obs, _, _ = move_until(env, start, hold_ori, -1.0, 0.02, 80, on_step)
+    _, cube_rot = cube_a_geometry(env, half_z(env.cubeA, 0.02))
+    hold_ori, _ = cube_grip_ori(cube_rot, hold_ori)
     return obs, hold_ori, rest_z
 
 
