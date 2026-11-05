@@ -62,6 +62,11 @@ VISIBLE_TOLERANCE = 0.005
 BIN_WALL_HEIGHT = 0.10
 # PickPlace 指尖落在物品顶面以下的深度，和采集的 GRASP_DEPTH 一致。
 PICKPLACE_GRASP_DEPTH = 0.03
+# 四样物品的抓取高度都在这个范围；重定位不能落到箱底，也不能在未被触碰时突然换高。
+PICKPLACE_MIN_GRASP_Z = 0.835
+PICKPLACE_MAX_GRASP_Z = 0.96
+PICKPLACE_TALL_GRASP_Z = 0.92
+PICKPLACE_RELOCATE_Z_TOL = 0.03
 # 螺母中心比桌面高这么多，米，约为螺母厚度的一半。
 NUT_HALF_THICKNESS = 0.009
 # Lift / Stack 方块中心比桌面高半个边长。用共同水平面恢复两指落点，
@@ -573,9 +578,10 @@ def _pickplace_plane(pixels, views, image_size):
     except ValueError:
         return visible_z, dict(info, source="visible")
     info["object_plane"] = object_info
-    # 圆柱剪影的深度会偏低；Milk 的尖顶又会让通用中心定位锁到箱壁。
-    # 只有可见面高出顶面估计足够多时才覆盖，普通箱壁遮挡仍用顶面减抓取深度。
-    if visible_z > object_z + 0.045:
+    # Milk / Cereal 的尖顶或遮挡会让通用中心定位锁到箱壁，才用合理高度的可见面纠正。
+    # Bread / Can 不走高物体兜底，避免把邻居或手臂的表面当成它们的抓取面。
+    tall_visible = PICKPLACE_TALL_GRASP_Z <= visible_z <= PICKPLACE_MAX_GRASP_Z
+    if tall_visible and visible_z > object_z + 0.045:
         return visible_z, dict(info, source="visible", object_z=round(object_z, 4))
     return object_z, dict(info, source="object_top", object_z=round(object_z, 4))
 
@@ -700,6 +706,19 @@ def pick_starts(task_name, subtasks):
     return starts
 
 
+def _pickplace_relocate_ok(step, first):
+    """未抓取的物品仍在原支撑面上，拒绝遮挡造成的箱底误检和大幅高度跳变。"""
+    previous = step.get("world", {}).get("pixel")
+    if previous is None:
+        return True
+    old_z = float(np.asarray(previous, dtype=float)[2])
+    new_z = float(np.asarray(first, dtype=float)[2])
+    if not PICKPLACE_MIN_GRASP_Z <= new_z <= PICKPLACE_MAX_GRASP_Z:
+        return False
+    old_valid = PICKPLACE_MIN_GRASP_Z <= old_z <= PICKPLACE_MAX_GRASP_Z
+    return not old_valid or abs(new_z - old_z) <= PICKPLACE_RELOCATE_Z_TOL
+
+
 def relocate(task_name, subtasks, start, views, image_size, axis=None):
     """抓下一个物体前用当前这一帧的深度重新量它：开局时挡在它前面的东西可能已经搬走了。
 
@@ -715,6 +734,8 @@ def relocate(task_name, subtasks, start, views, image_size, axis=None):
         try:
             first, second, info = _recover_step_pair(task_name, start_step, pixels, views, image_size, axis)
         except ValueError:
+            return None
+        if task_name.startswith("pickplace") and not _pickplace_relocate_ok(start_step, first):
             return None
         for step, step_role in zip(subtasks[start:], roles[start:]):
             if step_role.get("pixel") != "grip":

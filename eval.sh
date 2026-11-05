@@ -9,6 +9,10 @@
 # 调试时追加 --fg 前台执行，例如 bash eval.sh fixed --fg，能看到实时输出和退出码。
 # SEED 可换固定初始场景（默认 1000）；ORACLE=1 不连模型，用真值步骤检查深度定位和执行器。
 set -e
+# 容器重建后 /usr/share/glvnd 下可能缺少 NVIDIA 的 EGL vendor 配置，用用户目录副本兜底
+export __EGL_VENDOR_LIBRARY_FILENAMES=${__EGL_VENDOR_LIBRARY_FILENAMES:-/home/duqin.gt/egl_vendor.d/10_nvidia.json:/usr/share/glvnd/egl_vendor.d/50_mesa.json}
+# 多进程并行时 GPU 上的 EGL 会串行化（单步从 14ms 退化到数秒），改用 OSMesa 软件渲染
+export LD_LIBRARY_PATH=/home/duqin.gt/osmesa/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 PY=${PY:-/opt/conda/envs/python3.10.13/bin/python3}
 API_BASE=${API_BASE:-http://127.0.0.1:8000/v1}
 EPISODES=${EPISODES:-20}

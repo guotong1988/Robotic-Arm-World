@@ -72,6 +72,9 @@ WIPE_PRESS = 0.01
 # 两指落点的水平间距必须小于夹爪最大开度；异常点对不能继续取中点执行。
 MIN_GRIP_WIDTH = 0.005
 MAX_GRIP_WIDTH = 0.085
+# Panda 竖直朝下时 q7 约为 45 度减 yaw；等价朝向优先留在安全关节范围内。
+WRIST_CENTER = 45.0
+WRIST_SAFE = 140.0
 # 朝向一次变化超过这个角度时分段插值。目标离当前朝向接近半圈时，
 # 控制器自己选的转向会随一点点误差翻到另一边，把手腕带到关节极限。
 ORI_STEP = 0.15
@@ -440,14 +443,30 @@ def _grip_world(step, landmarks, matrices):
     return first, second
 
 
-def _grip_ori(first, second, current):
-    """由落点连线确定竖直抓取的 yaw；两个对称朝向里选离当前更近的，避免无谓翻转。"""
+def _panda_wrist_yaw(env):
+    """当前第 7 关节对应的竖直夹爪 yaw，保留未折回的关节位置。"""
+    robot = env.robots[0]
+    q7 = float(env.sim.data.qpos[robot._ref_joint_pos_indexes[-1]])
+    return WRIST_CENTER - float(np.degrees(q7))
+
+
+def _grip_ori(first, second, current, wrist_yaw=None):
+    """由落点连线确定 yaw；等价朝向先避开手腕限位，再选转动较小的一个。"""
     axis = np.asarray(second, dtype=float) - np.asarray(first, dtype=float)
     axis[2] = 0.0
     axis /= np.linalg.norm(axis)
     yaw = float(np.degrees(np.arctan2(-axis[0], axis[1])))
     ori = topdown_ori(yaw)
     flipped = topdown_ori(yaw + 180.0)
+    if wrist_yaw is not None:
+        candidates = []
+        for target in (ori, flipped):
+            target_yaw = float(np.degrees(np.arctan2(-target[0, 0], target[1, 0])))
+            travel = (target_yaw - float(wrist_yaw) + 180.0) % 360.0 - 180.0
+            settled = float(wrist_yaw) + travel
+            excess = max(0.0, abs(settled - WRIST_CENTER) - WRIST_SAFE)
+            candidates.append(((excess, abs(travel)), target))
+        return min(candidates, key=lambda item: item[0])[1]
     if float(np.dot(flipped[:, 0], current[:, 0])) > float(np.dot(ori[:, 0], current[:, 0])):
         return flipped
     return ori
@@ -521,7 +540,7 @@ def execute_plan(
                 ori = topdown_ori(step["yaw"])
             elif "pixel_2" in step:
                 first, second = _grip_world(step, landmarks, matrices)
-                ori = _grip_ori(first, second, ori)
+                ori = _grip_ori(first, second, ori, wrist_yaw=_panda_wrist_yaw(env))
             dest = _dest_for(step, landmarks, matrices, grasp_point, grasp_ori, ori)
             target_axis = np.asarray(ori, dtype=float)[:, 0]
             entry["target_pos"] = np.round(dest, 4).tolist()
@@ -640,6 +659,14 @@ def check_parser():
     first, second = _grip_world(pair_step, [], {})
     assert np.allclose(_grip_ori(first, second, topdown_ori(-90.0))[:, 0], [1.0, 0.0, 0.0])
     assert np.allclose(_grip_ori(first, second, topdown_ori(90.0))[:, 0], [-1.0, 0.0, 0.0])
+    unsafe_axis = topdown_ori(-145.0)[:, 0]
+    safe = _grip_ori(
+        np.array([0.0, 0.0, 0.83]),
+        np.array([0.0, 0.0, 0.83]) + 0.04 * unsafe_axis,
+        topdown_ori(-145.0),
+        wrist_yaw=-121.0,
+    )
+    assert np.allclose(safe, topdown_ori(35.0))
     pair_step["world"]["pixel_2"] = np.array([0.2, 0.0, 0.83])
     side_step = {"world": {"pixel": np.array([0.0, 0.0, 1.10]), "pixel_2": np.array([0.0, 0.0, 1.06])}}
     side_first, side_second = _side_grip_world(side_step, [], {})

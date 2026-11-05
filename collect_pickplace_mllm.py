@@ -9,7 +9,7 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
 免得手指碰到旁边的东西；易拉罐旁边有东西时同样按邻居选方向。采集器内部用 yaw 生成两指落点，
 标签不重复写 yaw，执行时由落点连线恢复。
 抓靠上的位置，两个指腹落点的中点已含抓取高度，所以 move_down 的 offset_z 为 0。
-四样都放时，先拿离其他物品最远的那样。采集全程监控尚未主动搬过的其他物品，
+四样都放时，先拿高窄、容易被碰倒的麦片盒，再依次拿离剩余物品最远的那样。采集全程监控尚未主动搬过的其他物品，
 被推走超过 2 厘米、高度变化超过 2.5 厘米或转动超过 25 度就整条丢弃，即使最后环境判成功也不保存。
 
 输入是一张 frontview RGB，对应样本的 image 字段；指令以一个 <image> 占位开头，
@@ -338,7 +338,7 @@ class PickPlaceTask:
         return float(np.degrees(angle)) - 90.0
 
     def order(self, env):
-        """先验知识：先拿离其他物品最远的那样，给后面的抓取留出空隙。"""
+        """先拿走容易在抓取邻居时被碰倒的麦片盒，再拿离剩余物品最远的那样。"""
         points = self.points(env)
         done = set(self.placed(env))
         left = [name for name in self.active(env) if name not in done]
@@ -348,7 +348,7 @@ class PickPlaceTask:
                 others = [np.linalg.norm(points[name][:2] - points[other][:2]) for other in left if other != name]
                 return min(others) if others else 0.0
 
-            best = max(left, key=room)
+            best = "Cereal" if "Cereal" in left else max(left, key=room)
             ordered.append(best)
             left.remove(best)
         return ordered

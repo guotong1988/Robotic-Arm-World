@@ -108,12 +108,24 @@ def _link_dir(found):
     directory = Path.home() / ".cache" / "robo-world-gl"
     directory.mkdir(parents=True, exist_ok=True)
     link = directory / "libOSMesa.so"
-    if not link.is_symlink() and link.exists():
-        link.unlink()
-    if not link.exists() or link.resolve() != path.resolve():
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to(path.resolve())
+    target = path.resolve()
+    try:
+        if link.is_symlink() and link.resolve() == target:
+            return directory
+    except OSError:
+        pass
+    # 并行评测会同时启动多个进程，直接 unlink 会互删，改用临时链接 + 原子替换
+    tmp = directory / "libOSMesa.so.{}".format(os.getpid())
+    try:
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        tmp.symlink_to(target)
+        os.replace(tmp, link)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
     return directory
 
 
