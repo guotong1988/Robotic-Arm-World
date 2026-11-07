@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -48,6 +49,132 @@ def _shared_value(bodies, key):
 def _row_images(row):
     """一条样本引用的 frontview 图片相对路径。"""
     return [row["image"]] if row.get("image") else []
+
+
+def attempt_stats(num_episodes, num_discarded):
+    """原始尝试口径：只有环境成功且质量过滤通过的轨迹计入分子。"""
+    episodes = int(num_episodes)
+    attempts = episodes + int(num_discarded)
+    return {
+        "num_attempts": attempts,
+        "raw_attempt_success_rate": episodes / attempts if attempts else 0.0,
+    }
+
+
+def _validate_row(row, task):
+    if not isinstance(row, dict) or row.get("task") != task:
+        raise ValueError("发布样本的任务归属无效")
+    if row.get("success") is not True:
+        raise ValueError("样本 {} 不是成功且通过质量过滤的轨迹，拒绝发布".format(row.get("id")))
+    sample_id = row.get("id")
+    episode = row.get("episode")
+    if not isinstance(sample_id, str) or not sample_id:
+        raise ValueError("发布数据含无效样本 ID")
+    if not isinstance(episode, int) or isinstance(episode, bool):
+        raise ValueError("样本 {} 的 episode 无效".format(sample_id))
+    answer = row.get("answer")
+    try:
+        body = json.loads(answer) if isinstance(answer, str) else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("样本 {} 的 answer 不是合法 JSON".format(sample_id)) from exc
+    if not isinstance(body, dict) or not isinstance(body.get("subtasks"), list):
+        raise ValueError("样本 {} 的 answer 缺少 subtasks 数组".format(sample_id))
+    images = _row_images(row)
+    if len(images) != 1:
+        raise ValueError("样本 {} 必须引用一张 frontview 图片".format(sample_id))
+    rel = images[0]
+    rel_path = Path(rel)
+    if rel_path.is_absolute() or not rel_path.parts or rel_path.parts[0] != "images" or ".." in rel_path.parts:
+        raise ValueError("样本 {} 的图片路径不安全：{}".format(sample_id, rel))
+    return sample_id, episode, rel
+
+
+def _validate_task_batch(out_dir, task, rows, meta, staging_dir=None, require_attempts=True):
+    """在改动正式文件前校验一个任务的样本、episode、图片和统计。"""
+    if not isinstance(rows, list) or not isinstance(meta, dict):
+        raise ValueError("任务 {} 的发布数据格式无效".format(task))
+    if meta.get("num_samples") != len(rows):
+        raise ValueError("任务 {} 的样本统计与 samples.jsonl 不一致".format(task))
+    entries = meta.get("episodes")
+    if not isinstance(entries, list) or meta.get("num_episodes") != len(entries):
+        raise ValueError("任务 {} 的 episode 统计与 meta 不一致".format(task))
+    sample_ids = set()
+    episode_ids = set()
+    image_paths = set()
+    row_episode_ids = set()
+    episode_sample_counts = {}
+    for row in rows:
+        sample_id, episode, rel = _validate_row(row, task)
+        if sample_id in sample_ids:
+            raise ValueError("样本 ID 重复：{}".format(sample_id))
+        if rel in image_paths:
+            raise ValueError("多个样本引用同一图片：{}".format(rel))
+        sample_ids.add(sample_id)
+        row_episode_ids.add(episode)
+        image_paths.add(rel)
+        episode_sample_counts[episode] = episode_sample_counts.get(episode, 0) + 1
+        source = Path(staging_dir) / Path(rel).name if staging_dir is not None else Path(out_dir) / rel
+        if not source.is_file():
+            raise ValueError("样本 {} 缺少图片：{}".format(sample_id, source))
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("success") is not True:
+            raise ValueError("任务 {} 含未成功 episode，拒绝发布".format(task))
+        episode = entry.get("episode")
+        if not isinstance(episode, int) or isinstance(episode, bool) or episode in episode_ids:
+            raise ValueError("任务 {} 的 meta episode 无效或重复：{}".format(task, episode))
+        episode_ids.add(episode)
+        if "num_samples" in entry and entry["num_samples"] != episode_sample_counts.get(episode, 0):
+            raise ValueError("episode {} 的样本计数与 meta 不一致".format(episode))
+    if episode_ids != row_episode_ids:
+        raise ValueError("任务 {} 的 meta episodes 与样本编号不一致".format(task))
+    discarded = meta.get("num_discarded_episodes")
+    if not isinstance(discarded, int) or isinstance(discarded, bool) or discarded < 0:
+        raise ValueError("任务 {} 的丢弃 episode 统计无效".format(task))
+    if require_attempts or "num_attempts" in meta or "raw_attempt_success_rate" in meta:
+        expected = attempt_stats(len(entries), discarded)
+        attempts = meta.get("num_attempts")
+        rate = meta.get("raw_attempt_success_rate")
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts != expected["num_attempts"]:
+            raise ValueError("任务 {} 的 num_attempts 与成功/丢弃数不一致".format(task))
+        if (
+            not isinstance(rate, (int, float))
+            or isinstance(rate, bool)
+            or not math.isfinite(float(rate))
+            or abs(float(rate) - expected["raw_attempt_success_rate"]) > 1e-12
+        ):
+            raise ValueError("任务 {} 的原始尝试成功率统计无效".format(task))
+
+
+def _validate_unique_rows(rows):
+    sample_ids = set()
+    image_paths = set()
+    for row in rows:
+        task = row.get("task")
+        if not isinstance(task, str) or not task:
+            raise ValueError("发布数据含无效任务名")
+        sample_id, _, rel = _validate_row(row, task)
+        if sample_id in sample_ids:
+            raise ValueError("全数据集样本 ID 重复：{}".format(sample_id))
+        if rel in image_paths:
+            raise ValueError("全数据集多个样本引用同一图片：{}".format(rel))
+        sample_ids.add(sample_id)
+        image_paths.add(rel)
+
+
+def _write_text_atomic(path, text):
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=str(path.parent), prefix=path.name + ".", delete=False
+    )
+    try:
+        with handle:
+            handle.write(text)
+        os.replace(handle.name, str(path))
+    except Exception:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
 
 
 def _prune_images(out_dir, task, merged, dropped_images):
@@ -98,23 +225,23 @@ def _lock_path(out_dir):
     return Path(tempfile.gettempdir()) / "mllm_publish_{}_{}.lock".format(os.getuid(), digest)
 
 
-def publish_task(out_dir, task, samples, task_meta):
-    """写入本任务样本，保留目录里其他任务。返回合并后的样本数。
-
-    多个采集进程并行写同一个 --out，先拿文件锁再读改写，
-    避免 samples.jsonl / meta.json 被并发覆盖丢样本。
-    """
+def publish_task(out_dir, task, samples, task_meta, staging_dir=None):
+    """校验后写入本任务样本，保留其他任务；staging_dir 是待发布图片目录。"""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    with _lock_path(out_dir).open("w") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        except OSError as exc:
-            print("publish_task: 锁文件不支持 flock（{}），不加锁写入".format(exc), flush=True)
-        return _publish_task(out_dir, task, samples, task_meta)
+    try:
+        with _lock_path(out_dir).open("w") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                print("publish_task: 锁文件不支持 flock（{}），不加锁写入".format(exc), flush=True)
+            return _publish_task(out_dir, task, samples, task_meta, staging_dir=staging_dir)
+    finally:
+        if staging_dir is not None and Path(staging_dir).exists():
+            finish_image_staging(out_dir, staging_dir, False)
 
 
-def _publish_task(out_dir, task, samples, task_meta):
+def _publish_task(out_dir, task, samples, task_meta, staging_dir=None):
     jsonl_path = out_dir / "samples.jsonl"
     meta_path = out_dir / "meta.json"
     existing_meta = _read_json(meta_path)
@@ -145,10 +272,6 @@ def _publish_task(out_dir, task, samples, task_meta):
         kept.append(row)
 
     merged = kept + owned
-    with jsonl_path.open("w", encoding="utf-8") as handle:
-        for record in merged:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    _prune_images(out_dir, task, merged, dropped_images)
 
     task_meta = dict(task_meta)
     task_meta["task"] = task
@@ -166,13 +289,32 @@ def _publish_task(out_dir, task, samples, task_meta):
     present = {row.get("task") for row in merged}
     tasks = {name: body for name, body in tasks.items() if name in present}
 
+    # 所有校验必须先于图片移动和正式 JSON 改写，失败时旧数据保持原样。
+    for name, body in tasks.items():
+        task_rows = [row for row in merged if row.get("task") == name]
+        _validate_task_batch(
+            out_dir,
+            name,
+            task_rows,
+            body,
+            staging_dir=staging_dir if name == task else None,
+            require_attempts=name == task,
+        )
+    _validate_unique_rows(merged)
+    if staging_dir is not None:
+        finish_image_staging(out_dir, staging_dir, True)
+    _write_text_atomic(
+        jsonl_path, "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in merged)
+    )
+    _prune_images(out_dir, task, merged, dropped_images)
+
     if len(tasks) <= 1:
         if len(tasks) == 1:
             flat = dict(next(iter(tasks.values())))
         else:
             flat = dict(task_meta)
         flat["num_samples"] = len(merged)
-        meta_path.write_text(json.dumps(flat, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_text_atomic(meta_path, json.dumps(flat, ensure_ascii=False, indent=2))
         return len(merged)
 
     bodies = list(tasks.values())
@@ -183,6 +325,8 @@ def _publish_task(out_dir, task, samples, task_meta):
         },
         "num_samples": len(merged),
         "num_episodes": sum(int(body.get("num_episodes") or 0) for body in bodies),
+        "num_attempts": sum(int(body.get("num_attempts") or 0) for body in bodies),
+        "num_discarded_episodes": sum(int(body.get("num_discarded_episodes") or 0) for body in bodies),
         "tasks": tasks,
     }
     camera = _shared_value(bodies, "camera")
@@ -194,7 +338,8 @@ def _publish_task(out_dir, task, samples, task_meta):
         combined["image_size"] = image_size
     if matrix is not None:
         combined["camera_world_to_pixel"] = matrix
-    meta_path.write_text(json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8")
+    combined.update(attempt_stats(combined["num_episodes"], combined["num_discarded_episodes"]))
+    _write_text_atomic(meta_path, json.dumps(combined, ensure_ascii=False, indent=2))
     return len(merged)
 
 
@@ -210,7 +355,10 @@ def _shard_meta(out_dir, task):
 
 
 def _meta_config(meta):
-    volatile = {"num_episodes", "num_discarded_episodes", "num_samples", "episodes"}
+    volatile = {
+        "num_episodes", "num_discarded_episodes", "num_samples", "episodes",
+        "num_attempts", "raw_attempt_success_rate",
+    }
     return {key: value for key, value in meta.items() if key not in volatile}
 
 
@@ -228,6 +376,7 @@ def merge_task_shards(out_dir, task, shard_dirs, expected_episodes):
     merged_meta = None
     meta_config = None
     discarded = 0
+    attempts = 0
 
     for shard_dir in shard_dirs:
         shard_dir = Path(shard_dir)
@@ -235,6 +384,7 @@ def merge_task_shards(out_dir, task, shard_dirs, expected_episodes):
         if not shard_rows:
             raise ValueError("分片 {} 没有样本，拒绝发布".format(shard_dir))
         meta = _shard_meta(shard_dir, task)
+        _validate_task_batch(shard_dir, task, shard_rows, meta)
         config = _meta_config(meta)
         if meta_config is None:
             merged_meta = dict(meta)
@@ -282,6 +432,7 @@ def merge_task_shards(out_dir, task, shard_dirs, expected_episodes):
             raise ValueError("分片 {} 的 meta episodes 与样本编号不一致".format(shard_dir))
         episodes.extend(shard_meta_episodes)
         discarded += int(meta.get("num_discarded_episodes", 0))
+        attempts += int(meta["num_attempts"])
 
     if len(episode_ids) != int(expected_episodes):
         raise ValueError(
@@ -290,16 +441,19 @@ def merge_task_shards(out_dir, task, shard_dirs, expected_episodes):
     if len(episodes) != len(episode_ids):
         raise ValueError("任务 {} 的 meta episodes 与样本数量不一致".format(task))
 
-    for _, destination in copies:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-    for source, destination in copies:
-        shutil.copy2(source, destination)
+    staging_dir = make_image_staging_dir(out_dir, task + "_merge")
+    for source, _ in copies:
+        shutil.copy2(source, staging_dir / source.name)
     rows.sort(key=lambda row: (row["episode"], row.get("step", 0), row["id"]))
     merged_meta["num_episodes"] = len(episode_ids)
     merged_meta["num_discarded_episodes"] = discarded
     merged_meta["num_samples"] = len(rows)
+    merged_meta.update(attempt_stats(len(episode_ids), discarded))
+    if attempts != merged_meta["num_attempts"]:
+        finish_image_staging(out_dir, staging_dir, False)
+        raise ValueError("任务 {} 的分片尝试数统计不一致".format(task))
     merged_meta["episodes"] = sorted(episodes, key=lambda entry: entry["episode"])
-    return publish_task(out_dir, task, rows, merged_meta)
+    return publish_task(out_dir, task, rows, merged_meta, staging_dir=staging_dir)
 
 
 def main():

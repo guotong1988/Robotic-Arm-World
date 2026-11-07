@@ -48,7 +48,7 @@ import json
 import os
 from pathlib import Path
 
-from mllm_dataset import finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
+from mllm_dataset import attempt_stats, finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
 
 # mjpython 会在子线程建窗口，采集时不要用它。渲染后端要在 import robosuite 之前定好。
 import gl_backend
@@ -588,9 +588,13 @@ class DatasetWriter:
             "num_samples": len(self.samples),
             "episodes": self.episodes,
         }
-        finish_image_staging(self.out_dir, self.image_dir, publish)
+        meta.update(attempt_stats(len(self.episodes), self.discarded))
         if publish:
-            self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
+            self.merged_count = publish_task(
+                self.out_dir, self.task, self.samples, meta, staging_dir=self.image_dir
+            )
+        else:
+            finish_image_staging(self.out_dir, self.image_dir, False)
 
 
 def arm_controller(env):
@@ -804,8 +808,9 @@ def main():
         )
 
     print(
-        "saved {} samples from {} succeeded episodes ({} failed, discarded); {} samples in {}".format(
-            len(writer.samples), successes, writer.discarded, writer.merged_count, writer.out_dir
+        "saved {} samples from {} succeeded episodes ({} failed, discarded); raw {}/{} = {:.1%}; {} samples in {}".format(
+            len(writer.samples), successes, writer.discarded, successes, attempts,
+            successes / attempts if attempts else 0.0, writer.merged_count, writer.out_dir
         )
     )
 

@@ -27,7 +27,7 @@ import robosuite as suite
 import robosuite.macros as macros
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
-from mllm_dataset import finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
+from mllm_dataset import attempt_stats, finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
 from collect_common import order_landings_at
 from grip_ik import box_contacts, closing_yaw, topdown_ori
 from collect_lift_mllm import (
@@ -468,9 +468,13 @@ class DatasetWriter:
             "num_samples": len(self.samples),
             "episodes": self.episodes,
         }
-        finish_image_staging(self.out_dir, self.image_dir, publish)
+        meta.update(attempt_stats(len(self.episodes), self.discarded))
         if publish:
-            self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
+            self.merged_count = publish_task(
+                self.out_dir, self.task, self.samples, meta, staging_dir=self.image_dir
+            )
+        else:
+            finish_image_staging(self.out_dir, self.image_dir, False)
 
 
 def collect_episode(env, writer, episode, style, rng):
@@ -618,8 +622,9 @@ def main():
             )
         )
     print(
-        "saved {} samples from {} succeeded episodes ({} failed, discarded); {} samples in {}".format(
-            len(writer.samples), successes, writer.discarded, writer.merged_count, writer.out_dir
+        "saved {} samples from {} succeeded episodes ({} failed, discarded); raw {}/{} = {:.1%}; {} samples in {}".format(
+            len(writer.samples), successes, writer.discarded, successes, attempts,
+            successes / attempts if attempts else 0.0, writer.merged_count, writer.out_dir
         )
     )
 

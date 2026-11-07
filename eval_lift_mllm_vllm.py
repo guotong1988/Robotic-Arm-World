@@ -16,7 +16,7 @@ vLLM 服务示例：
 3. 只把 frontview RGB 和这条指令放进对话
 4. 只在初始画面问一次模型，取出 target_1 和 target_2 两个夹爪落点的像素；
    背侧落点即使被方块挡住也要根据形状写出像素。抬升高度用指令里已经写明的数字
-5. 用这一帧的深度把像素换成两个落点的世界坐标，背侧落点用附近点云估计深度；
+5. 用这一帧的深度把像素换成两个落点的世界坐标，两条射线与当前可见接触面的水平面求交；
    之后不再问模型。按这两个点做逆运动学：走到落点中点上方、下降、合爪、抬起并稳住
 6. 抓住方块，并且方块抬过桌面 4 厘米，才算成功
 
@@ -67,7 +67,7 @@ from collect_lift_mllm import (
     unproject_pixel,
     world_to_pixel_matrices,
 )
-from depth_locate import CUBE_HALF_HEIGHT, make_views, recover_landings
+from depth_locate import make_views, recover_landings
 from eval_video import EvalVideo
 from grip_ik import GRIP_YAW, IKArm, choose_grasp, grasp_candidates, pad_offset, topdown_ori
 
@@ -546,7 +546,6 @@ def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episod
         views,
         size,
         axis=axis,
-        plane_offset=CUBE_HALF_HEIGHT,
     )
     elapsed = time.perf_counter() - started
     return {

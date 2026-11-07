@@ -7,9 +7,8 @@
    模型写出从这一帧起还要做的全部步骤：空间字段给 frontview 像素，
    抓取步骤给两指落点对（target_1、target_2，target_kind=grip），
    每步带一句 desc
-3. 计划里的像素只用深度相机换成世界坐标（depth_locate）：按像素的角色（模型在计划里
-   用 *_kind 标注的类别优先，没标注按任务和计划结构推断。要抓的物体、格子底面、柱顶、
-   门板上的点、两指落点……）从附近的深度点量出它所在的平面，
+3. 计划里的像素只用当前深度相机换成世界坐标（depth_locate）：模型必须用 *_kind
+   标明当前画面中的目标类别，缺失或未知类别直接拒绝；按类别从附近深度点量出目标平面，
    取视线和平面的交点。标注点常被挡住或在物体内部，所以不直接读该像素的深度；
    两指落点成对还原（grip），执行取两落点的中点，统计误差也用中点配真值
 4. 交给 task_plan.execute_plan，末端用世界坐标 OSC 跟踪，执行中不再问模型；
@@ -248,7 +247,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                     video.set_plan(subtasks, obs)
                 round_rec["steps"] = [step["type"] for step in subtasks]
                 round_rec["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-                points = locate_plan(task.task, subtasks, views, image_size)
+                points = locate_plan(subtasks, views, image_size)
                 round_rec["targets"] = match_targets(points, gt, grip_gt)
                 for target in round_rec["targets"]:
                     print(
@@ -278,7 +277,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                                 target["closing_yaw_err_deg"],
                             )
                         print(message, flush=True)
-                starts = set(pick_starts(task.task, subtasks))
+                starts = set(pick_starts(subtasks))
                 relocated = []
                 grasp_diagnostics = []
                 grasp_context = {"name": None, "offset": None}
@@ -346,7 +345,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                         grasp_snapshot("pre_place", index)
                     if index in starts and "obs" in latest:
                         point = relocate(
-                            task.task, subtasks, index, make_views(env, latest["obs"], matrices), image_size
+                            subtasks, index, make_views(env, latest["obs"], matrices), image_size
                         )
                         if point is not None:
                             relocated.extend(match_targets([point], gt_points(task, env, matrices), grip_gt))

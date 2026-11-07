@@ -51,6 +51,9 @@ launch_task() {
     task=$1
     log_name=$2
     shift 2
+    # 启动本任务前清掉旧分片，避免上次采集残留混入本次合并。
+    rm -rf -- "$SHARDS/$task"
+    mkdir -p "$SHARDS/$task"
     tasks+=("$task")
     base=$((EPISODES / WORKERS))
     extra=$((EPISODES % WORKERS))

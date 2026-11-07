@@ -42,7 +42,7 @@ from collect_lift_mllm import (
     with_views,
     world_to_pixel_matrices,
 )
-from mllm_dataset import finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
+from mllm_dataset import attempt_stats, finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
 from task_plan import (
     LIFT_TOL,
     MOVE_ABOVE_TOL,
@@ -490,9 +490,13 @@ class TaskWriter:
         meta["num_discarded_episodes"] = self.discarded
         meta["num_samples"] = len(self.samples)
         meta["episodes"] = self.episodes
-        finish_image_staging(self.out_dir, self.image_dir, publish)
+        meta.update(attempt_stats(len(self.episodes), self.discarded))
         if publish:
-            self.merged_count = publish_task(self.out_dir, self.task, self.samples, meta)
+            self.merged_count = publish_task(
+                self.out_dir, self.task, self.samples, meta, staging_dir=self.image_dir
+            )
+        else:
+            finish_image_staging(self.out_dir, self.image_dir, False)
 
 
 def task_instruction(task, env, plan, index, style, done):
@@ -682,7 +686,8 @@ def run_collection(task, args):
             )
         )
     print(
-        "saved {} samples from {} succeeded episodes ({} failed, discarded); {} samples in {}".format(
-            len(writer.samples), successes, writer.discarded, writer.merged_count, writer.out_dir
+        "saved {} samples from {} succeeded episodes ({} failed, discarded); raw {}/{} = {:.1%}; {} samples in {}".format(
+            len(writer.samples), successes, writer.discarded, successes, attempts,
+            successes / attempts if attempts else 0.0, writer.merged_count, writer.out_dir
         )
     )

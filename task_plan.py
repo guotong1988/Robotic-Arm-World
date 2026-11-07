@@ -31,7 +31,7 @@ move_above、move_down 的单点目标可以带 yaw：夹爪竖直朝下，两�
 
 每个像素字段还可以带类别：target_kind、align_point_kind、pivot_kind、path_kind，
 注明这个像素指的是哪类东西（object、cube_center、bin、nut、peg、table、door_handle、door_axis、grip）。
-评测按类别选对应的深度量法（depth_locate）；不写时按任务和计划结构推断。
+评测按类别选对应的深度量法（depth_locate）；不写或类别未知时拒绝定位，不按任务猜测。
 """
 
 import json

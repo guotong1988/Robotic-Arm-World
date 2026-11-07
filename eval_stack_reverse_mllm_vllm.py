@@ -288,9 +288,13 @@ def main():
     parser.add_argument("--out", default="data/stack_reverse_eval")
     parser.add_argument("--no-video", action="store_true", help="不把每条测评的 frontview 录成 mp4")
     parser.add_argument("--oracle", action="store_true", help="用反向真值步骤代替模型，检查抓绿放红能否做成")
+    parser.add_argument("--self-test", action="store_true", help="只检查共享解析与定位接口")
     args = parser.parse_args()
 
     check_parser()
+    if args.self_test:
+        print("self-test ok", flush=True)
+        return
     client = None
     if args.oracle:
         print("oracle mode, skip model server", flush=True)

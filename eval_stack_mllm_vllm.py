@@ -10,9 +10,9 @@
    只问一次；指令和采集一样以一个 <image> 占位开头
 3. 模型写出全部步骤：抓哪个像素、抬多高、放到哪个像素、放置高度、松爪、抬开。这些数都来自模型，
    抓红块的步骤给两指落点对（target_1、target_2），放绿块的步骤给绿块中心（target_1）
-4. 每个像素用 frontview 深度图换成世界坐标：放绿块的中心像素走平面量法（视线和
-   「桌面到顶面中点」那个水平面求交）；抓红块的落点对走 recover_landings 成对还原，
-   取两落点的中点执行。不读仿真里的物体位置，不用真值挑物体
+4. 每个像素用当前 frontview 深度图换成世界坐标：单点按当前支撑层和可见顶面定位，
+   双落点与当前可见接触面的共同水平面求交，取两落点的中点执行。
+   不读仿真里的物体位置，不用真值挑物体，也不使用预设方块尺寸
 5. 交给 task_plan.execute_plan，末端用世界坐标 OSC 跟踪，执行过程中不再看图、不再问模型
 6. 以 robosuite 的 Stack 成功判定为准：红块离开桌面、压在绿块上、夹爪已经松开
 
@@ -64,111 +64,15 @@ from eval_lift_mllm_vllm import (
     write_mp4,
 )
 from eval_video import EvalVideo
-from depth_locate import (
-    CUBE_HALF_HEIGHT,
-    backproject_disk,
-    make_views,
-    measure_views,
-    ray_at_height,
-    recover_landings,
-)
-from task_plan import SPATIAL, ParseError, check_parser, execute_plan, parse_plan, plausible, resolve_pixel
+from depth_locate import locate_plan, make_views, ray_at_height
+from task_plan import ParseError, check_parser, execute_plan, parse_plan, resolve_pixel
 
-# 物体顶面取像素附近这个半径里的点，桌面取更大的半径。单位像素，按 512 边长定，其他边长按比例缩放。
-OBJECT_RADIUS = 12
-TABLE_RADIUS = 40
-# 大半径里多数点落在桌面上，取低分位数当桌面高度；小半径里取高分位数当物体顶面。
-TABLE_PERCENTILE = 30
-TOP_PERCENTILE = 95
-# 估出来的物体高度限制在这个范围，米。夹爪或手臂挡在像素附近时不会把目标抬得太离谱。
-MIN_HEIGHT = 0.005
-MAX_HEIGHT = 0.12
 VIDEO_FPS = 20
 
 
-def locate(pixel, depth, matrix, image_size):
-    """模型给的像素换成世界坐标。水平位置完全由像素决定，深度图只给出物体中心的高度。
-
-    放在桌上的物体，中心高度是桌面和顶面的中点。标注里的像素是物体中心的投影，
-    所以像素准的时候，视线和这个水平面的交点就是物体中心。
-    """
-    scale = float(image_size) / 512.0
-    obj = backproject_disk(depth, matrix, pixel, max(2, int(round(OBJECT_RADIUS * scale))))
-    table = backproject_disk(depth, matrix, pixel, max(4, int(round(TABLE_RADIUS * scale))))
-    table_z = float(np.percentile(table[:, 2], TABLE_PERCENTILE))
-    top_z = float(np.percentile(obj[:, 2], TOP_PERCENTILE))
-    height = float(np.clip(top_z - table_z, MIN_HEIGHT, MAX_HEIGHT))
-    world = ray_at_height(pixel, table_z + 0.5 * height, matrix)
-    if not plausible(world):
-        raise ParseError("反投影超出工作空间：{}".format(np.round(world, 4).tolist()))
-    return world, {"table_z": round(table_z, 4), "top_z": round(top_z, 4), "height": round(height, 4)}
-
-
-def spatial_pixels(subtasks):
-    """计划里的 frontview 像素组 (target_1, target_2)，去重保序。"""
-    seen = []
-    keys = set()
-    for step in subtasks:
-        if step["type"] not in SPATIAL:
-            continue
-        first = np.asarray(step["pixel"], dtype=float)
-        key = tuple(np.round(first, 3))
-        if key in keys:
-            continue
-        keys.add(key)
-        second = step.get("pixel_2")
-        seen.append((first, None if second is None else np.asarray(second, dtype=float)))
-    return seen
-
-
 def perceive(subtasks, views, image_size, axis=None):
-    """每个像素各自定位：中心像素走平面量法，两指落点对走 recover_landings 成对还原。
-
-    中心像素直接从 frontview 邻域点云测量支撑面和顶面。
-    定位结果同时写回 step["world"]["pixel"]（落点对还写 world["pixel_2"]，执行取两点中点），
-    execute_plan 直接用；返回的点给统计用，也当 execute_plan 兜底用的 landmarks。
-    axis 是抓取步骤里两落点的连线方向（世界系），stack 用当前保持的 hold_ori 第一列。
-    """
-    points = []
-    by_key = {}
-    for front, front2 in spatial_pixels(subtasks):
-        if front2 is not None:
-            # 两指落点对：成对还原，两点的中点是抓取位置。
-            land_front, land_back, info = recover_landings(
-                {"front": front, "same": front2},
-                views,
-                image_size,
-                axis,
-                plane_offset=CUBE_HALF_HEIGHT,
-            )
-            world = 0.5 * (land_front + land_back)
-            center_pixel, _ = project_world(world, views[DEFAULT_CAMERA][1])
-            point = {
-                "pixel": front,
-                "center_pixel": center_pixel,
-                "world": world,
-                "land_1": land_front,
-                "land_2": land_back,
-                "info": dict(info, kind="grip"),
-            }
-            located = {"pixel": land_front, "pixel_2": land_back}
-        else:
-            # 中心点使用共享的自洽顶面估计：只在中心竖直小柱里找顶面，
-            # 不把旁边手臂的高差点直接当方块顶面。object 两视图独立估计后融合，
-            # 被手臂污染的一路偏高时由共享规则剔除。
-            world, info = measure_views("object", {DEFAULT_CAMERA: front}, views, image_size)
-            point = {"pixel": front, "world": world, "info": dict(info, kind="object")}
-            located = {"pixel": world}
-        points.append(point)
-        by_key[tuple(np.round(front, 3))] = (point, located)
-    for step in subtasks:
-        if step["type"] not in SPATIAL:
-            continue
-        value = step["pixel"]
-        entry = by_key.get(tuple(np.round(np.asarray(value, dtype=float), 3)))
-        if entry is not None:
-            step.setdefault("world", {}).update(entry[1])
-    return points
+    """与其他任务共用当前类别和当前深度定位，不使用固定方块尺寸。"""
+    return locate_plan(subtasks, views, image_size, axis=axis)
 
 
 def nearest_object(pixel, gt_pixels):
@@ -184,14 +88,15 @@ def point_target(point, gt_pix, gt_a, gt_b):
     index, dists = nearest_object(stat_pixel, gt_pix)
     stat_gt = gt_pix[index]
     gt = gt_a if index == 0 else gt_b
-    err = pos_error(point["world"], gt)
+    world = point.get("center_world", point["world"])
+    err = pos_error(world, gt)
     target = {
         "object": "red" if index == 0 else "green",
         "kind": point["info"].get("kind", "object"),
         "pixel": round_pixel(stat_pixel),
         "gt_pixel": round_pixel(stat_gt),
         "pixel_err": round(dists[index], 2),
-        "world": [round(float(v), 4) for v in point["world"]],
+        "world": [round(float(v), 4) for v in world],
         "gt_world": [round(float(v), 4) for v in gt],
         "err_m": {k: round(v, 4) for k, v in err.items()},
         "depth": point["info"],
@@ -209,7 +114,7 @@ def point_target(point, gt_pix, gt_a, gt_b):
         format_pixel(stat_gt),
         format_pixel(stat_pixel),
         format_xyz(gt),
-        format_xyz(point["world"]),
+        format_xyz(world),
         format_err_axes(err),
     )
     return target, line
@@ -291,7 +196,7 @@ def run_episode(env, client, rng, episode, image_size, oracle, video_path=None):
                 env,
                 subtasks,
                 hold_ori,
-                [point["world"] for point in points],
+                [point.get("center_world", point["world"]) for point in points],
                 matrices,
                 grip=-1.0,
                 on_step=on_step,

@@ -64,6 +64,8 @@ def _find_osmesa():
     )
     directories.extend(
         [
+            Path.home() / "osmesa" / "usr" / "lib64",
+            Path.home() / ".cache" / "robo-world-gl",
             Path("/usr/lib64"),
             Path("/usr/lib"),
             Path("/usr/lib/x86_64-linux-gnu"),
