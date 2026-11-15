@@ -31,11 +31,11 @@ def percent(num, den):
 def load_summary(out, dirname):
     path = out / dirname / "summary.json"
     if not path.is_file():
-        return None, "未完成"
+        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8")), ""
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None, "summary.json 无法读取"
+        return None
 
 
 def plan_cell(summary, kind):
@@ -49,39 +49,10 @@ def plan_cell(summary, kind):
     return "{}/{}".format(matched, den)
 
 
-def notes_for(summary, kind, missing_note):
-    if summary is None:
-        return missing_note
-    notes = []
-    if kind == "lift":
-        notes.append("Lift 不比整条计划，成功率就是抓住并抬起的比例")
-        episodes = int(summary["episodes"])
-        successes = int(summary["successes"])
-        grasps = summary.get("grasps")
-        failed = episodes - successes
-        if grasps is not None and failed > 0:
-            grasps = int(grasps)
-            ungrasped = episodes - grasps
-            not_lifted = grasps - successes
-            if not_lifted <= 0:
-                notes.append("失败 {} 条未抓住".format(ungrasped))
-            else:
-                parts = []
-                if ungrasped:
-                    parts.append("未抓住 {} 条".format(ungrasped))
-                if not_lifted:
-                    parts.append("抓住但未抬起 {} 条".format(not_lifted))
-                notes.append("，".join(parts))
-    failures = summary.get("parse_failures") or 0
-    if failures:
-        notes.append("{} 次解析失败".format(int(failures)))
-    return "；".join(notes)
-
-
 def render(out):
     rows = []
     for index, (dirname, title, kind) in enumerate(TASKS):
-        summary, missing_note = load_summary(out, dirname)
+        summary = load_summary(out, dirname)
         if summary is None:
             rows.append({
                 "index": index,
@@ -90,7 +61,6 @@ def render(out):
                 "rate": 0.0,
                 "success": "无结果",
                 "plan": "—",
-                "note": notes_for(None, kind, missing_note),
                 "successes": 0,
                 "episodes": 0,
             })
@@ -108,18 +78,17 @@ def render(out):
             "rate": rate,
             "success": success,
             "plan": plan_cell(summary, kind),
-            "note": notes_for(summary, kind, ""),
             "successes": successes,
             "episodes": episodes,
         })
 
     rows.sort(key=lambda row: (not row["ok"], -row["rate"], row["index"]))
     lines = [
-        "| 任务 | 成功率 | 计划一致 | 备注 |",
-        "| --- | ---: | ---: | --- |",
+        "| 任务 | 成功率 | 计划一致 |",
+        "| --- | ---: | ---: |",
     ]
     for row in rows:
-        lines.append("| {} | {} | {} | {} |".format(row["title"], row["success"], row["plan"], row["note"]))
+        lines.append("| {} | {} | {} |".format(row["title"], row["success"], row["plan"]))
     done = [row for row in rows if row["ok"]]
     total_success = sum(row["successes"] for row in done)
     total_episodes = sum(row["episodes"] for row in done)
