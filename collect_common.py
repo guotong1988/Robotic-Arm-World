@@ -1,7 +1,8 @@
 """PickPlace、NutAssembly、Door、Wipe 共用的采集流程。
 
-每个任务给一份抽象计划。步骤里不写像素，只写引用的点名，比如 "Milk"、"Milk_bin"。
-像素每一帧按当时的位置现算，所以同一份计划在任何一帧都能写成那一帧的 subtasks。
+每个任务给一份抽象计划。步骤里不写像素或 XYZ，只写引用的点名，比如 "Milk"、"Milk_bin"。
+空间标签每一帧按当时的位置现算：pixel 写 frontview 像素，xyz 写机器人基座整数厘米。
+所以同一份计划在任何一帧都能写成那一帧的 subtasks。
 
 采集先按初始画面写出 subtasks，解析后交给 task_plan.execute_plan，和评测是同一个执行器。
 每条成功轨迹只保存开局那一帧（phase 为 initial），标注是从开局起的整条步骤。
@@ -29,8 +30,12 @@ from collect_lift_mllm import (
     CAMERAS,
     DEFAULT_CAMERA,
     arm_controller,
+    capture_camera_images,
+    configure_lazy_camera,
+    format_base_xyz,
     format_pixel,
     grip_view_pixels,
+    grip_view_xyz,
     input_fields,
     matrix_to_list,
     move_until,
@@ -54,6 +59,7 @@ from task_plan import (
     approach_ori,
     execute_plan,
     format_plan,
+    has_second_point,
     parse_plan,
     side_grip_ori,
     topdown_ori,
@@ -104,13 +110,15 @@ def step_desc(task, env, step):
     return COMMON_STEP_DESC.get(step["type"], step["type"])
 
 
-def plan_desc(task):
-    """跟在指令话术后面的字段说明：解释 target_1 等字段。任务实现 plan_desc() 时用自己的（比如两夹爪落点的任务）。"""
+def plan_desc(task, coord_mode="pixel"):
+    """跟在指令话术后面的字段说明；XYZ 模式不再要求深度定位角色。"""
     fn = getattr(task, "plan_desc", None)
     if fn is not None:
-        text = fn()
+        text = fn(coord_mode)
         if text:
             return text
+    if coord_mode == "xyz":
+        return "target_1、align_point、pivot、path 都是机器人基座 XYZ 整数厘米 [x y z]，双落点步骤还写 target_2"
     return "target_1 是要对准的点在正面相机图上的像素"
 
 
@@ -131,16 +139,25 @@ def order_landings(env, center, pair):
     return order_landings_at(center, camera, pair)
 
 
-def answer_spec():
+def answer_spec(coord_mode="pixel"):
     lead = (
         "JSON 字符串。subtasks 是从这一帧还要做的步骤，每个 subtask 的 desc 用 20 字以内说明这一步做什么；"
-        "各字段的含义跟在指令话术后面，不在 answer 里重复。像素都写成 \"[x y]\"，x 向右、y 向下，原点在左上角。"
+        "各字段的含义跟在指令话术后面，不在 answer 里重复。"
     )
-    views = "每个空间字段给 frontview 的像素：target_1 对应 image；align_point、pivot、path 同理。"
+    if coord_mode == "xyz":
+        spatial = (
+            "target_1、target_2、align_point、pivot、path 都写机器人基座 XYZ，格式为整数厘米 \"[x y z]\"；"
+            "不写 target_kind、align_point_kind、pivot_kind、path_kind。"
+            "move_above、move_down、lift、reach、turn、wipe 的其余数值字段沿用原定义。"
+        )
+        return lead + spatial
+    views = "像素都写成 \"[x y]\"，x 向右、y 向下，原点在左上角。每个空间字段给 frontview 的像素：target_1 对应 image；align_point、pivot、path 同理。"
     return lead + views + _ANSWER_KIND
 
 
-def coordinate_frame():
+def coordinate_frame(coord_mode="pixel"):
+    if coord_mode == "xyz":
+        return "subtasks 里的 target_1、target_2、pivot、align_point、path 是机器人基座 XYZ 整数厘米；points 里的 pos 是世界坐标，米"
     return "subtasks 里的 target_1、pivot、align_point、path 是 frontview 像素；points 里的 pos 是世界坐标，米"
 
 
@@ -216,29 +233,39 @@ def point_kind(task, name):
     return fn(name) if fn is not None else None
 
 
-def render_step(task, env, step, points, matrices, eef, eef_ori, current):
+def render_step(task, env, step, points, matrices, eef, eef_ori, current, coord_mode="pixel", grip_yaw=None):
     """抽象步骤写成这一帧的 subtask。current 表示正在做这一步，已经到位就返回 None。
 
-    每个空间字段只写 frontview 像素，被挡住时也根据物体形状写出像素。
-    每个像素字段带 *_kind 类别标注（任务实现 point_kind 时），评测按类别选深度量法。
+    pixel 模式的空间字段写 frontview 像素，被挡住时也根据物体形状写出像素；
+    xyz 模式写机器人基座整数厘米。只有 pixel 写 *_kind，供评测选择深度量法。
     任务实现 grip_points(env, name) 且 name 是夹爪落点时，写 target_1、target_2，
-    target_kind 标 grip，执行器取两点的中点。竖直抓取由两点连线推导 yaw；
-    Door 的 reach 由连线和 approach 构造侧抓姿态。抓取标签不再重复写 yaw。每步带 desc，说明这一步做什么。
+    执行器取两点的中点。pixel 竖直抓取由两点连线推导 yaw；XYZ 可保留抽象计划
+    已避腕部限位的安全 yaw，避免短落点对量化改变朝向。Door 的 reach 始终由连线
+    和 approach 构造侧抓姿态，不写 yaw。每步带 desc，说明这一步做什么。
     """
 
     def put_views(out, key, name):
-        out[key] = format_pixel(project_world(points[name], matrices[DEFAULT_CAMERA])[0])
+        if coord_mode == "xyz":
+            out[key] = format_base_xyz(env, points[name])
+        else:
+            out[key] = format_pixel(project_world(points[name], matrices[DEFAULT_CAMERA])[0])
 
     def put_grip(out, name):
-        """落点型的引用点：写两个夹爪落点在 frontview 上的像素，返回这对世界坐标。"""
+        """落点型的引用点：按 coord_mode 写两个夹爪落点，返回这对世界坐标。"""
         fn = getattr(task, "grip_points", None)
         if fn is None:
             return None
         pair = fn(env, name)
         if pair is None:
             return None
-        out.update(grip_view_pixels(pair[0], pair[1], matrices))
-        out["target_kind"] = "grip"
+        if coord_mode == "xyz":
+            out.update(grip_view_xyz(env, pair[0], pair[1]))
+            if kind != "reach" and grip_yaw is not None:
+                # 短落点对按厘米取整会放大角度误差；沿用抽象计划已避腕部限位的 yaw。
+                out["yaw"] = int(round(float(grip_yaw)))
+        else:
+            out.update(grip_view_pixels(pair[0], pair[1], matrices))
+            out["target_kind"] = "grip"
         return pair
 
     kind = step["type"]
@@ -247,7 +274,7 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
         grip_pair = put_grip(out, step["ref"])
         if grip_pair is None:
             put_views(out, "target_1", step["ref"])
-            ref_kind = point_kind(task, step["ref"])
+            ref_kind = point_kind(task, step["ref"]) if coord_mode == "pixel" else None
             if ref_kind is not None:
                 out["target_kind"] = ref_kind
         if kind == "move_above":
@@ -262,7 +289,7 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
             out["yaw"] = int(round(float(step["yaw"])))
         if "align_point" in step:
             put_views(out, "align_point", step["align_point"])
-            align_point_kind = point_kind(task, step["align_point"])
+            align_point_kind = point_kind(task, step["align_point"]) if coord_mode == "pixel" else None
             if align_point_kind is not None:
                 out["align_point_kind"] = align_point_kind
         if current:
@@ -286,7 +313,7 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
         }
         if put_grip(out, step["ref"]) is None:
             put_views(out, "target_1", step["ref"])
-            ref_kind = point_kind(task, step["ref"])
+            ref_kind = point_kind(task, step["ref"]) if coord_mode == "pixel" else None
             if ref_kind is not None:
                 out["target_kind"] = ref_kind
         return out
@@ -296,7 +323,7 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
         grip_pair = put_grip(out, step["ref"])
         if grip_pair is None:
             put_views(out, "target_1", step["ref"])
-            ref_kind = point_kind(task, step["ref"])
+            ref_kind = point_kind(task, step["ref"]) if coord_mode == "pixel" else None
             if ref_kind is not None:
                 out["target_kind"] = ref_kind
         out["approach"] = _vector(approach)
@@ -316,7 +343,7 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
         put_views(out, "pivot", step["pivot"])
         out["axis"] = _vector(step["axis"])
         out["angle"] = int(round(angle))
-        pivot_kind = point_kind(task, step["pivot"])
+        pivot_kind = point_kind(task, step["pivot"]) if coord_mode == "pixel" else None
         if pivot_kind is not None:
             out["pivot_kind"] = pivot_kind
         return out
@@ -327,10 +354,14 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
         out = {
             "type": "wipe",
             "desc": step_desc(task, env, step),
-            "path": [format_pixel(project_world(points[name], matrices[DEFAULT_CAMERA])[0]) for name in names],
+            "path": [
+                format_base_xyz(env, points[name]) if coord_mode == "xyz"
+                else format_pixel(project_world(points[name], matrices[DEFAULT_CAMERA])[0])
+                for name in names
+            ],
         }
         out["offset_z"] = round(float(step["offset_z"]), 3)
-        path_kind = point_kind(task, names[0])
+        path_kind = point_kind(task, names[0]) if coord_mode == "pixel" else None
         if path_kind is not None:
             out["path_kind"] = path_kind
         return out
@@ -339,7 +370,7 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current):
     return {"type": kind, "desc": step_desc(task, env, step)}
 
 
-def render_plan(task, env, plan, index, matrices, done):
+def render_plan(task, env, plan, index, matrices, done, coord_mode="pixel"):
     """从第 index 步起还要做的 subtasks，以及每条对应抽象计划里的第几步。"""
     if done:
         return [], []
@@ -347,7 +378,19 @@ def render_plan(task, env, plan, index, matrices, done):
     eef, eef_ori = eef_pose(env)
     subtasks, mapping = [], []
     for k in range(int(index), len(plan)):
-        step = render_step(task, env, plan[k], points, matrices, eef, eef_ori, current=(k == index))
+        ref = plan[k].get("ref")
+        grip_yaw = next(
+            (
+                candidate["yaw"]
+                for candidate in plan
+                if candidate.get("ref") == ref and "yaw" in candidate
+            ),
+            None,
+        )
+        step = render_step(
+            task, env, plan[k], points, matrices, eef, eef_ori, current=(k == index), coord_mode=coord_mode,
+            grip_yaw=grip_yaw,
+        )
         if step is not None:
             subtasks.append(step)
             mapping.append(k)
@@ -362,14 +405,14 @@ def attach_execution_world(task, env, abstract, concrete):
     if ref is not None:
         grip_fn = getattr(task, "grip_points", None)
         pair = grip_fn(env, ref) if grip_fn is not None else None
-        if pair is not None and "pixel_2" in concrete:
+        if pair is not None and has_second_point(concrete):
             world["pixel"], world["pixel_2"] = pair
-        elif "pixel" in concrete:
+        elif "pixel" in concrete or "pixel" in concrete.get("base", {}):
             world["pixel"] = points[ref]
     for abstract_key, concrete_key in (("align_point", "align_point"), ("pivot", "pivot")):
-        if abstract_key in abstract and concrete_key in concrete:
+        if abstract_key in abstract and (concrete_key in concrete or concrete_key in concrete.get("base", {})):
             world[concrete_key] = points[abstract[abstract_key]]
-    if abstract["type"] == "wipe" and "path" in concrete:
+    if abstract["type"] == "wipe" and ("path" in concrete or "path" in concrete.get("base", {})):
         world["path"] = [points[name] for name in task.wipe_path(env)]
     if world:
         concrete["world"] = world
@@ -390,7 +433,7 @@ def plan_signature(subtasks):
     return tuple(items)
 
 
-def make_env(task, image_size, seed, use_camera=True, camera_depths=False):
+def make_env(task, image_size, seed, use_camera=True, camera_depths=False, lazy_camera=False):
     kwargs = dict(
         env_name=task.env_name,
         robots="Panda",
@@ -413,12 +456,15 @@ def make_env(task, image_size, seed, use_camera=True, camera_depths=False):
     )
     kwargs.update(task.env_kwargs())
     try:
-        return suite.make(**kwargs)
+        env = suite.make(**kwargs)
     except ImportError as exc:
         text = str(exc)
         if "EGL" in text or "OSMesa" in text or "glGetError" in text:
             raise ImportError(text + "\n\n" + gl_backend.install_hint("离屏渲染初始化失败。")) from exc
         raise
+    if lazy_camera:
+        configure_lazy_camera(env)
+    return env
 
 
 def prepare_scene(env, task, rng, on_step):
@@ -455,11 +501,12 @@ def prepare_scene(env, task, rng, on_step):
 class TaskWriter:
     """样本先缓存在内存里，整条轨迹成功了才写盘。"""
 
-    def __init__(self, out_dir, task, image_size):
+    def __init__(self, out_dir, task, image_size, coord_mode="pixel"):
         self.out_dir = Path(out_dir)
         self.image_dir = make_image_staging_dir(self.out_dir, task)
         self.task = task
         self.image_size = int(image_size)
+        self.coord_mode = coord_mode
         self.samples = []
         self.episodes = []
         self.pending = []
@@ -499,20 +546,24 @@ class TaskWriter:
             finish_image_staging(self.out_dir, self.image_dir, False)
 
 
-def task_instruction(task, env, plan, index, style, done):
+def task_instruction(task, env, plan, index, style, done, coord_mode="pixel"):
     """采集与评测共用同一条指令，避免字段说明只在一边更新。"""
-    return with_views(task.instruction(env, plan, index, style, done), plan_desc(task))
+    return with_views(task.instruction(env, plan, index, style, done), plan_desc(task, coord_mode))
 
 
-def run_episode(env, task, episode, rng, style, matrices, image_size, writer=None, bucket_m=0.02):
+def run_episode(env, task, episode, rng, style, matrices, image_size, writer=None, bucket_m=0.02, coord_mode="pixel"):
     """采一条轨迹。writer 为 None 时只执行、不渲染标注，用来检查计划本身能不能做成。"""
     state = {"step": 0, "index": 0, "plan": [], "obs": None, "last_key": None, "last_step": None}
 
     def label():
         done = bool(task.success(env))
-        subtasks, mapping = render_plan(task, env, state["plan"], state["index"], matrices, done)
+        subtasks, mapping = render_plan(
+            task, env, state["plan"], state["index"], matrices, done, coord_mode=coord_mode
+        )
         # 指令带 <image> 占位、话术后面带字段说明，和训练样本的格式一致。
-        instruction = task_instruction(task, env, state["plan"], state["index"], style, done)
+        instruction = task_instruction(
+            task, env, state["plan"], state["index"], style, done, coord_mode=coord_mode
+        )
         return subtasks, mapping, instruction
 
     def record(phase, force):
@@ -550,6 +601,7 @@ def run_episode(env, task, episode, rng, style, matrices, image_size, writer=Non
             "success": False,
         }
         sample.update(task.record_extra(env))
+        state["obs"] = capture_camera_images(env, state["obs"])
         writer.add(sample, {name: state["obs"][name + "_image"] for name in CAMERAS})
         state["last_key"] = key
         state["last_step"] = state["step"]
@@ -576,7 +628,7 @@ def run_episode(env, task, episode, rng, style, matrices, image_size, writer=Non
         subtasks, mapping, _ = label()
         if not subtasks:
             break
-        parsed = parse_plan(format_plan(subtasks), image_size=image_size)
+        parsed = parse_plan(format_plan(subtasks), image_size=image_size, coord_mode=coord_mode)
         for concrete, abstract_index in zip(parsed["subtasks"], mapping):
             attach_execution_world(task, env, state["plan"][abstract_index], concrete)
 
@@ -621,7 +673,7 @@ def run_episode(env, task, episode, rng, style, matrices, image_size, writer=Non
     return success
 
 
-def task_meta(task, matrices, image_size):
+def task_meta(task, matrices, image_size, coord_mode="pixel"):
     meta = {
         "env": task.env_name,
         "robot": "Panda",
@@ -629,9 +681,10 @@ def task_meta(task, matrices, image_size):
         "cameras": list(CAMERAS),
         "image_size": [int(image_size), int(image_size)],
         "inputs": input_fields(),
-        "output": {"answer": answer_spec()},
+        "output": {"answer": answer_spec(coord_mode)},
         "primitives": list(task.primitives),
-        "coordinate_frame": coordinate_frame(),
+        "coord_mode": coord_mode,
+        "coordinate_frame": coordinate_frame(coord_mode),
         "camera_world_to_pixel": {name: matrix_to_list(matrix) for name, matrix in matrices.items()},
         "instruction": "指令以一个 <image> 占位开头，和 inputs 里的 frontview 图片对应。话术后面带 answer 各字段的说明。" + task.instruction_note,
         "sampling": "每条成功轨迹只保存 phase=initial 的一帧。泛化来自开局布局：物体位置、朝向和目标位置，不存轨迹中途的画面。",
@@ -649,13 +702,17 @@ def add_common_args(parser, default_out):
     parser.add_argument("--episode-stride", type=int, default=1, help="每次尝试后的 episode 编号步长；并行分片使用 worker 总数")
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--bucket-cm", type=float, default=2.0, help="保留参数。现在每条成功轨迹只存开局一帧，不再按位移抽帧")
+    parser.add_argument(
+        "--coord-mode", choices=("pixel", "xyz"), default="pixel",
+        help="空间标签：frontview 像素，或机器人基座 XYZ 整数厘米",
+    )
 
 
 def run_collection(task, args):
     rng = np.random.default_rng(args.seed)
-    env = make_env(task, args.image_size, args.seed, use_camera=True)
+    env = make_env(task, args.image_size, args.seed, use_camera=True, lazy_camera=True)
     matrices = world_to_pixel_matrices(env, args.image_size)
-    writer = TaskWriter(args.out, task.task, args.image_size)
+    writer = TaskWriter(args.out, task.task, args.image_size, args.coord_mode)
     max_attempts = args.max_attempts or args.episodes * 10
     successes = 0
     episode = args.episode_offset
@@ -666,7 +723,8 @@ def run_collection(task, args):
             style = task.styles[int(rng.integers(len(task.styles)))]
             try:
                 success = run_episode(
-                    env, task, episode, rng, style, matrices, args.image_size, writer, args.bucket_cm / 100.0
+                    env, task, episode, rng, style, matrices, args.image_size, writer, args.bucket_cm / 100.0,
+                    coord_mode=args.coord_mode,
                 )
             except ParseError as exc:
                 writer.finish_episode(episode, False)
@@ -677,7 +735,7 @@ def run_collection(task, args):
             attempts += 1
         complete = successes >= args.episodes
     finally:
-        writer.close(task_meta(task, matrices, args.image_size), publish=complete)
+        writer.close(task_meta(task, matrices, args.image_size, args.coord_mode), publish=complete)
         env.close()
     if not complete:
         raise RuntimeError(

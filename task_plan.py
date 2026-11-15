@@ -1,37 +1,38 @@
 """任务无关的执行步骤。
 
 模型看到的是一张 frontview RGB 和一句指令，写出的计划是有顺序的步骤。
-带位置的步骤使用 target_1、align_point、pivot、path 等 frontview 像素。
-夹爪落点是一对：target_1、target_2，两落点的中点才是要到的位置。
+带位置的步骤使用 target_1、align_point、pivot、path 等空间字段：pixel 模式是 frontview 像素，
+XYZ 模式是机器人基座整数厘米。夹爪落点是一对：target_1、target_2，两落点的中点才是要到的位置。
 answer 顶层和每个 subtask 都可以带 desc，是给人看的说明，解析器直接忽略。
 所有任务都只写 subtasks。
 Lift 的每一步指向同一个方块，Stack 先指向红块再指向绿块，执行器不用知道是哪个任务。
 
-评测时用提问这一帧的深度图把计划里的像素换成世界坐标（depth_locate），之后不再改。
-物体随后被抓起来，也不能改用新的位置，否则后半段会指到已经搬走的物体上。
-采集时没有深度图，像素配「离它最近的物体中心」的相机深度反投影。
+pixel 评测用提问这一帧的深度图把像素换成世界坐标（depth_locate）；XYZ 评测直接把基座坐标
+转换为世界坐标，不使用深度。之后不再改。物体随后被抓起来，也不能改用新的位置，否则后半段
+会指到已经搬走的物体上。采集执行直接配合同一份抽象计划的世界真值点。
 
 步骤：
 
-- move_above：到该像素上方，clearance 是相对物体中心再抬高多少，米
-- move_down：降到该像素，offset_z 是相对物体中心的高度，米。抓取是 0，放置要加上被抓物体的高度
+- move_above：到目标点上方，clearance 是相对物体中心再抬高多少，米
+- move_down：降到目标点，offset_z 是相对物体中心的高度，米。抓取是 0，放置要加上被抓物体的高度
 - close_gripper / open_gripper
-- lift：把该像素对应的点再抬高 delta_z，米，夹爪保持闭合
+- lift：把目标点再抬高 delta_z，米，夹爪保持闭合
 - stabilize：停住 duration 秒
 - reach：夹爪沿 approach（世界坐标方向）伸向目标，停在离它 standoff 米处。两指上下合拢；
   Door 双落点的中点是抓取中心，target_1 在上、target_2 在下，连线与 approach 共同确定侧抓姿态
-- turn：夹爪连同手里的东西绕转轴转 angle 度。转轴过 pivot 像素，方向是 axis，右手定则
-- wipe：贴着桌面依次走过 path 里的像素，offset_z 是相对这些点再往下压多少，米
+- turn：夹爪连同手里的东西绕转轴转 angle 度。转轴过 pivot 空间点，方向是 axis，右手定则
+- wipe：贴着桌面依次走过 path 里的空间点，offset_z 是相对这些点再往下压多少，米
 
-move_above、move_down 的单点目标可以带 yaw：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转 yaw 度。
-竖直抓取的双落点目标不写 yaw，由两点水平连线推导；Door reach 不走这条 yaw 路径。
-单点不带 yaw 时保持当前朝向。还可以带 align_point，是手里物体上某一点在提问那一帧的像素。
+move_above、move_down、lift 可以带 yaw：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转 yaw 度。
+竖直抓取的双落点目标通常不写 yaw，由两点水平连线推导；XYZ 整数厘米标签可带安全 yaw，避免短落点对取整改变朝向。Door reach 不走这条 yaw 路径。
+单点不带 yaw 时保持当前朝向。还可以带 align_point，是手里物体上某一点在提问那一帧的空间坐标。
 这时对准目标的是这个点，不是夹爪：合爪时该点相对夹爪的位置，按夹爪之后转过的角度一起转，
 再从目标里减掉。计划开头已经抓着东西时，用开头的夹爪位姿。
 
-每个像素字段还可以带类别：target_kind、align_point_kind、pivot_kind、path_kind，
+pixel 模式的每个空间字段还可以带类别：target_kind、align_point_kind、pivot_kind、path_kind，
 注明这个像素指的是哪类东西（object、cube_center、bin、nut、peg、table、door_handle、door_axis、grip）。
-评测按类别选对应的深度量法（depth_locate）；不写或类别未知时拒绝定位，不按任务猜测。
+深度评测按类别选对应的量法（depth_locate）；不写或类别未知时拒绝定位，不按任务猜测。
+XYZ 模式不经过深度定位，因此不输出这些类别字段。
 """
 
 import json
@@ -44,6 +45,7 @@ from collect_lift_mllm import (
     DEFAULT_CAMERA,
     STABILIZE_DURATION,
     arm_controller,
+    base_to_world,
     hold,
     move_until,
     project_world,
@@ -144,8 +146,29 @@ def parse_pixel(value, image_size):
     return pixel
 
 
+def parse_base_xyz(value, name="target"):
+    """机器人基座 XYZ 标签，单位为厘米；返回米制数组，供刚体变换后执行。"""
+    try:
+        if isinstance(value, str):
+            match = VECTOR_TEXT.match(value.strip())
+            if not match:
+                raise ParseError("{} 应为机器人基座整数厘米 [x y z]".format(name))
+            point = np.array([float(item) for item in match.groups()], dtype=float)
+        elif isinstance(value, (list, tuple)) and len(value) == 3:
+            point = np.array([float(item) for item in value], dtype=float)
+        else:
+            raise ParseError("{} 应为机器人基座整数厘米 [x y z]".format(name))
+    except (TypeError, ValueError) as exc:
+        raise ParseError("{} 不是数字".format(name)) from exc
+    if point.shape != (3,) or not np.all(np.isfinite(point)):
+        raise ParseError("{} 的基座 XYZ 无效".format(name))
+    if np.any(np.abs(point[:2]) > 200.0) or not -200.0 <= point[2] <= 300.0:
+        raise ParseError("{} 的基座 XYZ 超出范围：{}".format(name, point.tolist()))
+    return point / 100.0
+
+
 def parse_vector(value, name):
-    """世界坐标里的方向，长度为 3 的数组，或 \"[x y z]\"。返回单位向量。"""
+    """世界坐标里的方向，长度为 3 的数组，或 "[x y z]"。返回单位向量。"""
     try:
         if isinstance(value, str):
             match = VECTOR_TEXT.match(value.strip())
@@ -208,7 +231,9 @@ def _optional_kind(item, key):
     return value.strip()
 
 
-def _parse_subtasks(items, image_size):
+def _parse_subtasks(items, image_size, coord_mode="pixel"):
+    if coord_mode not in ("pixel", "xyz"):
+        raise ParseError("coord_mode 只能是 pixel 或 xyz")
     if not isinstance(items, list):
         raise ParseError("subtasks 应为数组")
     steps = []
@@ -217,32 +242,39 @@ def _parse_subtasks(items, image_size):
             raise ParseError("子任务缺少 type")
         kind = item["type"]
         step = {"type": kind}
+
+        def put_point(key, value, name):
+            if coord_mode == "xyz":
+                step.setdefault("base", {})[key] = parse_base_xyz(value, name)
+                return True
+            step[key] = parse_pixel(value, image_size)
+            return step[key] is not None
+
         if kind in SPATIAL or kind == "reach":
-            step["pixel"] = parse_pixel(_required_target(item, kind), image_size)
-            if step["pixel"] is None:
+            if not put_point("pixel", _required_target(item, kind), "target_1"):
                 raise ParseError("{} 缺少可见的 target_1 像素".format(kind))
             if "target_2" in item:
                 # 夹爪2落点。两落点的中点是执行目标，见 _dest_for。
-                step["pixel_2"] = parse_pixel(item["target_2"], image_size)
-                if step["pixel_2"] is None:
+                if not put_point("pixel_2", item["target_2"], "target_2"):
                     raise ParseError("{} 缺少可见的 target_2 像素".format(kind))
-            target_kind = _optional_kind(item, "target_kind")
-            if target_kind is not None:
-                step["pixel_kind"] = target_kind
+            if coord_mode == "pixel":
+                target_kind = _optional_kind(item, "target_kind")
+                if target_kind is not None:
+                    step["pixel_kind"] = target_kind
+        if kind in SPATIAL and "yaw" in item:
+            step["yaw"] = _bounded(item["yaw"], -180.0, 180.0, "yaw")
         if kind in ("move_above", "move_down"):
-            if "yaw" in item:
-                step["yaw"] = _bounded(item["yaw"], -180.0, 180.0, "yaw")
             if "align_point" in item or "held" in item:
                 # 新名 align_point；旧数据里的 held 映射到同一套内部字段。
                 value = item["align_point"] if "align_point" in item else item["held"]
-                step["align_point"] = parse_pixel(value, image_size)
-                if step["align_point"] is None:
+                if not put_point("align_point", value, "align_point"):
                     raise ParseError("{} 缺少可见的 align_point 像素".format(kind))
-                align_point_kind = _optional_kind(item, "align_point_kind")
-                if align_point_kind is None:
-                    align_point_kind = _optional_kind(item, "held_kind")
-                if align_point_kind is not None:
-                    step["align_point_kind"] = align_point_kind
+                if coord_mode == "pixel":
+                    align_point_kind = _optional_kind(item, "align_point_kind")
+                    if align_point_kind is None:
+                        align_point_kind = _optional_kind(item, "held_kind")
+                    if align_point_kind is not None:
+                        step["align_point_kind"] = align_point_kind
         if kind == "move_above":
             step["clearance"] = _bounded(item.get("clearance", DEFAULT_CLEARANCE), 0.0, 0.4, "clearance")
         elif kind == "move_down":
@@ -253,24 +285,27 @@ def _parse_subtasks(items, image_size):
             step["approach"] = parse_vector(_required(item, "approach", kind), "approach")
             step["standoff"] = _bounded(item.get("standoff", 0.0), 0.0, 0.3, "standoff")
         elif kind == "turn":
-            step["pivot"] = parse_pixel(_required(item, "pivot", kind), image_size)
-            if step["pivot"] is None:
+            if not put_point("pivot", _required(item, "pivot", kind), "pivot"):
                 raise ParseError("turn 缺少可见的 pivot 像素")
-            pivot_kind = _optional_kind(item, "pivot_kind")
-            if pivot_kind is not None:
-                step["pivot_kind"] = pivot_kind
+            if coord_mode == "pixel":
+                pivot_kind = _optional_kind(item, "pivot_kind")
+                if pivot_kind is not None:
+                    step["pivot_kind"] = pivot_kind
             step["axis"] = parse_vector(_required(item, "axis", kind), "axis")
             step["angle"] = _bounded(_required(item, "angle", kind), -180.0, 180.0, "angle")
         elif kind == "wipe":
             path = _required(item, "path", kind)
             if not isinstance(path, list) or not path:
                 raise ParseError("wipe 的 path 应为非空数组")
-            step["path"] = [parse_pixel(pixel, image_size) for pixel in path]
-            if any(pixel is None for pixel in step["path"]):
-                raise ParseError("wipe 的 path 缺少可见像素")
-            path_kind = _optional_kind(item, "path_kind")
-            if path_kind is not None:
-                step["path_kind"] = path_kind
+            if coord_mode == "xyz":
+                step.setdefault("base", {})["path"] = [parse_base_xyz(point, "path") for point in path]
+            else:
+                step["path"] = [parse_pixel(pixel, image_size) for pixel in path]
+                if any(pixel is None for pixel in step["path"]):
+                    raise ParseError("wipe 的 path 缺少可见像素")
+                path_kind = _optional_kind(item, "path_kind")
+                if path_kind is not None:
+                    step["path_kind"] = path_kind
             step["offset_z"] = _bounded(item.get("offset_z", -WIPE_PRESS), -0.05, 0.05, "offset_z")
         elif kind == "stabilize":
             step["duration"] = _bounded(item.get("duration", STABILIZE_DURATION), 0.0, 5.0, "duration")
@@ -282,8 +317,8 @@ def _parse_subtasks(items, image_size):
     return steps
 
 
-def parse_plan(text, image_size=None):
-    """从模型回答里取出 subtasks。空间步骤解析成像素。"""
+def parse_plan(text, image_size=None, coord_mode="pixel"):
+    """从模型回答里取出 subtasks；空间步骤解析成像素或基座 XYZ 米制坐标。"""
     if not text or not str(text).strip():
         raise ParseError("模型没有返回文本")
     raw = str(text).strip()
@@ -304,7 +339,7 @@ def parse_plan(text, image_size=None):
                 last_error = ParseError("缺少 subtasks")
                 continue
             try:
-                steps = _parse_subtasks(obj["subtasks"], image_size)
+                steps = _parse_subtasks(obj["subtasks"], image_size, coord_mode)
             except ParseError as exc:
                 last_error = exc
                 continue
@@ -315,6 +350,88 @@ def parse_plan(text, image_size=None):
 def format_plan(subtasks):
     """序列化成模型输出的格式。字段说明跟在指令话术后面，不在回答里重复。"""
     return json.dumps({"subtasks": subtasks}, ensure_ascii=False, separators=(", ", ": "))
+
+
+def has_second_point(step):
+    """双落点既可能来自像素解析，也可能已写入 base/world。"""
+    return "pixel_2" in step or "pixel_2" in step.get("base", {}) or "pixel_2" in step.get("world", {})
+
+
+def direct_xyz_points(env, subtasks):
+    """把基座 XYZ（内部为米）直接转成世界坐标，不读取图像、深度或物体真值。
+
+    返回与深度定位统计兼容的点记录；双落点额外保留中点和两指几何。
+    """
+    points = []
+    seen = set()
+
+    def convert(value):
+        world = np.asarray(base_to_world(env, value), dtype=float).reshape(3)
+        if not plausible(world):
+            raise ParseError("基座 XYZ 转换后超出工作空间：{}".format(np.round(world, 4).tolist()))
+        return world
+
+    def add(signature, point):
+        if signature not in seen:
+            seen.add(signature)
+            points.append(point)
+
+    for step_index, step in enumerate(subtasks):
+        base = step.get("base")
+        if not base:
+            continue
+        world = step.setdefault("world", {})
+        for key, value in base.items():
+            if key == "path":
+                world[key] = [convert(point) for point in value]
+            else:
+                world[key] = convert(value)
+        if "pixel" in base:
+            first = world["pixel"]
+            if "pixel_2" in base:
+                second = world["pixel_2"]
+                center = 0.5 * (first + second)
+                signature = ("grip", tuple(np.round(first, 6)), tuple(np.round(second, 6)))
+                add(signature, {
+                    "step_index": step_index,
+                    "role": "grip",
+                    "world": first,
+                    "world_2": second,
+                    "center_world": center,
+                    "land_1": first,
+                    "land_2": second,
+                    "info": {
+                        "method": "direct_base_xyz",
+                        "kind": "grip",
+                        "side": step["type"] == "reach",
+                    },
+                })
+            else:
+                signature = ("pixel", tuple(np.round(first, 6)))
+                add(signature, {
+                    "step_index": step_index,
+                    "role": "any",
+                    "world": first,
+                    "info": {"method": "direct_base_xyz"},
+                })
+        for key, role in (("align_point", "object"), ("pivot", "any")):
+            if key in world:
+                signature = (key, tuple(np.round(world[key], 6)))
+                add(signature, {
+                    "step_index": step_index,
+                    "role": role,
+                    "world": world[key],
+                    "info": {"method": "direct_base_xyz"},
+                })
+        for point in world.get("path", []):
+            signature = ("path", tuple(np.round(point, 6)))
+            add(signature, {
+                "step_index": step_index,
+                "role": "any",
+                "world": point,
+                "info": {"method": "direct_base_xyz"},
+            })
+    return points
 
 
 def resolve_pixel(pixel, landmarks, matrix):
@@ -474,7 +591,7 @@ def _grip_ori(first, second, current, wrist_yaw=None):
 
 def _dest_for(step, landmarks, matrices, grasp_point, grasp_ori, ori):
     world = clip_workspace(step_point(step, "pixel", landmarks, matrices))
-    if "pixel_2" in step:
+    if has_second_point(step):
         # target_1、target_2 是两指合拢时的两个落点，两点的中点才是要到的位置。
         first, second = _grip_world(step, landmarks, matrices)
         world = 0.5 * (clip_workspace(first) + clip_workspace(second))
@@ -486,7 +603,7 @@ def _dest_for(step, landmarks, matrices, grasp_point, grasp_ori, ori):
     else:
         extra = float(step["delta_z"])
     dest = world + np.array([0.0, 0.0, extra])
-    if "align_point" in step:
+    if "align_point" in step or "align_point" in step.get("world", {}) or "align_point" in step.get("base", {}):
         align_point = step_point(step, "align_point", landmarks, matrices)
         dest = dest - align_point_offset(align_point, grasp_point, grasp_ori, ori)
     return clip_workspace(dest)
@@ -538,14 +655,14 @@ def execute_plan(
             if "yaw" in step:
                 # 任务给了明确 yaw 时优先使用，它通常还考虑了手腕限位和后续搬运。
                 ori = topdown_ori(step["yaw"])
-            elif "pixel_2" in step:
+            elif has_second_point(step):
                 first, second = _grip_world(step, landmarks, matrices)
                 ori = _grip_ori(first, second, ori, wrist_yaw=_panda_wrist_yaw(env))
             dest = _dest_for(step, landmarks, matrices, grasp_point, grasp_ori, ori)
             target_axis = np.asarray(ori, dtype=float)[:, 0]
             entry["target_pos"] = np.round(dest, 4).tolist()
             entry["target_yaw_deg"] = round(float(np.degrees(np.arctan2(-target_axis[0], target_axis[1]))), 2)
-            if "pixel_2" in step:
+            if has_second_point(step):
                 first, second = _grip_world(step, landmarks, matrices)
                 entry["grip_width_m"] = round(float(np.linalg.norm((second - first)[:2])), 4)
             if kind == "move_above":
@@ -564,7 +681,7 @@ def execute_plan(
             anchor = dest
             grip = command
         elif kind == "reach":
-            if "pixel_2" in step:
+            if has_second_point(step):
                 first, second = _side_grip_world(step, landmarks, matrices)
                 target = 0.5 * (first + second)
                 ori = side_grip_ori(first, second, step["approach"])
@@ -654,6 +771,33 @@ def check_parser():
     assert np.allclose(others[1]["pixel_2"], [150, 249])
     assert others[2]["pivot_kind"] == "door_axis"
     assert len(others[3]["path"]) == 2
+    xyz = parse_plan(format_plan([
+        {"type": "move_down", "target_1": "[10 -20 83]", "target_2": "[14 -20 83]"},
+        {"type": "lift", "target_1": "[10 -20 83]", "target_2": "[14 -20 83]", "delta_z": 0.1, "yaw": 45},
+        {"type": "move_above", "target_1": "[20 5 84]", "align_point": "[12 -20 83]"},
+        {"type": "turn", "pivot": "[30 0 90]", "axis": [0, 0, 1], "angle": 20},
+        {"type": "wipe", "path": ["[-5 2 82]", "[0 3 82]"]},
+    ]), coord_mode="xyz")["subtasks"]
+    assert np.allclose(xyz[0]["base"]["pixel"], [0.10, -0.20, 0.83])
+    assert np.allclose(xyz[0]["base"]["pixel_2"], [0.14, -0.20, 0.83])
+    assert "pixel" not in xyz[0] and "pixel_kind" not in xyz[0]
+    assert xyz[1]["yaw"] == 45.0
+    assert np.allclose(xyz[2]["base"]["align_point"], [0.12, -0.20, 0.83])
+    assert np.allclose(xyz[3]["base"]["pivot"], [0.30, 0.0, 0.90])
+    assert len(xyz[4]["base"]["path"]) == 2
+    assert has_second_point(xyz[0]) and has_second_point(xyz[1]) and not has_second_point(xyz[2])
+    aligned_step = {
+        "type": "move_above",
+        "world": {
+            "pixel": np.array([0.20, 0.05, 0.95]),
+            "align_point": np.array([0.12, -0.20, 0.83]),
+        },
+        "clearance": 0.1,
+    }
+    aligned_dest = _dest_for(
+        aligned_step, [], {}, np.array([0.10, -0.20, 0.83]), TOPDOWN, TOPDOWN
+    )
+    assert np.allclose(aligned_dest, [0.18, 0.05, 1.05])
     assert np.allclose(topdown_ori(0.0), TOPDOWN)
     pair_step = {"world": {"pixel": np.array([-0.02, 0.0, 0.83]), "pixel_2": np.array([0.02, 0.0, 0.83])}}
     first, second = _grip_world(pair_step, [], {})

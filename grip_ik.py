@@ -154,8 +154,8 @@ def landing_points(center, axis, half_width):
     return [center - axis * float(half_width), center + axis * float(half_width)]
 
 
-def grasp_candidates(points, offset):
-    """两个落点换成末端位姿。返回 [(末端位置, 朝向, yaw)]，yaw 和 yaw + 180 两种。"""
+def grasp_candidates(points, offset, yaw=None):
+    """两个落点换成末端位姿；显式 yaw 可避免整数坐标取整改变合拢方向。"""
     p1, p2 = [np.asarray(point, dtype=float).reshape(3) for point in points]
     axis = p2 - p1
     axis[2] = 0.0
@@ -163,7 +163,8 @@ def grasp_candidates(points, offset):
     if not np.isfinite(width) or width < MIN_GRIP_WIDTH or width > MAX_GRIP_WIDTH:
         raise ValueError("两个落点的水平间距 {:.3f} 米，夹爪夹不了".format(width))
     mid = 0.5 * (p1 + p2)
-    yaw = closing_yaw(axis / width)
+    if yaw is None:
+        yaw = closing_yaw(axis / width)
     out = []
     for candidate in (yaw, yaw + 180.0):
         ori = topdown_ori(wrap_deg(candidate))

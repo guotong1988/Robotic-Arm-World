@@ -6,13 +6,13 @@
 - 指令：夹爪不在方块正上方时，先移动到目标上方，再抬剩余高度；已经对准后只写还要抬多少。
   话术后面带字段说明（target_1、target_2 这些字段各是什么），模型按说明写 answer
 - 输出：一条抓取计划。每个 subtask 带一个 desc，用 20 字以内说明这一步做什么。
-  要动位置的步骤带两个夹爪落点的像素，不带深度
+  要动位置的步骤带两个夹爪落点；pixel 写像素，xyz 写机器人基座 XYZ 整数厘米，不带深度
 
 落点是两指合拢时贴住方块表面的那两点。合拢轴取方块局部 x/y 轴中更接近默认夹爪方向的面法向，
 保证两点连线垂直于对应侧面。target_1 是夹爪1（朝 frontview 那侧）的落点，target_2 是夹爪2（朝后）的落点。
-两个落点都写在正面相机图上。像素 x 向右、y 向下，原点在图像左上角。
+pixel 模式的两个落点都写在正面相机图上，x 向右、y 向下，原点在图像左上角。
 被挡住的落点也根据方块形状和朝向写出像素，不使用 mask。
-评测时模型按同样的格式给出像素，用 frontview 深度还原后做逆运动学。
+pixel 评测用 frontview 深度还原落点；XYZ 评测直接做基座到世界坐标转换，然后做逆运动学。
 
 每条抓取先定一个目标抬升高度。
 某一帧如果方块已经抬起了一段，指令和 lift 的 delta_z 写的都是剩下的高度。
@@ -25,9 +25,11 @@
     <image>
     先移动到目标上方，再将方块向上抬起 14 厘米。回答的 JSON 中，target_1 是夹爪1落点的像素，target_2 是夹爪2落点的像素，都在正面相机图上，两落点的中点是抓取位置。
 
-输出例子（还没抓起、夹爪还在侧面时）：
+输出例子（默认 pixel 模式，还没抓起、夹爪还在侧面时）：
 
     {"subtasks": [{"type": "move_above", "desc": "移到方块正上方", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip"}, {"type": "move_down", "desc": "竖直降到方块处", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip"}, {"type": "close_gripper", "desc": "合爪夹住方块"}, {"type": "lift", "desc": "竖直向上抬起方块", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip", "delta_z": 0.14}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+
+--coord-mode xyz 时，上述落点改为 "[x y z]" 基座整数厘米，并省略 target_kind。
 
 每条成功抓取只存开局那一帧（phase 为 initial），不存悬停、下降、合爪、上抬这些中途画面。
 泛化放在开局：方块抽到桌面的不同区域，朝向绕竖直轴随机转；抬升高度在低、中、高三档里抽。
@@ -44,6 +46,7 @@ samples.jsonl 按任务合并，后跑的采集不会盖掉已经写下的其他
 """
 
 import argparse
+import gc
 import json
 import os
 from pathlib import Path
@@ -61,6 +64,7 @@ import robosuite as suite
 import robosuite.macros as macros
 from robosuite.controllers import load_composite_controller_config
 from robosuite.utils.camera_utils import get_camera_transform_matrix
+from robosuite.utils.mjcf_utils import IMAGE_CONVENTION_MAPPING
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat2axisangle
 
@@ -171,7 +175,7 @@ def cube_placement(seed):
     )
 
 
-def make_env(image_size, seed, camera_depths=False, use_ik=False):
+def make_env(image_size, seed, camera_depths=False, use_ik=False, lazy_camera=False):
     try:
         env = suite.make(
             env_name="Lift",
@@ -198,7 +202,33 @@ def make_env(image_size, seed, camera_depths=False, use_ik=False):
         if "EGL" in text or "OSMesa" in text or "glGetError" in text:
             raise ImportError(text + "\n\n" + gl_backend.install_hint("离屏渲染初始化失败。")) from exc
         raise
+    if lazy_camera:
+        configure_lazy_camera(env)
     return env
+
+
+def configure_lazy_camera(env):
+    """停用逐控制步渲染的相机 Observable，保留记录样本时的手动渲染能力。"""
+    env.use_camera_obs = False
+    for name in CAMERAS:
+        observable = env._observables.get(name + "_image")
+        if observable is not None:
+            observable.set_enabled(False)
+            observable.set_active(False)
+
+
+def capture_camera_images(env, obs):
+    """给按需渲染的采集观测补上当前图像，不改动其他状态观测。"""
+    convention = IMAGE_CONVENTION_MAPPING[macros.IMAGE_CONVENTION]
+    for index, name in enumerate(CAMERAS):
+        image = env.sim.render(
+            camera_name=name,
+            width=env.camera_widths[index],
+            height=env.camera_heights[index],
+            depth=False,
+        )
+        obs[name + "_image"] = image[::convention]
+    return obs
 
 
 # 同一条抓取里说法保持一致，变的是还要再抬的高度。
@@ -305,19 +335,19 @@ def above_cube(eef_pos, cube_pos):
     return float(np.linalg.norm(np.asarray(eef_pos)[:2] - np.asarray(cube_pos)[:2])) <= ABOVE_XY_TOL
 
 
-def instruction_for(style, remaining_m, lifted_m, above):
+def instruction_for(style, remaining_m, lifted_m, above, coord_mode="pixel"):
     unit, fresh, again = style
     spoken = spoken_height(remaining_m, unit)
     if spoken <= 0.0:
-        return with_views(DONE_INSTRUCTION, plan_desc()), 0.0
+        return with_views(DONE_INSTRUCTION, plan_desc(coord_mode)), 0.0
     # 还没对准时后半句用完整抬升说法，避免「再……再……」。
     template = again if above and lifted_m >= 0.005 else fresh
     amount = spoken * 100.0 if unit == "cm" else spoken
     lift_clause = template.format(amount)
     if above:
-        return with_views(lift_clause, plan_desc()), spoken
+        return with_views(lift_clause, plan_desc(coord_mode)), spoken
     body = lift_clause[:-1] if lift_clause.endswith("。") else lift_clause
-    return with_views("先移动到目标上方，再{}。".format(body), plan_desc()), spoken
+    return with_views("先移动到目标上方，再{}。".format(body), plan_desc(coord_mode)), spoken
 
 
 def world_to_pixel_matrices(env, image_size):
@@ -384,6 +414,38 @@ def grip_view_pixels(front, back, matrices):
     }
 
 
+def robot_base_pose(env):
+    """机器人基座在 robosuite 世界坐标系里的位置和朝向。"""
+    body = env.robots[0].robot_model.root_body
+    return (
+        np.array(env.sim.data.get_body_xpos(body), dtype=float, copy=True),
+        np.asarray(env.sim.data.get_body_xmat(body), dtype=float).reshape(3, 3).copy(),
+    )
+
+
+def world_to_base(env, point):
+    """世界坐标（米）转机器人基座坐标（米）。"""
+    pos, mat = robot_base_pose(env)
+    return mat.T @ (np.asarray(point, dtype=float).reshape(3) - pos)
+
+
+def base_to_world(env, point):
+    """机器人基座坐标（米）转执行器使用的世界坐标（米）。"""
+    pos, mat = robot_base_pose(env)
+    return pos + mat @ np.asarray(point, dtype=float).reshape(3)
+
+
+def format_base_xyz(env, point):
+    """基座 XYZ 标签：厘米、四舍五入到整数，格式为 \"[x y z]\"。"""
+    coords = " ".join(str(int(np.rint(value * 100.0))) for value in world_to_base(env, point))
+    return "[{}]".format(coords)
+
+
+def grip_view_xyz(env, front, back):
+    """两个夹爪落点的机器人基座 XYZ 整数厘米标签。"""
+    return {"target_1": format_base_xyz(env, front), "target_2": format_base_xyz(env, back)}
+
+
 def matrix_to_list(matrix):
     return [[float(value) for value in row] for row in np.asarray(matrix, dtype=float)]
 
@@ -414,24 +476,26 @@ def grip_landings(env, current_ori=None):
     return box_contacts(center, half, rot, axis)
 
 
-def plan_desc():
+def plan_desc(coord_mode="pixel"):
+    if coord_mode == "xyz":
+        return (
+            "target_1、target_2 是两个夹爪落点的机器人基座 XYZ 坐标，格式为整数厘米 [x y z]；"
+            "两落点的中点是抓取位置，不需要 target_kind"
+        )
     return (
         "target_1 是夹爪1落点的像素，target_2 是夹爪2落点的像素，都在正面相机图上；"
         "target_2 被方块挡住时也根据方块形状和朝向补出它的像素，不写 mask。两落点的中点是抓取位置"
     )
 
 
-def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels):
-    """从当前画面接着做的步骤。已经做完的不再写入。落点像素写在要动位置的步骤上。
-
-    pixels 是 grip_view_pixels 的返回：{"target_1", ...}，值是 frontview 的 "[x y]"，键序就是写出顺序。
-    每步带 desc，说明这一步做什么。
-    """
+def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels, coord_mode="pixel"):
+    """从当前画面接着做的步骤。已经做完的不再写入。空间标签写在要动位置的步骤上。"""
 
     def spatial(step):
         step["desc"] = STEP_DESC[step["type"]]
         step.update(pixels)
-        step["target_kind"] = "grip"
+        if coord_mode == "pixel":
+            step["target_kind"] = "grip"
         return step
 
     subtasks = []
@@ -450,8 +514,8 @@ def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels):
     return subtasks
 
 
-def format_answer(pixels, cube_pos, eef_pos, phase, above, delta_z):
-    """MLLM 要生成的抓取计划。要动位置的步骤带两个夹爪落点的像素，delta_z 是还要抬的高度；字段含义在指令里。"""
+def format_answer(pixels, cube_pos, eef_pos, phase, above, delta_z, coord_mode="pixel"):
+    """MLLM 要生成的抓取计划。要动位置的步骤带两个夹爪落点，delta_z 是还要抬的高度。"""
     plan = {
         "subtasks": build_subtasks(
             phase,
@@ -460,6 +524,7 @@ def format_answer(pixels, cube_pos, eef_pos, phase, above, delta_z):
             np.asarray(cube_pos, dtype=float)[2],
             delta_z,
             pixels,
+            coord_mode,
         ),
     }
     return json.dumps(plan, ensure_ascii=False, separators=(", ", ": "))
@@ -485,13 +550,14 @@ def save_rgb(path, image):
 
 
 class DatasetWriter:
-    def __init__(self, out_dir, image_size, env):
+    def __init__(self, out_dir, image_size, env, coord_mode="pixel"):
         self.out_dir = Path(out_dir)
         self.image_dir = make_image_staging_dir(self.out_dir, "lift")
         self.jsonl_path = self.out_dir / "samples.jsonl"
         self.meta_path = self.out_dir / "meta.json"
         self.image_size = image_size
         self.env = env
+        self.coord_mode = coord_mode
         self.world_to_pixel = world_to_pixel_matrices(env, image_size)
         self.task = "lift"
         self.samples = []
@@ -504,7 +570,10 @@ class DatasetWriter:
         """先缓存在内存里，等这条轨迹成功了才写盘。"""
         cube_pos, eef_pos = positions_from_obs(obs)
         front, back = grip_landings(self.env)
-        pixels = grip_view_pixels(front, back, self.world_to_pixel)
+        if self.coord_mode == "xyz":
+            pixels = grip_view_xyz(self.env, front, back)
+        else:
+            pixels = grip_view_pixels(front, back, self.world_to_pixel)
         cube_pos = [round(float(value), 4) for value in cube_pos]
         eef_pos = [round(float(value), 4) for value in eef_pos]
         sample_id = make_sample_id(self.task, episode, phase, step)
@@ -525,12 +594,13 @@ class DatasetWriter:
             "cube_pos": cube_pos,
             "grip_front": [round(float(value), 4) for value in front],
             "grip_back": [round(float(value), 4) for value in back],
-            "grip_pixel": pixels["target_1"],
             "eef_pos": eef_pos,
-            "answer": format_answer(pixels, cube_pos, eef_pos, phase, above, lift_height),
+            "answer": format_answer(pixels, cube_pos, eef_pos, phase, above, lift_height, self.coord_mode),
             "success": False,
         }
-        record["grip_pixel_2"] = pixels["target_2"]
+        if self.coord_mode == "pixel":
+            record["grip_pixel"] = pixels["target_1"]
+            record["grip_pixel_2"] = pixels["target_2"]
         rgbs = {name: np.array(obs[name + "_image"], copy=True) for name in CAMERAS}
         self.pending.append((record, rgbs))
         return record
@@ -558,16 +628,22 @@ class DatasetWriter:
             "要动位置的步骤带 target_1 和 target_2，都是 frontview 的整数像素，形如 \"[x y]\"，x 向右、y 向下，原点在图像左上角。"
             "target_1 是朝向相机的落点，target_2 是方块背面的落点，挡住了也照写。" + desc_note
         )
-        frame = "target_1、target_2 都是 frontview 像素。grip_front、grip_back 是两个落点的世界坐标，米"
-        units = {"target_1": "pixel", "target_2": "pixel", "grip_front": "meter", "grip_back": "meter"}
+        if self.coord_mode == "xyz":
+            pixels = "要动位置的步骤带 target_1 和 target_2，都是机器人基座 XYZ 整数厘米，形如 \"[x y z]\"；不写 target_kind。" + desc_note
+            frame = "target_1、target_2 是机器人基座坐标，整数厘米。grip_front、grip_back 是两个落点的世界坐标，米"
+            units = {"target_1": "centimeter", "target_2": "centimeter", "grip_front": "meter", "grip_back": "meter"}
+        else:
+            frame = "target_1、target_2 都是 frontview 像素。grip_front、grip_back 是两个落点的世界坐标，米"
+            units = {"target_1": "pixel", "target_2": "pixel", "grip_front": "meter", "grip_back": "meter"}
         sources = {
             "cube_pos": "obs['cube_pos']，世界坐标，米",
             "grip_front": "方块所选侧面朝 frontview 的夹爪落点，世界坐标，米",
             "grip_back": "方块相对侧面背向 frontview 的夹爪落点，世界坐标，米",
-            "grip_pixel": "grip_front 投到 frontview 的像素字符串，和 subtasks 里的 target_1 一致",
             "eef_pos": "obs['robot0_eef_pos']",
         }
-        sources["grip_pixel_2"] = "grip_back 投到 frontview 的像素字符串，和 subtasks 里的 target_2 一致。这个点常被方块挡住"
+        if self.coord_mode == "pixel":
+            sources["grip_pixel"] = "grip_front 投到 frontview 的像素字符串，和 subtasks 里的 target_1 一致"
+            sources["grip_pixel_2"] = "grip_back 投到 frontview 的像素字符串，和 subtasks 里的 target_2 一致。这个点常被方块挡住"
         meta = {
             "env": "Lift",
             "robot": "Panda",
@@ -576,8 +652,9 @@ class DatasetWriter:
             "image_size": [self.image_size, self.image_size],
             "inputs": input_fields(),
             "output": {
-                "answer": "JSON 字符串。subtasks 按顺序可能包含 move_above、move_down、close_gripper、lift（delta_z 为剩余抬升，米）、stabilize（duration 0.5 秒），每个 subtask 的 desc 用 20 字以内说明这一步做什么。" + pixels + "各空间步骤还带 target_kind，固定为 grip（夹爪落点，不是方块中心）。已经完成的步骤不写。抬到目标高度后 subtasks 为空。",
+                "answer": "JSON 字符串。subtasks 按顺序可能包含 move_above、move_down、close_gripper、lift（delta_z 为剩余抬升，米）、stabilize（duration 0.5 秒），每个 subtask 的 desc 用 20 字以内说明这一步做什么。" + pixels + ("已经完成的步骤不写。抬到目标高度后 subtasks 为空。" if self.coord_mode == "xyz" else "各空间步骤还带 target_kind，固定为 grip（夹爪落点，不是方块中心）。已经完成的步骤不写。抬到目标高度后 subtasks 为空。"),
             },
+            "coord_mode": self.coord_mode,
             "coordinate_frame": frame,
             "units": units,
             "camera_world_to_pixel": {name: matrix_to_list(matrix) for name, matrix in self.world_to_pixel.items()},
@@ -663,7 +740,7 @@ def collect_episode(env, writer, episode, target_lift, style, rng):
         cube_pos, eef_pos = positions_from_obs(current_obs)
         lifted, remaining = remaining_lift(cube_pos[2], rest_z, target_lift)
         above = above_cube(eef_pos, cube_pos)
-        instruction, spoken = instruction_for(style, remaining, lifted, above)
+        instruction, spoken = instruction_for(style, remaining, lifted, above, writer.coord_mode)
         xy_cm = int(np.rint(np.linalg.norm(eef_pos[:2] - cube_pos[:2]) * 100.0))
         z_cm = int(np.rint(eef_pos[2] * 100.0))
         # 靠近看水平距离，下降和上抬看末端高度，避免同一种画面存太多张。
@@ -678,6 +755,7 @@ def collect_episode(env, writer, episode, target_lift, style, rng):
             return None
         if not force and key == state["last_key"]:
             return None
+        current_obs = capture_camera_images(env, current_obs)
         sample = writer.add(
             episode,
             state["step"],
@@ -770,13 +848,14 @@ def main():
     parser.add_argument("--episode-offset", type=int, default=0, help="首个 episode 编号；并行分片时用不同偏移避免样本 ID 冲突")
     parser.add_argument("--episode-stride", type=int, default=1, help="每次尝试后的 episode 编号步长；并行分片使用 worker 总数")
     parser.add_argument("--image-size", type=int, default=1024)
+    parser.add_argument("--coord-mode", choices=("pixel", "xyz"), default="pixel", help="空间标签：frontview 像素，或机器人基座 XYZ 整数厘米")
     parser.add_argument("--height-min", type=float, default=0.06, help="抬升高度下限，米")
     parser.add_argument("--height-max", type=float, default=0.18, help="抬升高度上限，米")
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    env = make_env(args.image_size, args.seed)
-    writer = DatasetWriter(args.out, args.image_size, env)
+    env = make_env(args.image_size, args.seed, lazy_camera=True)
+    writer = DatasetWriter(args.out, args.image_size, env, args.coord_mode)
     max_attempts = args.max_attempts or args.episodes * 10
     successes = 0
     episode = args.episode_offset
@@ -796,6 +875,8 @@ def main():
             successes += int(success)
             episode += args.episode_stride
             attempts += 1
+            # 每条轨迹的闭包会形成循环引用，不主动回收时进程内存按约 400MB/条持续上涨。
+            gc.collect()
         complete = successes >= args.episodes
     finally:
         writer.close(publish=complete)

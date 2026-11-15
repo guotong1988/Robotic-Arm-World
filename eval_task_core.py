@@ -4,21 +4,22 @@
 
 1. 按 collect_common 的方式摆好场景，手臂移到随机出发点（和采集同一个 prepare_scene）
 2. 指令以一个 <image> 占位开头（图走 image_url），话术后面带字段说明；
-   模型写出从这一帧起还要做的全部步骤：空间字段给 frontview 像素，
-   抓取步骤给两指落点对（target_1、target_2，target_kind=grip），
-   每步带一句 desc
-3. 计划里的像素只用当前深度相机换成世界坐标（depth_locate）：模型必须用 *_kind
+   模型写出从这一帧起还要做的全部步骤：空间字段给 frontview 像素或机器人基座 XYZ 整数厘米，
+   抓取步骤给两指落点对（target_1、target_2），每步带一句 desc
+3. pixel 模式只用当前深度相机换成世界坐标（depth_locate）：模型必须用 *_kind
    标明当前画面中的目标类别，缺失或未知类别直接拒绝；按类别从附近深度点量出目标平面，
-   取视线和平面的交点。标注点常被挡住或在物体内部，所以不直接读该像素的深度；
-   两指落点成对还原（grip），执行取两落点的中点，统计误差也用中点配真值
+   取视线和平面的交点。标注点常被挡住或在物体内部，所以不直接读该像素的深度。
+   XYZ 模式不使用深度或 *_kind，直接做基座到世界坐标转换。
+   两指落点成对处理，执行取两落点的中点，统计误差也用中点配真值
 4. 交给 task_plan.execute_plan，末端用世界坐标 OSC 跟踪，执行中不再问模型；
-   多物体时每抓下一个之前用当前帧的深度重量它（开局挡在它前面的物体可能已经搬走）
+   pixel 多物体时每抓下一个之前用当前帧的深度重量它（开局挡在它前面的物体可能已经搬走），
+   XYZ 多物体始终直接使用计划中的三维坐标
 5. 没做成且任务允许多轮（Wipe 会漏几个点），按当前画面重新问一次，只做剩下的
 6. 以 env._check_success 判定成功
 
-仿真真值只用于事后统计像素和世界误差，不进模型输入，也不参与定位和控制。
---oracle 用真值步骤代替模型回答，其余流程不变，用来确认深度定位和执行器本身够用。
-录像使用 frontview 单画面，标出模型回答的原始像素，不叠加深度点云。
+仿真真值只用于 --oracle 和事后统计坐标误差，不进模型输入，也不参与定位和控制。
+--oracle 用真值步骤代替模型回答，其余流程不变，用来确认对应坐标定位链路和执行器本身够用。
+录像使用 frontview 单画面；pixel 模式标出模型回答的原始像素，不叠加深度点云。
 """
 
 import time
@@ -54,7 +55,7 @@ from eval_lift_mllm_vllm import (
 )
 from eval_video import EvalVideo
 from eval_stack_mllm_vllm import VIDEO_FPS, mean_or_none, plan_matches, write_results
-from task_plan import ParseError, check_parser, execute_plan, format_plan, parse_plan
+from task_plan import ParseError, check_parser, direct_xyz_points, execute_plan, format_plan, parse_plan
 
 
 def plan_pixels(subtasks):
@@ -150,6 +151,8 @@ def match_targets(points, gt, grip_gt=None):
         world = point.get("center_world", point["world"])
 
         def metric(item):
+            if front is None:
+                return float(np.linalg.norm(world - item["world"]))
             return float(np.linalg.norm(front - item["pixel"]))
 
         nearest = min(pool, key=metric)
@@ -170,7 +173,7 @@ def match_targets(points, gt, grip_gt=None):
             first = np.asarray(point["land_1"], dtype=float)
             second = np.asarray(point["land_2"], dtype=float)
             axis = second - first
-            side = point["info"].get("method") == "door_handle_plane"
+            side = point["info"].get("method") == "door_handle_plane" or bool(point["info"].get("side"))
             width = float(np.linalg.norm(axis if side else axis[:2]))
             target["land_1"] = np.round(first, 4).tolist()
             target["land_2"] = np.round(second, 4).tolist()
@@ -197,7 +200,9 @@ def match_targets(points, gt, grip_gt=None):
     return targets
 
 
-def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, style, video_path=None):
+def run_episode(
+    env, task, client, rng, episode, image_size, matrices, oracle, style, video_path=None, coord_mode="pixel"
+):
     latest = {}
     video = None if video_path is None else EvalVideo(env, image_size)
 
@@ -215,13 +220,13 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
             plan = task.build_plan(env, rng)
             if bool(task.success(env)):
                 break
-            instruction = task_instruction(task, env, plan, 0, style, False)
-            gt_subtasks, _ = render_plan(task, env, plan, 0, matrices, False)
+            instruction = task_instruction(task, env, plan, 0, style, False, coord_mode=coord_mode)
+            gt_subtasks, _ = render_plan(task, env, plan, 0, matrices, False, coord_mode=coord_mode)
             if not gt_subtasks:
                 break
             gt_answer = format_plan(gt_subtasks)
             images = camera_images(obs, image_size)
-            views = make_views(env, obs, matrices)
+            views = make_views(env, obs, matrices) if coord_mode == "pixel" else None
             # 真值只用来统计误差，不进模型，不进定位和控制。
             gt = gt_points(task, env, matrices)
             grip_gt = None
@@ -242,12 +247,15 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                 flush=True,
             )
             try:
-                subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
+                subtasks = parse_plan(answer, image_size=image_size, coord_mode=coord_mode)["subtasks"]
                 if video is not None:
                     video.set_plan(subtasks, obs)
                 round_rec["steps"] = [step["type"] for step in subtasks]
-                round_rec["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-                points = locate_plan(subtasks, views, image_size)
+                round_rec["plan_match"] = plan_matches(subtasks, gt_answer, image_size, coord_mode=coord_mode)
+                if coord_mode == "xyz":
+                    points = direct_xyz_points(env, subtasks)
+                else:
+                    points = locate_plan(subtasks, views, image_size)
                 round_rec["targets"] = match_targets(points, gt, grip_gt)
                 for target in round_rec["targets"]:
                     print(
@@ -277,7 +285,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                                 target["closing_yaw_err_deg"],
                             )
                         print(message, flush=True)
-                starts = set(pick_starts(subtasks))
+                starts = set(pick_starts(subtasks)) if coord_mode == "pixel" else set()
                 relocated = []
                 grasp_diagnostics = []
                 grasp_context = {"name": None, "offset": None}
@@ -341,7 +349,7 @@ def run_episode(env, task, client, rng, episode, image_size, matrices, oracle, s
                     if step["type"] == "close_gripper":
                         grasp_context["name"] = grip_name(index)
                         grasp_context["offset"] = None
-                    elif step["type"] == "move_down" and "align_point" in step:
+                    elif step["type"] == "move_down" and "align_point" in step.get("world", {}):
                         grasp_snapshot("pre_place", index)
                     if index in starts and "obs" in latest:
                         point = relocate(
@@ -527,7 +535,11 @@ def add_common_args(parser, default_out):
     parser.add_argument("--out", default=default_out)
     parser.add_argument("--no-video", action="store_true", help="不把每条测评录成 frontview mp4")
     parser.add_argument("--oracle", action="store_true", help="用真值步骤代替模型，检查执行器")
-    parser.add_argument("--self-test", action="store_true", help="只检查像素收集和解析")
+    parser.add_argument(
+        "--coord-mode", choices=("pixel", "xyz"), default="pixel",
+        help="空间标签：frontview 像素加深度，或直接使用机器人基座 XYZ 整数厘米",
+    )
+    parser.add_argument("--self-test", action="store_true", help="只检查像素、XYZ 收集和解析")
     return parser
 
 
@@ -551,7 +563,9 @@ def make_client(args):
 def run_eval(task, args, client):
     check_parser()
     rng = np.random.default_rng(args.seed)
-    env = make_env(task, args.image_size, args.seed, use_camera=True, camera_depths=True)
+    env = make_env(
+        task, args.image_size, args.seed, use_camera=True, camera_depths=args.coord_mode == "pixel"
+    )
     image_size = camera_size(env)
     matrices = world_to_pixel_matrices(env, image_size)
     print("native image size {}x{} cameras {}".format(image_size, image_size, ",".join(CAMERAS)), flush=True)
@@ -565,7 +579,8 @@ def run_eval(task, args, client):
             video_path = None if video_dir is None else video_dir / "ep{:04d}.mp4".format(episode)
             try:
                 record = run_episode(
-                    env, task, client, rng, episode, image_size, matrices, args.oracle, style, video_path
+                    env, task, client, rng, episode, image_size, matrices, args.oracle, style, video_path,
+                    coord_mode=args.coord_mode,
                 )
             except ServerError as exc:
                 print(exc, flush=True)
@@ -577,6 +592,7 @@ def run_eval(task, args, client):
         summary["task"] = task.task
         summary["env"] = task.env_name
         summary["oracle"] = bool(args.oracle)
+        summary["coord_mode"] = args.coord_mode
         summary["seed"] = args.seed
         summary["fixed_initial"] = bool(args.fixed_initial)
         summary["image_size"] = [int(image_size), int(image_size)]

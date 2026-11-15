@@ -14,16 +14,17 @@ vLLM 服务示例：
 1. 按 collect_lift_mllm.py 的方式摆好 Lift / Panda，渲染 frontview 的 RGB
 2. 按当前画面重算指令，和采集时一样：没对准就先移动到目标上方，对准后只写还要抬多少
 3. 只把 frontview RGB 和这条指令放进对话
-4. 只在初始画面问一次模型，取出 target_1 和 target_2 两个夹爪落点的像素；
-   背侧落点即使被方块挡住也要根据形状写出像素。抬升高度用指令里已经写明的数字
-5. 用这一帧的深度把像素换成两个落点的世界坐标，两条射线与当前可见接触面的水平面求交；
+4. 只在初始画面问一次模型，取出 target_1 和 target_2 两个夹爪落点；
+   pixel 是 frontview 像素，XYZ 是机器人基座整数厘米。抬升高度用指令里已经写明的数字
+5. pixel 模式用这一帧的深度把像素换成世界坐标，两条射线与当前可见接触面的水平面求交；
+   XYZ 模式不使用深度，直接做基座到世界坐标转换。
    之后不再问模型。按这两个点做逆运动学：走到落点中点上方、下降、合爪、抬起并稳住
 6. 抓住方块，并且方块抬过桌面 4 厘米，才算成功
 
-每条测评按控制频率收成 mp4，写到输出目录的 videos/。frontview 画面标出模型回答的
+每条测评按控制频率收成 mp4，写到输出目录的 videos/。pixel 模式的 frontview 画面标出模型回答的
 原始像素，不叠加深度点云。--no-video 可以关掉。
 
-模型给的是像素，不是世界坐标。仿真里的落点只用于 --oracle 出答案和事后统计误差，不参与定位和控制。
+模型给的是像素或基座 XYZ 标签，不是 robosuite 世界坐标。仿真里的落点只用于 --oracle 出答案和事后统计误差，不参与定位和控制。
 move_above 在落点中点上方 12 厘米，这个高度落在采集时的悬停范围内。
 """
 
@@ -50,11 +51,13 @@ from collect_lift_mllm import (
     STABILIZE_DURATION,
     above_cube,
     arm_controller,
+    base_to_world,
     cube_grip_ori,
     format_answer,
     format_pixel,
     grip_landings,
     grip_view_pixels,
+    grip_view_xyz,
     hold,
     instruction_for,
     make_env,
@@ -70,6 +73,7 @@ from collect_lift_mllm import (
 from depth_locate import make_views, recover_landings
 from eval_video import EvalVideo
 from grip_ik import GRIP_YAW, IKArm, choose_grasp, grasp_candidates, pad_offset, topdown_ori
+from task_plan import parse_base_xyz
 
 # 采集时悬停高度在 8 到 15 厘米之间随机，这里取中间附近的固定值。
 HOVER_CLEARANCE = 0.12
@@ -126,7 +130,7 @@ def parse_pixel(value, image_size):
     return pixel
 
 
-def normalize_subtasks(items, image_size):
+def normalize_subtasks(items, image_size, coord_mode="pixel"):
     if not isinstance(items, list):
         raise ValueError("subtasks 应为数组")
     steps = []
@@ -138,14 +142,22 @@ def normalize_subtasks(items, image_size):
             raise ValueError("未知子任务 {}".format(kind))
         step = {"type": kind}
         if kind in ("move_above", "move_down", "lift"):
-            if "target_1" in item:
-                step["pixel"] = parse_pixel(item["target_1"], image_size)
-            elif "target" in item:
-                step["pixel"] = parse_pixel(item["target"], image_size)
-            else:
+            value = item.get("target_1", item.get("target"))
+            if value is None:
                 raise ValueError("{} 缺少 target_1".format(kind))
-            if "target_2" in item:
-                step["pixel_2"] = parse_pixel(item["target_2"], image_size)
+            if coord_mode == "xyz":
+                step["base"] = {"pixel": parse_base_xyz(value, "target_1")}
+                if "target_2" in item:
+                    step["base"]["pixel_2"] = parse_base_xyz(item["target_2"], "target_2")
+            else:
+                step["pixel"] = parse_pixel(value, image_size)
+                if "target_2" in item:
+                    step["pixel_2"] = parse_pixel(item["target_2"], image_size)
+            if coord_mode == "xyz" and kind in ("move_above", "move_down") and "yaw" in item:
+                yaw = float(item["yaw"])
+                if not np.isfinite(yaw) or not -180.0 <= yaw <= 180.0:
+                    raise ValueError("yaw 超出范围：{}".format(yaw))
+                step["yaw"] = yaw
         if kind == "lift":
             if "delta_z" not in item:
                 raise ValueError("lift 缺少 delta_z")
@@ -183,31 +195,34 @@ def _load_object(text):
     return obj
 
 
-def _plan_from_object(obj, image_size):
+def _plan_from_object(obj, image_size, coord_mode="pixel"):
     if "subtasks" not in obj:
         raise ValueError("缺少 subtasks")
-    steps = normalize_subtasks(obj["subtasks"], image_size)
+    steps = normalize_subtasks(obj["subtasks"], image_size, coord_mode=coord_mode)
     target = None
     target_2 = None
+    yaw = None
     for step in steps:
-        if "pixel" in step:
-            target = step["pixel"]
-            target_2 = step.get("pixel_2")
+        points = step.get("base", {}) if coord_mode == "xyz" else step
+        if "pixel" in points:
+            target = points["pixel"]
+            target_2 = points.get("pixel_2")
+            yaw = step.get("yaw")
             break
-    return {"target": target, "target_2": target_2, "subtasks": steps}
+    return {"target": target, "target_2": target_2, "yaw": yaw, "subtasks": steps}
 
 
-def _parse_plan(text, image_size):
+def _parse_plan(text, image_size, coord_mode="pixel"):
     last_error = None
     for blob in _json_blobs(text):
         try:
-            return _plan_from_object(_load_object(blob), image_size)
+            return _plan_from_object(_load_object(blob), image_size, coord_mode=coord_mode)
         except ValueError as exc:
             last_error = exc
     raise ValueError(str(last_error) if last_error else "没有抓取计划")
 
 
-def parse_answer(text, image_size=None):
+def parse_answer(text, image_size=None, coord_mode="pixel"):
     """从模型回答里取出 subtasks。target 是第一个带像素的步骤，抬到目标后可以为空。"""
     if not text or not str(text).strip():
         raise ParseError("模型没有返回文本")
@@ -220,7 +235,7 @@ def parse_answer(text, image_size=None):
     last_error = None
     for candidate in candidates:
         try:
-            return _parse_plan(candidate, image_size)
+            return _parse_plan(candidate, image_size, coord_mode=coord_mode)
         except ValueError as exc:
             last_error = exc
     raise ParseError("无法解析抓取计划：{}".format(raw[:300])) from last_error
@@ -515,48 +530,63 @@ def write_mp4(path, frames, fps=VIDEO_FPS):
     return path
 
 
-def predict(client, env, obs, instruction, oracle, phase, above, delta_z, episode, axis=None):
+def predict(
+    client, env, obs, instruction, oracle, phase, above, delta_z, episode, axis=None, coord_mode="pixel"
+):
     size = camera_size(env)
     images = camera_images(obs, size)
     gt_cube, gt_eef = positions_from_obs(obs)
     matrices = world_to_pixel_matrices(env, size)
     # 真值只用来出 oracle 答案和事后统计，不进定位和控制。
     gt_front, gt_back = grip_landings(env)
-    gt_pixel, _ = project_world(gt_front, matrices[DEFAULT_CAMERA])
-    gt_pixel_2, _ = project_world(gt_back, matrices[DEFAULT_CAMERA])
+    gt_pixel = gt_pixel_2 = None
+    if coord_mode == "pixel":
+        gt_pixel, _ = project_world(gt_front, matrices[DEFAULT_CAMERA])
+        gt_pixel_2, _ = project_world(gt_back, matrices[DEFAULT_CAMERA])
     started = time.perf_counter()
     if oracle:
-        pixels = grip_view_pixels(gt_front, gt_back, matrices)
-        text = format_answer(pixels, gt_cube, gt_eef, phase, above, delta_z)
+        if coord_mode == "xyz":
+            points = grip_view_xyz(env, gt_front, gt_back)
+        else:
+            points = grip_view_pixels(gt_front, gt_back, matrices)
+        text = format_answer(points, gt_cube, gt_eef, phase, above, delta_z, coord_mode=coord_mode)
     else:
         text = client.complete(images, instruction)
     print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
     print("episode {:02d} answer ({:.3f}s):\n{}".format(episode, time.perf_counter() - started, text), flush=True)
-    plan = parse_answer(text, image_size=size)
+    plan = parse_answer(text, image_size=size, coord_mode=coord_mode)
     if plan["target"] is None:
         raise ParseError("缺少 target_1")
     if plan["target_2"] is None:
         raise ParseError("缺少 target_2")
-    views = make_views(env, obs, matrices)
-    front, back, located = recover_landings(
-        {
-            "front": plan["target"],
-            "same": plan["target_2"],
-        },
-        views,
-        size,
-        axis=axis,
-    )
+    if coord_mode == "xyz":
+        front = np.asarray(base_to_world(env, plan["target"]), dtype=float)
+        back = np.asarray(base_to_world(env, plan["target_2"]), dtype=float)
+        if not plausible(front) or not plausible(back):
+            raise ParseError("基座 XYZ 转换后超出工作空间")
+        located = {"method": "direct_base_xyz"}
+    else:
+        views = make_views(env, obs, matrices)
+        front, back, located = recover_landings(
+            {
+                "front": plan["target"],
+                "same": plan["target_2"],
+            },
+            views,
+            size,
+            axis=axis,
+        )
     elapsed = time.perf_counter() - started
     return {
         "answer": text,
         "plan": {
-            "pixel": plan["target"],
-            "pixel_2": plan["target_2"],
+            "pixel": plan["target"] if coord_mode == "pixel" else None,
+            "pixel_2": plan["target_2"] if coord_mode == "pixel" else None,
             "front": front,
             "back": back,
             "target": 0.5 * (front + back),
             "subtasks": plan["subtasks"],
+            "yaw": plan.get("yaw"),
         },
         "gt_cube_pos": gt_cube,
         "gt_eef_pos": gt_eef,
@@ -659,7 +689,9 @@ def execute_subtask(env, step, target, hold_ori, grip, obs, on_step):
     raise ParseError("未知子任务 {}".format(kind))
 
 
-def run_episode(env, client, rng, episode, height_min, height_max, oracle, video_path=None):
+def run_episode(
+    env, client, rng, episode, height_min, height_max, oracle, video_path=None, coord_mode="pixel"
+):
     size = camera_size(env)
     video = None if video_path is None else EvalVideo(env, size)
 
@@ -675,7 +707,9 @@ def run_episode(env, client, rng, episode, height_min, height_max, oracle, video
         style = INSTRUCTION_STYLES[int(rng.integers(len(INSTRUCTION_STYLES)))]
         lifted, remaining = remaining_lift(gt_cube[2], rest_z, target_lift)
         above = above_cube(gt_eef, gt_cube)
-        opening_instruction, opening_spoken = instruction_for(style, remaining, lifted, above)
+        opening_instruction, opening_spoken = instruction_for(
+            style, remaining, lifted, above, coord_mode=coord_mode
+        )
         queries = []
         hover_ok = grasp_ok = lift_ok = False
         hover_err = grasp_err = lift_err = None
@@ -695,13 +729,16 @@ def run_episode(env, client, rng, episode, height_min, height_max, oracle, video
                 opening_spoken,
                 episode,
                 axis=initial_ori[:, 0],
+                coord_mode=coord_mode,
             )
             if video is not None:
                 video.set_plan(pred["plan"]["subtasks"], obs)
             front_w = pred["plan"]["front"]
             back_w = pred["plan"]["back"]
             try:
-                pose, ori, _yaw, _q = choose_grasp(arm.ik, grasp_candidates([front_w, back_w], finger_offset))
+                pose, ori, _yaw, _q = choose_grasp(
+                    arm.ik, grasp_candidates([front_w, back_w], finger_offset, yaw=pred["plan"].get("yaw"))
+                )
             except ValueError as exc:
                 raise ParseError(str(exc)) from exc
             print(
@@ -788,6 +825,16 @@ def run_episode(env, client, rng, episode, height_min, height_max, oracle, video
                     print("wrote partial video {}".format(saved), flush=True)
 
 
+def json_ready(value):
+    if isinstance(value, np.ndarray):
+        return np.round(value, 4).tolist()
+    if isinstance(value, dict):
+        return {key: json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_ready(item) for item in value]
+    return value
+
+
 def pack_query(stage, instruction, pred, reached, pos_err):
     cube_err = pred["cube_err"]
     target = pred["plan"]["target"]
@@ -800,7 +847,7 @@ def pack_query(stage, instruction, pred, reached, pos_err):
             {
                 key: round_pixel(value)
                 if key in ("pixel", "pixel_2") and value is not None
-                else value
+                else json_ready(value)
                 for key, value in step.items()
             }
             for step in pred["plan"]["subtasks"]
@@ -978,10 +1025,10 @@ def load_camera_matrices(dataset):
     return matrices, int(size[0])
 
 
-def probe_dataset(client, dataset, count, seed):
+def probe_dataset(client, dataset, count, seed, coord_mode="pixel"):
     path = Path(dataset) / "samples.jsonl"
     root = Path(dataset)
-    matrices, image_size = load_camera_matrices(dataset)
+    matrices, image_size = load_camera_matrices(dataset) if coord_mode == "pixel" else (None, None)
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     rng = np.random.default_rng(seed)
     picked = rng.choice(len(rows), size=min(count, len(rows)), replace=False)
@@ -995,39 +1042,48 @@ def probe_dataset(client, dataset, count, seed):
         image = read_image(root / row["image"])
         text = client.complete(image, row["instruction"])
         try:
-            plan = parse_answer(text, image_size=image_size)
+            plan = parse_answer(text, image_size=image_size, coord_mode=coord_mode)
         except ParseError as exc:
             print("{} parse failed: {}".format(row["id"], exc), flush=True)
             continue
         if plan["target"] is None:
             print("{} 没有像素".format(row["id"]), flush=True)
             continue
-        # 数据集没有深度图，用 frontview 真值深度反投影来检查像素误差。
-        matrix = matrices[DEFAULT_CAMERA]
-        pred_pixel = plan["target"]
+        # 像素 probe 用数据集真值深度；XYZ probe 直接比较基座坐标，不使用深度。
+        pred_pixel = plan["target"] if coord_mode == "pixel" else None
+        gt_pixel = None
         try:
-            if "grip_front" in row and "grip_back" in row and plan["target_2"] is not None:
-                worlds = []
-                for pixel, gt in zip((plan["target"], plan["target_2"]), (row["grip_front"], row["grip_back"])):
-                    _, view_depth = project_world(gt, matrix)
-                    worlds.append(unproject_pixel(pixel, view_depth, matrix))
-                world = 0.5 * (worlds[0] + worlds[1])
-                gt_world = 0.5 * (np.asarray(row["grip_front"], dtype=float) + np.asarray(row["grip_back"], dtype=float))
-                gt_pixel = round_pixel(project_world(row["grip_front"], matrix)[0])
-            elif "cube_pos" in row:
-                gt_world = row["cube_pos"]
-                _, view_depth = project_world(gt_world, matrix)
-                world = unproject_pixel(pred_pixel, view_depth, matrix)
-                gt_pixel = row.get("cube_pixel")
-                if gt_pixel is None:
-                    gt_pixel = round_pixel(project_world(gt_world, matrix)[0])
+            if coord_mode == "xyz":
+                gt_plan = parse_answer(row["answer"], coord_mode="xyz")
+                if plan["target_2"] is None or gt_plan["target_2"] is None:
+                    print("{} 缺少双落点，跳过".format(row["id"]), flush=True)
+                    continue
+                world = 0.5 * (plan["target"] + plan["target_2"])
+                gt_world = 0.5 * (gt_plan["target"] + gt_plan["target_2"])
             else:
-                print("{} 没有落点或方块坐标，跳过".format(row["id"]), flush=True)
-                continue
-        except ValueError as exc:
-            print("{} frontview {}".format(row["id"], exc), flush=True)
+                matrix = matrices[DEFAULT_CAMERA]
+                if "grip_front" in row and "grip_back" in row and plan["target_2"] is not None:
+                    worlds = []
+                    for pixel, gt in zip((plan["target"], plan["target_2"]), (row["grip_front"], row["grip_back"])):
+                        _, view_depth = project_world(gt, matrix)
+                        worlds.append(unproject_pixel(pixel, view_depth, matrix))
+                    world = 0.5 * (worlds[0] + worlds[1])
+                    gt_world = 0.5 * (np.asarray(row["grip_front"], dtype=float) + np.asarray(row["grip_back"], dtype=float))
+                    gt_pixel = round_pixel(project_world(row["grip_front"], matrix)[0])
+                elif "cube_pos" in row:
+                    gt_world = row["cube_pos"]
+                    _, view_depth = project_world(gt_world, matrix)
+                    world = unproject_pixel(pred_pixel, view_depth, matrix)
+                    gt_pixel = row.get("cube_pixel")
+                    if gt_pixel is None:
+                        gt_pixel = round_pixel(project_world(gt_world, matrix)[0])
+                else:
+                    print("{} 没有落点或方块坐标，跳过".format(row["id"]), flush=True)
+                    continue
+        except (ValueError, ParseError) as exc:
+            print("{} {} {}".format(row["id"], coord_mode, exc), flush=True)
             continue
-        if not plausible(world):
+        if coord_mode == "pixel" and not plausible(world):
             print("{} 反投影超出工作空间 {}".format(row["id"], np.round(world, 4).tolist()), flush=True)
             continue
         plan = {
@@ -1036,20 +1092,21 @@ def probe_dataset(client, dataset, count, seed):
             "subtasks": plan["subtasks"],
         }
         cube_err = pos_error(world, gt_world)
-        pixel_err = float(
-            np.linalg.norm(np.asarray(plan["pixel"], dtype=float) - np.asarray(gt_pixel, dtype=float))
-        )
+        pixel_err = None
+        if pred_pixel is not None and gt_pixel is not None:
+            pixel_err = float(np.linalg.norm(np.asarray(pred_pixel, dtype=float) - np.asarray(gt_pixel, dtype=float)))
         matched = subtasks_match(plan, row.get("answer", ""))
         cube_errs.append(cube_err)
-        pixel_errs.append(pixel_err)
+        if pixel_err is not None:
+            pixel_errs.append(pixel_err)
         phase = row.get("phase") or "unknown"
         by_phase.setdefault(phase, []).append(cube_err)
         matches += int(matched)
         print(
             "{} pixel gt={} pred={} cube gt={} pred={} {} l2={} subtasks={}".format(
                 row["id"],
-                format_pixel(gt_pixel),
-                format_pixel(plan["pixel"]),
+                format_pixel(gt_pixel) if gt_pixel is not None else "n/a",
+                format_pixel(plan["pixel"]) if plan["pixel"] is not None else "n/a",
                 format_xyz(gt_world),
                 format_xyz(world),
                 format_err_axes(cube_err),
@@ -1230,6 +1287,10 @@ def add_common_args(parser):
     parser.add_argument("--oracle", action="store_true", help="用环境真值代替模型，检查控制器")
     parser.add_argument("--probe", type=int, default=0, help="正式测评前，先在采集样本上测方块位置和子任务")
     parser.add_argument("--dataset", default="data/lift_mllm")
+    parser.add_argument(
+        "--coord-mode", choices=("pixel", "xyz"), default="pixel",
+        help="空间标签：frontview 像素加深度，或直接使用机器人基座 XYZ 整数厘米",
+    )
     parser.add_argument("--self-test", action="store_true", help="只检查解析和坐标换算")
     return parser
 
@@ -1239,13 +1300,15 @@ def run_eval(args, client, backend, extra_summary=None):
     if args.oracle:
         print("oracle mode, skip model server", flush=True)
     elif args.probe > 0:
-        probe_dataset(client, args.dataset, args.probe, args.seed)
+        probe_dataset(client, args.dataset, args.probe, args.seed, coord_mode=args.coord_mode)
 
     if args.episodes <= 0:
         return
 
     rng = np.random.default_rng(args.seed)
-    env = make_env(args.image_size, args.seed, camera_depths=True, use_ik=True)
+    env = make_env(
+        args.image_size, args.seed, camera_depths=args.coord_mode == "pixel", use_ik=True
+    )
     video_dir = None if args.no_video else Path(args.out) / "videos"
     records = []
     try:
@@ -1263,6 +1326,7 @@ def run_eval(args, client, backend, extra_summary=None):
                     args.height_max,
                     args.oracle,
                     video_path,
+                    coord_mode=args.coord_mode,
                 )
             except ServerError as exc:
                 print(exc, flush=True)
@@ -1272,6 +1336,7 @@ def run_eval(args, client, backend, extra_summary=None):
     finally:
         summary = summarize(records)
         summary["oracle"] = bool(args.oracle)
+        summary["coord_mode"] = args.coord_mode
         summary["seed"] = args.seed
         summary["fixed_initial"] = bool(args.fixed_initial)
         summary["backend"] = "oracle" if args.oracle else backend

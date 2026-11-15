@@ -7,7 +7,7 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
 每样物品的步骤：移到物品上方、下降、合爪、抬过箱壁、移到对应格子上方、下降、松爪、抬开。
 全部放完后停住。麦片盒 10 厘米宽、3 厘米厚，只能沿窄边合拢；牛奶、面包选和最近邻居方向垂直的那条，
 免得手指碰到旁边的东西；易拉罐旁边有东西时同样按邻居选方向。采集器内部用 yaw 生成两指落点，
-标签不重复写 yaw，执行时由落点连线恢复。
+pixel 标签不重复写 yaw，执行时由落点连线恢复；XYZ 标签保留计划的安全 yaw，避免短连线量化改变朝向。
 抓靠上的位置，两个指腹落点的中点已含抓取高度，所以 move_down 的 offset_z 为 0。
 四样都放时，先拿高窄、容易被碰倒的麦片盒，再依次拿离剩余物品最远的那样。采集全程监控尚未主动搬过的其他物品，
 被推走超过 2 厘米、高度变化超过 2.5 厘米或转动超过 25 度就整条丢弃，即使最后环境判成功也不保存。
@@ -18,8 +18,8 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
     <image>
     把易拉罐放进右边箱子里对应的格子。回答的 JSON 中，抓物品的步骤里 target_1、target_2 是两指落点，都在正面相机图上；另一个落点被挡住时也根据物品形状和朝向补出它的像素，不写 mask。放进箱格的步骤只写格子中心。
 
-输出例子（易拉罐单独一个、还没抓住时；抓取步骤写两个指腹落点，中点是抓取位置，连线决定 yaw，
-不再单独输出 yaw）：
+输出例子（默认 pixel 模式，易拉罐单独一个、还没抓住时；抓取步骤写两个指腹落点，中点是抓取位置，
+连线决定 yaw，不再单独输出 yaw）：
 
     {"subtasks": [{"type": "move_above", "desc": "移到易拉罐上方", "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip", "clearance": 0.12}, {"type": "move_down", "desc": "降到易拉罐处准备夹", "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住易拉罐"}, {"type": "lift", "desc": "抬起易拉罐", "delta_z": 0.17, "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到格子正上方", "target_1": "[360 270]", "target_kind": "bin", "clearance": 0.22}, {"type": "move_down", "desc": "把易拉罐放进格子", "target_1": "[360 270]", "target_kind": "bin", "offset_z": 0.1}, {"type": "open_gripper", "desc": "松爪放下易拉罐"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[360 270]", "target_kind": "bin", "clearance": 0.22}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
@@ -304,8 +304,13 @@ class PickPlaceTask:
         camera = env.sim.data.cam_xpos[env.sim.model.camera_name2id(DEFAULT_CAMERA)]
         return order_landings_at(center, camera, pair)
 
-    def plan_desc(self):
+    def plan_desc(self, coord_mode="pixel"):
         """抓取写两指落点；箱格仍写单个中心点。被挡的落点按形状补出。"""
+        if coord_mode == "xyz":
+            return (
+                "抓物品的 target_1、target_2 是贴住物品两侧的两指落点，放进箱格只写 target_1（格子中心）；"
+                "它们都是机器人基座 XYZ 整数厘米 [x y z]，两落点的中点是抓取位置"
+            )
         return (
             "抓物品的步骤里 target_1、target_2 是贴住物品两侧的两指落点，都在正面相机图上；"
             "另一个落点被物品挡住时也根据物品形状和朝向补出它的像素，不写 mask。两落点的中点是抓取位置；"

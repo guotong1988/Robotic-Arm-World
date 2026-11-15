@@ -13,8 +13,9 @@
    指令和采集一样以每台相机一个 <image> 占位开头
 3. 成功分两步看：执行过程中曾经叠起来过（被叠的块离开桌面、和另一块接触、已经松开），
    并且结束时被叠的块回到桌面高度、没被抓着、两块不再接触。放回位置误差单独记录
-4. 按每次合爪、松爪前指的像素各自离哪个方块近，判断它两次分别抓了哪块、放到哪块上面
-5. --oracle 用真值像素和真值步骤代替模型，先确认叠上去再拿下来这套动作本身能做成
+4. 按每次合爪、松爪前指的空间点各自离哪个方块近，判断它两次分别抓了哪块、放到哪块上面；
+   pixel 按像素比较，XYZ 转成世界坐标后按三维距离比较
+5. --oracle 用真值坐标和真值步骤代替模型，先确认叠上去再拿下来这套动作本身能做成
 """
 
 import argparse
@@ -29,8 +30,11 @@ import numpy as np
 
 from collect_lift_mllm import (
     DEFAULT_CAMERA,
+    base_to_world,
+    format_base_xyz,
     format_pixel,
     grip_view_pixels,
+    grip_view_xyz,
     project_world,
     with_views,
     world_to_pixel_matrices,
@@ -125,72 +129,94 @@ def unstack_success(env, obs, direction, orig_moved, stacked_seen):
     return bool(stacked_seen and on_table and released and separated)
 
 
-def unstack_plan(env, obs, offset, matrices, direction, half, axis, camera_pos):
+def unstack_plan(env, obs, offset, matrices, direction, half, axis, camera_pos, coord_mode="pixel"):
     """叠上去再拿下来的真值步骤。
 
     前半段复用正向的步骤生成，只把要抓的块和垫底的块按方向对调，去掉结尾的 stabilize；
     后半段降到垫底块两侧（被叠的块此刻正压在垫底块上，贴垫底块两侧就是贴它两侧）
     重新抓住、抬高、放回它原来在桌上的位置。
     像素都来自提问这一帧的 frontview：叠好的块在垫底块的像素上，原位的像素还空着。
-    被挡住的落点也按方块形状写出。
+    XYZ 模式改用机器人基座整数厘米，其余步骤保持不变。
     """
     cube_a, cube_b, eef = positions_from_obs(obs)
     moved, base = (cube_a, cube_b) if direction == "red_on_green" else (cube_b, cube_a)
     side = np.asarray(axis, dtype=float) * float(half)
 
     def center_pixel(point):
+        if coord_mode == "xyz":
+            return format_base_xyz(env, point)
         return format_pixel(project_world(point, matrices[DEFAULT_CAMERA])[0])
 
     # 第一次抓取：两指落点贴被叠块两侧，朝 frontview 的一侧写 target_1。
     land_1, land_2 = order_landings_at(moved, camera_pos, (moved + side, moved - side))
-    grip_pixels = grip_view_pixels(land_1, land_2, matrices)
+    land_3, land_4 = order_landings_at(base, camera_pos, (base + side, base - side))
+    if coord_mode == "xyz":
+        grip_pixels = grip_view_xyz(env, land_1, land_2)
+        grip_re = grip_view_xyz(env, land_3, land_4)
+    else:
+        grip_pixels = grip_view_pixels(land_1, land_2, matrices)
+        grip_re = grip_view_pixels(land_3, land_4, matrices)
     pix_base = center_pixel(base)
     # 第二次抓取：落点贴垫底块两侧，两指落到垫底块上那个被叠块的两侧。
-    land_3, land_4 = order_landings_at(base, camera_pos, (base + side, base - side))
-    grip_re = grip_view_pixels(land_3, land_4, matrices)
     # 放回桌上原来的位置：写空位的中心像素，目标中心加距离。
     pix_moved = center_pixel(moved)
-    steps = remaining_subtasks(moved, base, eef, grip_pixels, pix_base, float(moved[2]), offset, False, False)
+    steps = remaining_subtasks(
+        moved, base, eef, grip_pixels, pix_base, float(moved[2]), offset, False, False,
+        coord_mode=coord_mode,
+    )
     steps = steps[:-1]  # 去掉叠好后的 stabilize，接着做拿下来
     # 降到被叠块的中心高度，重新抓住；第二次抓取的两指落点贴垫底块两侧。
-    steps.append(grip_step("move_down", "降到叠好的块上", grip_re, {"offset_z": round(float(offset), 3)}))
+    steps.append(grip_step(
+        "move_down", "降到叠好的块上", grip_re, {"offset_z": round(float(offset), 3)}, coord_mode,
+    ))
     steps.append({"type": "close_gripper", "desc": "合爪夹住叠好的块"})
-    steps.append(grip_step("lift", "把叠好的块抬起来", grip_re, {"delta_z": TRANSPORT_DZ}))
+    steps.append(grip_step("lift", "把叠好的块抬起来", grip_re, {"delta_z": TRANSPORT_DZ}, coord_mode))
     steps.append(place_step(
         "move_above", "移回它原来的位置上方", pix_moved,
-        {"clearance": round(float(DEFAULT_CLEARANCE), 2)},
+        {"clearance": round(float(DEFAULT_CLEARANCE), 2)}, coord_mode,
     ))
-    steps.append(place_step("move_down", "把块放回桌面", pix_moved, {"offset_z": 0.0}))
+    steps.append(place_step("move_down", "把块放回桌面", pix_moved, {"offset_z": 0.0}, coord_mode))
     steps.append({"type": "open_gripper", "desc": "松爪放下"})
     steps.append(place_step(
         "move_above", "向上抬开夹爪", pix_moved,
-        {"clearance": round(float(DEFAULT_CLEARANCE), 2)},
+        {"clearance": round(float(DEFAULT_CLEARANCE), 2)}, coord_mode,
     ))
     steps.append({"type": "stabilize", "desc": "停在原地保持稳定", "duration": STABILIZE_DURATION})
     # format_plan 直接返回模型输出格式的 JSON 文本，oracle 时喂给 parse_plan。
     return format_plan(steps)
 
 
-def pixels_before(subtasks, kind):
-    """每次 kind 这一步之前最近一个 frontview 像素，返回和出现次数一样长的列表。"""
+def points_before(subtasks, kind, coord_mode="pixel"):
+    """每次 kind 这一步之前最近一个空间目标，返回和出现次数一样长的列表。"""
     out = []
-    pixel = None
+    point = None
     for step in subtasks:
         if step["type"] == kind:
-            out.append(pixel)
-        if "pixel" in step:
-            pixel = step["pixel"]
+            out.append(point)
+        if coord_mode == "xyz":
+            point = step.get("base", {}).get("pixel", point)
+        elif "pixel" in step:
+            point = step["pixel"]
     return out
 
 
-def classify(pixels, gt_pix):
-    return [
-        None if pixel is None else OBJECT_NAMES[nearest_object(pixel, gt_pix)[0]]
-        for pixel in pixels
-    ]
+def classify(points, gt_pix, gt_world=None, env=None, coord_mode="pixel"):
+    out = []
+    for point in points:
+        if point is None:
+            out.append(None)
+        elif coord_mode == "xyz":
+            world = base_to_world(env, point)
+            out.append(OBJECT_NAMES[nearest_object(world, gt_world)[0]])
+        else:
+            out.append(OBJECT_NAMES[nearest_object(point, gt_pix)[0]])
+    return out
 
 
-def run_episode(env, client, rng, episode, image_size, oracle, direction, instruction=None, video_path=None):
+def run_episode(
+    env, client, rng, episode, image_size, oracle, direction, instruction=None, video_path=None,
+    coord_mode="pixel",
+):
     frames = []
     chosen = {"direction": None}
     stacked = {"seen": False}
@@ -216,10 +242,10 @@ def run_episode(env, client, rng, episode, image_size, oracle, direction, instru
         styles = INSTRUCTION_STYLES[direction]
         styled = instruction or styles[int(rng.integers(len(styles)))]
         # 和采集一致：指令以每台相机一个 <image> 占位开头、话术后面带字段说明，图走 image_url 后占位被剥掉。
-        instruction = with_views(styled, plan_desc())
+        instruction = with_views(styled, plan_desc(coord_mode))
         matrices = world_to_pixel_matrices(env, image_size)
         images = camera_images(obs, image_size)
-        views = make_views(env, obs, matrices)
+        views = make_views(env, obs, matrices) if coord_mode == "pixel" else None
         matrix = matrices[DEFAULT_CAMERA]
         # 评测执行保持 hold_ori，两指合拢轴就是它的第一列。
         axis = np.asarray(hold_ori, dtype=float)[:, 0].copy()
@@ -231,7 +257,8 @@ def run_episode(env, client, rng, episode, image_size, oracle, direction, instru
         orig_base = np.array(gt_b if direction == "red_on_green" else gt_a, dtype=float)
         gt_pix = [project_world(gt_a, matrix)[0], project_world(gt_b, matrix)[0]]
         gt_answer = unstack_plan(
-            env, obs, place_offset(env), matrices, direction, half_z(env.cubeA, 0.02), axis, cam_pos
+            env, obs, place_offset(env), matrices, direction, half_z(env.cubeA, 0.02), axis, cam_pos,
+            coord_mode=coord_mode,
         )
 
         record = {
@@ -250,14 +277,20 @@ def run_episode(env, client, rng, episode, image_size, oracle, direction, instru
         print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
         print("episode {:02d} answer ({}s):\n{}".format(episode, record["seconds"], answer), flush=True)
         try:
-            subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
+            subtasks = parse_plan(answer, image_size=image_size, coord_mode=coord_mode)["subtasks"]
             record["steps"] = [step["type"] for step in subtasks]
-            record["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-            record["picked_list"] = classify(pixels_before(subtasks, "close_gripper"), gt_pix)
-            record["placed_list"] = classify(pixels_before(subtasks, "open_gripper"), gt_pix)
+            record["plan_match"] = plan_matches(subtasks, gt_answer, image_size, coord_mode=coord_mode)
+            record["picked_list"] = classify(
+                points_before(subtasks, "close_gripper", coord_mode), gt_pix,
+                gt_world=[gt_a, gt_b], env=env, coord_mode=coord_mode,
+            )
+            record["placed_list"] = classify(
+                points_before(subtasks, "open_gripper", coord_mode), gt_pix,
+                gt_world=[gt_a, gt_b], env=env, coord_mode=coord_mode,
+            )
             record["picked"] = record["picked_list"][0] if record["picked_list"] else None
             record["placed_on"] = record["placed_list"][0] if record["placed_list"] else None
-            points = perceive(subtasks, views, image_size, axis=axis)
+            points = perceive(subtasks, views, image_size, axis=axis, env=env, coord_mode=coord_mode)
             targets = []
             for point in points:
                 target, line = point_target(point, gt_pix, gt_a, gt_b)
@@ -403,6 +436,10 @@ def main():
     parser.add_argument("--out", default="data/stack_unstack_eval")
     parser.add_argument("--no-video", action="store_true", help="不把每条测评的 frontview 录成 mp4")
     parser.add_argument("--oracle", action="store_true", help="用真值步骤代替模型，检查叠上去再拿下来能否做成")
+    parser.add_argument(
+        "--coord-mode", choices=("pixel", "xyz"), default="pixel",
+        help="空间标签：frontview 像素加深度，或直接使用机器人基座 XYZ 整数厘米",
+    )
     parser.add_argument("--self-test", action="store_true", help="只检查共享解析与定位接口")
     args = parser.parse_args()
 
@@ -426,7 +463,9 @@ def main():
         print("api {} model {}".format(client.api_base, client.resolve_model()), flush=True)
 
     rng = np.random.default_rng(args.seed)
-    env = make_env(args.image_size, args.seed, use_camera=True, camera_depths=True)
+    env = make_env(
+        args.image_size, args.seed, use_camera=True, camera_depths=args.coord_mode == "pixel"
+    )
     image_size = camera_size(env)
     video_dir = None if args.no_video else Path(args.out) / "videos"
     records = []
@@ -435,7 +474,8 @@ def main():
             video_path = None if video_dir is None else video_dir / "ep{:04d}.mp4".format(episode)
             try:
                 record = run_episode(
-                    env, client, rng, episode, image_size, args.oracle, args.direction, args.instruction or None, video_path
+                    env, client, rng, episode, image_size, args.oracle, args.direction, args.instruction or None,
+                    video_path, coord_mode=args.coord_mode,
                 )
             except ServerError as exc:
                 print(exc, flush=True)
@@ -446,6 +486,7 @@ def main():
         summary = summarize_unstack(records)
         summary["task"] = "stack_unstack"
         summary["oracle"] = bool(args.oracle)
+        summary["coord_mode"] = args.coord_mode
         summary["seed"] = args.seed
         summary["backend"] = "oracle" if args.oracle else "vllm"
         summary["direction"] = args.direction

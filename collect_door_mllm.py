@@ -103,7 +103,12 @@ class DoorTask:
         """把手上的抓取点和门板中面上的转轴、铰链是两种量法。"""
         return "door_handle" if name == "handle" else "door_axis"
 
-    def plan_desc(self):
+    def plan_desc(self, coord_mode="pixel"):
+        if coord_mode == "xyz":
+            return (
+                "reach 的 target_1、target_2 是门把手上下两指落点，turn 的 pivot 是对应转轴；"
+                "它们都是机器人基座 XYZ 整数厘米 [x y z]，两落点的中点是抓取位置，连线表示上下合拢方向"
+            )
         return (
             "reach 步骤里 target_1 是门把手上方的夹爪落点，target_2 是下方落点，都在正面相机图上；"
             "两落点的中点是抓取位置，连线表示上下合拢方向，turn 的 pivot 仍写对应转轴的像素"

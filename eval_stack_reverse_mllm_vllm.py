@@ -9,8 +9,9 @@
 1. 指令换成反向说法，也可以用 --instruction 指定一句；指令和采集一样以每台相机一个 <image> 占位开头
 2. 成功按反向判定：绿块中心离桌面超过 4cm、和红块接触、夹爪没有抓着绿块。阈值和 robosuite 的 Stack 一样
 3. 同时记下原任务是否成功（红块叠在绿块上），看模型是不是无视指令照旧做
-4. 按模型合爪前、松爪前指的像素各自离哪个方块近，判断它实际抓了哪个、放到哪个上面
-5. --oracle 用反向真值像素和真值步骤，先确认抓绿块、放红块这套动作本身能做成
+4. 按模型合爪前、松爪前指的空间点各自离哪个方块近，判断它实际抓了哪个、放到哪个上面；
+   pixel 按像素比较，XYZ 转成世界坐标后按三维距离比较
+5. --oracle 用反向真值坐标和真值步骤，先确认抓绿块、放红块这套动作本身能做成
 """
 
 import argparse
@@ -25,8 +26,11 @@ import numpy as np
 
 from collect_lift_mllm import (
     DEFAULT_CAMERA,
+    base_to_world,
+    format_base_xyz,
     format_pixel,
     grip_view_pixels,
+    grip_view_xyz,
     project_world,
     with_views,
     world_to_pixel_matrices,
@@ -89,43 +93,55 @@ def reverse_success(env, obs):
     return lifted and touching and not is_holding_green(env)
 
 
-def reverse_plan(env, obs, offset, matrices, half, axis, camera_pos):
+def reverse_plan(env, obs, offset, matrices, half, axis, camera_pos, coord_mode="pixel"):
     """抓绿块、放到红块上的真值步骤。复用正向的步骤生成，只把两块对调。
 
     抓绿块的步骤写两指落点对（贴绿块两侧），放红块的步骤写红块中心，和正向任务一致。
-    所有像素都来自 frontview，被挡住的落点也按方块形状写出。
+    像素来自 frontview；XYZ 使用机器人基座整数厘米。
     """
     cube_a, cube_b, eef = positions_from_obs(obs)
     side = np.asarray(axis, dtype=float) * float(half)
     # 两指落点贴被叠的绿块两侧，朝 frontview 的一侧写 target_1。
     land_1, land_2 = order_landings_at(cube_b, camera_pos, (cube_b + side, cube_b - side))
-    grip_pixels = grip_view_pixels(land_1, land_2, matrices)
-    pix_place = format_pixel(project_world(cube_a, matrices[DEFAULT_CAMERA])[0])
-    steps = remaining_subtasks(cube_b, cube_a, eef, grip_pixels, pix_place, float(cube_b[2]), offset, False, False)
+    if coord_mode == "xyz":
+        grip_pixels = grip_view_xyz(env, land_1, land_2)
+        pix_place = format_base_xyz(env, cube_a)
+    else:
+        grip_pixels = grip_view_pixels(land_1, land_2, matrices)
+        pix_place = format_pixel(project_world(cube_a, matrices[DEFAULT_CAMERA])[0])
+    steps = remaining_subtasks(
+        cube_b, cube_a, eef, grip_pixels, pix_place, float(cube_b[2]), offset, False, False,
+        coord_mode=coord_mode,
+    )
     # format_plan 直接返回模型输出格式的 JSON 文本，oracle 时喂给 parse_plan。
     return format_plan(steps)
 
 
-def step_before(subtasks, kind):
-    """kind 这一步之前最近一个带 frontview 像素的步骤。"""
-    pixel = None
+def step_before(subtasks, kind, coord_mode="pixel"):
+    """kind 这一步之前最近一个带空间目标的步骤。"""
+    point = None
     for step in subtasks:
         if step["type"] == kind:
-            return pixel
-        if "pixel" in step:
-            pixel = step["pixel"]
+            return point
+        if coord_mode == "xyz":
+            point = step.get("base", {}).get("pixel", point)
+        elif "pixel" in step:
+            point = step["pixel"]
     return None
 
 
-def classify_behavior(subtasks, gt_pix):
-    """按合爪、松爪前的 frontview 像素判断抓了哪块、放到哪块上。"""
-    pick = step_before(subtasks, "close_gripper")
-    place = step_before(subtasks, "open_gripper")
+def classify_behavior(subtasks, gt_pix, gt_world=None, env=None, coord_mode="pixel"):
+    """按合爪、松爪前的像素或基座 XYZ 判断抓了哪块、放到哪块上。"""
+    pick = step_before(subtasks, "close_gripper", coord_mode)
+    place = step_before(subtasks, "open_gripper", coord_mode)
 
-    def nearest(pixel):
-        if pixel is None:
+    def nearest(point):
+        if point is None:
             return None
-        return OBJECT_NAMES[nearest_object(pixel, gt_pix)[0]]
+        if coord_mode == "xyz":
+            point = base_to_world(env, point)
+            return OBJECT_NAMES[nearest_object(point, gt_world)[0]]
+        return OBJECT_NAMES[nearest_object(point, gt_pix)[0]]
 
     picked = nearest(pick)
     placed_on = nearest(place)
@@ -138,7 +154,9 @@ def classify_behavior(subtasks, gt_pix):
     return picked, placed_on, behavior
 
 
-def run_episode(env, client, rng, episode, image_size, oracle, instruction=None, video_path=None):
+def run_episode(
+    env, client, rng, episode, image_size, oracle, instruction=None, video_path=None, coord_mode="pixel"
+):
     frames = []
 
     def on_step(obs):
@@ -150,10 +168,10 @@ def run_episode(env, client, rng, episode, image_size, oracle, instruction=None,
         obs, hold_ori, _rest_z = prepare_scene(env, rng, on_step)
         styled = instruction or REVERSE_INSTRUCTIONS[int(rng.integers(len(REVERSE_INSTRUCTIONS)))]
         # 和采集一致：指令以每台相机一个 <image> 占位开头、话术后面带字段说明，图走 image_url 后占位被剥掉。
-        instruction = with_views(styled, plan_desc())
+        instruction = with_views(styled, plan_desc(coord_mode))
         matrices = world_to_pixel_matrices(env, image_size)
         images = camera_images(obs, image_size)
-        views = make_views(env, obs, matrices)
+        views = make_views(env, obs, matrices) if coord_mode == "pixel" else None
         matrix = matrices[DEFAULT_CAMERA]
         # 评测执行保持 hold_ori，两指合拢轴就是它的第一列。
         axis = np.asarray(hold_ori, dtype=float)[:, 0].copy()
@@ -163,7 +181,8 @@ def run_episode(env, client, rng, episode, image_size, oracle, instruction=None,
         gt_a, gt_b, _ = positions_from_obs(obs)
         gt_pix = [project_world(gt_a, matrix)[0], project_world(gt_b, matrix)[0]]
         gt_answer = reverse_plan(
-            env, obs, place_offset(env), matrices, half_z(env.cubeA, 0.02), axis, cam_pos
+            env, obs, place_offset(env), matrices, half_z(env.cubeA, 0.02), axis, cam_pos,
+            coord_mode=coord_mode,
         )
 
         record = {"episode": episode, "instruction": instruction, "success": False, "behavior": None}
@@ -174,11 +193,13 @@ def run_episode(env, client, rng, episode, image_size, oracle, instruction=None,
         print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
         print("episode {:02d} answer ({}s):\n{}".format(episode, record["seconds"], answer), flush=True)
         try:
-            subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
+            subtasks = parse_plan(answer, image_size=image_size, coord_mode=coord_mode)["subtasks"]
             record["steps"] = [step["type"] for step in subtasks]
-            record["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-            record["picked"], record["placed_on"], record["behavior"] = classify_behavior(subtasks, gt_pix)
-            points = perceive(subtasks, views, image_size, axis=axis)
+            record["plan_match"] = plan_matches(subtasks, gt_answer, image_size, coord_mode=coord_mode)
+            record["picked"], record["placed_on"], record["behavior"] = classify_behavior(
+                subtasks, gt_pix, gt_world=[gt_a, gt_b], env=env, coord_mode=coord_mode
+            )
+            points = perceive(subtasks, views, image_size, axis=axis, env=env, coord_mode=coord_mode)
             targets = []
             for point in points:
                 target, line = point_target(point, gt_pix, gt_a, gt_b)
@@ -288,6 +309,10 @@ def main():
     parser.add_argument("--out", default="data/stack_reverse_eval")
     parser.add_argument("--no-video", action="store_true", help="不把每条测评的 frontview 录成 mp4")
     parser.add_argument("--oracle", action="store_true", help="用反向真值步骤代替模型，检查抓绿放红能否做成")
+    parser.add_argument(
+        "--coord-mode", choices=("pixel", "xyz"), default="pixel",
+        help="空间标签：frontview 像素加深度，或直接使用机器人基座 XYZ 整数厘米",
+    )
     parser.add_argument("--self-test", action="store_true", help="只检查共享解析与定位接口")
     args = parser.parse_args()
 
@@ -311,7 +336,9 @@ def main():
         print("api {} model {}".format(client.api_base, client.resolve_model()), flush=True)
 
     rng = np.random.default_rng(args.seed)
-    env = make_env(args.image_size, args.seed, use_camera=True, camera_depths=True)
+    env = make_env(
+        args.image_size, args.seed, use_camera=True, camera_depths=args.coord_mode == "pixel"
+    )
     image_size = camera_size(env)
     video_dir = None if args.no_video else Path(args.out) / "videos"
     records = []
@@ -320,7 +347,8 @@ def main():
             video_path = None if video_dir is None else video_dir / "ep{:04d}.mp4".format(episode)
             try:
                 record = run_episode(
-                    env, client, rng, episode, image_size, args.oracle, args.instruction or None, video_path
+                    env, client, rng, episode, image_size, args.oracle, args.instruction or None, video_path,
+                    coord_mode=args.coord_mode,
                 )
             except ServerError as exc:
                 print(exc, flush=True)
@@ -331,6 +359,7 @@ def main():
         summary = summarize_reverse(records)
         summary["task"] = "stack_reverse"
         summary["oracle"] = bool(args.oracle)
+        summary["coord_mode"] = args.coord_mode
         summary["seed"] = args.seed
         summary["backend"] = "oracle" if args.oracle else "vllm"
         summary["instruction"] = args.instruction or list(REVERSE_INSTRUCTIONS)

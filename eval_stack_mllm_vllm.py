@@ -8,16 +8,17 @@
 1. 按 collect_stack_mllm.py 的方式摆好两个方块，手臂移到随机出发点
 2. 只把 frontview RGB 和「把红色方块叠到绿色方块上」放进对话，
    只问一次；指令和采集一样以一个 <image> 占位开头
-3. 模型写出全部步骤：抓哪个像素、抬多高、放到哪个像素、放置高度、松爪、抬开。这些数都来自模型，
+3. 模型写出全部步骤：抓取位置、抬升高度、放置位置、放置高度、松爪、抬开。这些数都来自模型，
    抓红块的步骤给两指落点对（target_1、target_2），放绿块的步骤给绿块中心（target_1）
-4. 每个像素用当前 frontview 深度图换成世界坐标：单点按当前支撑层和可见顶面定位，
+4. pixel 模式用当前 frontview 深度图换成世界坐标：单点按当前支撑层和可见顶面定位，
    双落点与当前可见接触面的共同水平面求交，取两落点的中点执行。
+   XYZ 模式不使用深度，直接把机器人基座整数厘米转换为世界坐标。
    不读仿真里的物体位置，不用真值挑物体，也不使用预设方块尺寸
 5. 交给 task_plan.execute_plan，末端用世界坐标 OSC 跟踪，执行过程中不再看图、不再问模型
 6. 以 robosuite 的 Stack 成功判定为准：红块离开桌面、压在绿块上、夹爪已经松开
 
 仿真真值只用于事后统计误差，不进入模型输入，也不参与控制。
---oracle 用真值像素和真值步骤代替模型，其余流程不变，用来确认深度定位和执行器本身够用。
+--oracle 用真值坐标和真值步骤代替模型，其余流程不变，用来确认对应坐标定位链路和执行器本身够用。
 """
 
 import argparse
@@ -65,13 +66,17 @@ from eval_lift_mllm_vllm import (
 )
 from eval_video import EvalVideo
 from depth_locate import locate_plan, make_views, ray_at_height
-from task_plan import ParseError, check_parser, execute_plan, parse_plan, resolve_pixel
+from task_plan import ParseError, check_parser, direct_xyz_points, execute_plan, parse_plan, resolve_pixel
 
 VIDEO_FPS = 20
 
 
-def perceive(subtasks, views, image_size, axis=None):
-    """与其他任务共用当前类别和当前深度定位，不使用固定方块尺寸。"""
+def perceive(subtasks, views, image_size, axis=None, env=None, coord_mode="pixel"):
+    """像素模式使用深度定位；XYZ 模式直接把基座坐标转为世界坐标。"""
+    if coord_mode == "xyz":
+        if env is None:
+            raise ValueError("XYZ 定位需要 env")
+        return direct_xyz_points(env, subtasks)
     return locate_plan(subtasks, views, image_size, axis=axis)
 
 
@@ -85,22 +90,27 @@ def point_target(point, gt_pix, gt_a, gt_b):
     stat_pixel = point.get("center_pixel")
     if stat_pixel is None:
         stat_pixel = point.get("pixel")
-    index, dists = nearest_object(stat_pixel, gt_pix)
-    stat_gt = gt_pix[index]
-    gt = gt_a if index == 0 else gt_b
     world = point.get("center_world", point["world"])
+    if stat_pixel is None:
+        index, dists = nearest_object(world, [gt_a, gt_b])
+        stat_gt = None
+    else:
+        index, dists = nearest_object(stat_pixel, gt_pix)
+        stat_gt = gt_pix[index]
+    gt = gt_a if index == 0 else gt_b
     err = pos_error(world, gt)
     target = {
         "object": "red" if index == 0 else "green",
         "kind": point["info"].get("kind", "object"),
-        "pixel": round_pixel(stat_pixel),
-        "gt_pixel": round_pixel(stat_gt),
-        "pixel_err": round(dists[index], 2),
         "world": [round(float(v), 4) for v in world],
         "gt_world": [round(float(v), 4) for v in gt],
         "err_m": {k: round(v, 4) for k, v in err.items()},
         "depth": point["info"],
     }
+    if stat_pixel is not None:
+        target["pixel"] = round_pixel(stat_pixel)
+        target["gt_pixel"] = round_pixel(stat_gt)
+        target["pixel_err"] = round(dists[index], 2)
     if target["kind"] == "grip" and point.get("land_2") is not None:
         first = np.asarray(point["land_1"], dtype=float)
         second = np.asarray(point["land_2"], dtype=float)
@@ -109,20 +119,19 @@ def point_target(point, gt_pix, gt_a, gt_b):
         target["land_2"] = np.round(second, 4).tolist()
         target["grip_width_m"] = round(float(np.linalg.norm(axis[:2])), 4)
         target["closing_yaw_deg"] = round(float(np.degrees(np.arctan2(-axis[0], axis[1]))), 2)
-    line = "{} pixel gt={} pred={} pos gt={} pred={} {}".format(
-        target["object"],
-        format_pixel(stat_gt),
-        format_pixel(stat_pixel),
-        format_xyz(gt),
-        format_xyz(world),
-        format_err_axes(err),
+    line = "{} pos gt={} pred={} {}".format(
+        target["object"], format_xyz(gt), format_xyz(world), format_err_axes(err),
     )
+    if stat_pixel is not None:
+        line = "{} pixel gt={} pred={} {}".format(
+            target["object"], format_pixel(stat_gt), format_pixel(stat_pixel), line,
+        )
     return target, line
 
 
-def plan_matches(pred_steps, gt_answer, image_size):
+def plan_matches(pred_steps, gt_answer, image_size, coord_mode="pixel"):
     """步骤类型一致，放置高度、抬升量也接近标注。"""
-    gt_steps = parse_plan(gt_answer, image_size=image_size)["subtasks"]
+    gt_steps = parse_plan(gt_answer, image_size=image_size, coord_mode=coord_mode)["subtasks"]
     if [step["type"] for step in pred_steps] != [step["type"] for step in gt_steps]:
         return False
     for pred, gt in zip(pred_steps, gt_steps):
@@ -133,7 +142,7 @@ def plan_matches(pred_steps, gt_answer, image_size):
     return True
 
 
-def run_episode(env, client, rng, episode, image_size, oracle, video_path=None):
+def run_episode(env, client, rng, episode, image_size, oracle, video_path=None, coord_mode="pixel"):
     video = None if video_path is None else EvalVideo(env, image_size)
 
     def on_step(obs):
@@ -145,10 +154,10 @@ def run_episode(env, client, rng, episode, image_size, oracle, video_path=None):
         obs, hold_ori, rest_z = prepare_scene(env, rng, on_step)
         style = INSTRUCTION_STYLES[int(rng.integers(len(INSTRUCTION_STYLES)))]
         # 和采集一致：指令以每台相机一个 <image> 占位开头、话术后面带字段说明，图走 image_url 后占位被剥掉。
-        instruction = with_views(style[0], plan_desc())
+        instruction = with_views(style[0], plan_desc(coord_mode))
         matrices = world_to_pixel_matrices(env, image_size)
         images = camera_images(obs, image_size)
-        views = make_views(env, obs, matrices)
+        views = make_views(env, obs, matrices) if coord_mode == "pixel" else None
         matrix = matrices[DEFAULT_CAMERA]
         # 评测执行保持 hold_ori，两指合拢轴就是它的第一列。
         axis = np.asarray(hold_ori, dtype=float)[:, 0].copy()
@@ -168,6 +177,7 @@ def run_episode(env, client, rng, episode, image_size, oracle, video_path=None):
             half_z(env.cubeA, 0.02),
             axis,
             env.sim.data.cam_xpos[env.sim.model.camera_name2id(DEFAULT_CAMERA)],
+            coord_mode=coord_mode,
         )
         # format_plan 返回的就是模型输出格式的 JSON 文本，oracle 时直接喂给 parse_plan。
         gt_answer = gt_plan["answer"]
@@ -180,12 +190,12 @@ def run_episode(env, client, rng, episode, image_size, oracle, video_path=None):
         print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
         print("episode {:02d} answer ({}s):\n{}".format(episode, record["seconds"], answer), flush=True)
         try:
-            subtasks = parse_plan(answer, image_size=image_size)["subtasks"]
+            subtasks = parse_plan(answer, image_size=image_size, coord_mode=coord_mode)["subtasks"]
             if video is not None:
                 video.set_plan(subtasks, obs)
             record["steps"] = [step["type"] for step in subtasks]
-            record["plan_match"] = plan_matches(subtasks, gt_answer, image_size)
-            points = perceive(subtasks, views, image_size, axis=axis)
+            record["plan_match"] = plan_matches(subtasks, gt_answer, image_size, coord_mode=coord_mode)
+            points = perceive(subtasks, views, image_size, axis=axis, env=env, coord_mode=coord_mode)
             targets = []
             for point in points:
                 target, line = point_target(point, gt_pix, gt_a, gt_b)
@@ -251,7 +261,7 @@ def summarize(records):
         hits = [first_target(r, name) for r in records]
         hits = [t for t in hits if t is not None]
         out[name + "_found"] = len(hits)
-        out[name + "_pixel_err"] = mean_or_none([t["pixel_err"] for t in hits])
+        out[name + "_pixel_err"] = mean_or_none([t.get("pixel_err") for t in hits])
         out[name + "_xy_err_m"] = mean_or_none([t["err_m"]["xy"] for t in hits])
         out[name + "_z_err_m"] = mean_or_none([abs(t["err_m"]["z"]) for t in hits])
     return out
@@ -295,10 +305,10 @@ def print_summary(summary):
             print("{} 没有指到".format(label), flush=True)
             continue
         print(
-            "{} n={} 像素误差 {:.1f}px  水平误差 {}  高度误差 {}".format(
+            "{} n={} 像素误差 {}  水平误差 {}  高度误差 {}".format(
                 label,
                 summary[name + "_found"],
-                summary[name + "_pixel_err"],
+                "n/a" if summary[name + "_pixel_err"] is None else "{:.1f}px".format(summary[name + "_pixel_err"]),
                 format_cm(summary[name + "_xy_err_m"]),
                 format_cm(summary[name + "_z_err_m"]),
             ),
@@ -353,7 +363,11 @@ def main():
     parser.add_argument("--text-template", default="{instruction}", help="拼在图片后面的文本，默认就是指令原文")
     parser.add_argument("--out", default="data/stack_eval")
     parser.add_argument("--no-video", action="store_true", help="不把每条测评录成 frontview mp4")
-    parser.add_argument("--oracle", action="store_true", help="用真值步骤代替模型，检查深度定位和执行器")
+    parser.add_argument("--oracle", action="store_true", help="用真值步骤代替模型，检查坐标定位链路和执行器")
+    parser.add_argument(
+        "--coord-mode", choices=("pixel", "xyz"), default="pixel",
+        help="空间标签：frontview 像素加深度，或直接使用机器人基座 XYZ 整数厘米",
+    )
     parser.add_argument("--self-test", action="store_true", help="只检查解析和坐标换算")
     args = parser.parse_args()
 
@@ -377,7 +391,9 @@ def main():
         print("api {} model {}".format(client.api_base, client.resolve_model()), flush=True)
 
     rng = np.random.default_rng(args.seed)
-    env = make_env(args.image_size, args.seed, use_camera=True, camera_depths=True)
+    env = make_env(
+        args.image_size, args.seed, use_camera=True, camera_depths=args.coord_mode == "pixel"
+    )
     image_size = camera_size(env)
     video_dir = None if args.no_video else Path(args.out) / "videos"
     records = []
@@ -387,7 +403,9 @@ def main():
                 rng = reset_episode_rng(env, args.seed)
             video_path = None if video_dir is None else video_dir / "ep{:04d}.mp4".format(episode)
             try:
-                record = run_episode(env, client, rng, episode, image_size, args.oracle, video_path)
+                record = run_episode(
+                    env, client, rng, episode, image_size, args.oracle, video_path, coord_mode=args.coord_mode
+                )
             except ServerError as exc:
                 print(exc, flush=True)
                 break
@@ -396,6 +414,7 @@ def main():
     finally:
         summary = summarize(records)
         summary["oracle"] = bool(args.oracle)
+        summary["coord_mode"] = args.coord_mode
         summary["seed"] = args.seed
         summary["fixed_initial"] = bool(args.fixed_initial)
         summary["backend"] = "oracle" if args.oracle else "vllm"

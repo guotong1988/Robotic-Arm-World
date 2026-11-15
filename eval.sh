@@ -5,9 +5,9 @@
 # 所有任务连同一个 vLLM 服务，地址用 API_BASE 环境变量覆盖。
 # 直接运行会整体转到后台（nohup），立即返回，总日志是 $LOG/eval.log。
 # 全部任务结束后，按各目录的 summary.json 追加一张成功率表到这份总日志。
-# 两种模式：bash eval.sh random 保持每次初始场景随机；bash eval.sh fixed 让 20 次使用相同初始。
-# 调试时追加 --fg 前台执行，例如 bash eval.sh fixed --fg，能看到实时输出和退出码。
-# SEED 可换固定初始场景（默认 1000）；ORACLE=1 不连模型，用真值步骤检查深度定位和执行器。
+# 初始场景：random 每次随机，fixed 让多次使用相同初始；坐标模式：pixel（默认）或 xyz。
+# 调试时追加 --fg 前台执行，例如 bash eval.sh fixed xyz --fg，能看到实时输出和退出码。
+# SEED 可换固定初始场景（默认 1000）；ORACLE=1 不连模型，用真值步骤检查坐标定位链路和执行器。
 set -e
 # 容器重建后 /usr/share/glvnd 下可能缺少 NVIDIA 的 EGL vendor 配置，用用户目录副本兜底
 export __EGL_VENDOR_LIBRARY_FILENAMES=${__EGL_VENDOR_LIBRARY_FILENAMES:-/home/duqin.gt/egl_vendor.d/10_nvidia.json:/usr/share/glvnd/egl_vendor.d/50_mesa.json}
@@ -20,12 +20,14 @@ TIMEOUT=${TIMEOUT:-600}
 SEED=${SEED:-1000}
 IMAGE_SIZE=${IMAGE_SIZE:-1024}
 MODE=${MODE:-random}
+COORD_MODE=${COORD_MODE:-pixel}
 FG=0
 for arg in "$@"; do
     case "$arg" in
         random|fixed) MODE=$arg ;;
+        pixel|xyz) COORD_MODE=$arg ;;
         --fg) FG=1 ;;
-        *) echo "用法: bash eval.sh [random|fixed] [--fg]" >&2; exit 2 ;;
+        *) echo "用法: bash eval.sh [random|fixed] [pixel|xyz] [--fg]" >&2; exit 2 ;;
     esac
 done
 if [ "$MODE" != "random" ] && [ "$MODE" != "fixed" ]; then
@@ -42,19 +44,22 @@ if [ "$MODE" = "fixed" ]; then
 else
     DEFAULT_OUT=data/eval
 fi
+if [ "$COORD_MODE" = "xyz" ]; then
+    DEFAULT_OUT=${DEFAULT_OUT}_xyz
+fi
 OUT=${OUT:-$DEFAULT_OUT}
 LOG=$OUT/logs
 mkdir -p $LOG
 
 if [ "$FG" -ne 1 ]; then
     nohup env PY="$PY" API_BASE="$API_BASE" EPISODES="$EPISODES" TIMEOUT="$TIMEOUT" SEED="$SEED" \
-        IMAGE_SIZE="$IMAGE_SIZE" OUT="$OUT" ORACLE="${ORACLE:-}" \
-        bash "$0" "$MODE" --fg > $LOG/eval.log 2>&1 &
-    echo "后台执行 pid $!，模式 $MODE，总日志 $LOG/eval.log，各任务日志在 $LOG"
+        IMAGE_SIZE="$IMAGE_SIZE" OUT="$OUT" ORACLE="${ORACLE:-}" COORD_MODE="$COORD_MODE" \
+        bash "$0" "$MODE" "$COORD_MODE" --fg > $LOG/eval.log 2>&1 &
+    echo "后台执行 pid $!，初始场景 $MODE，坐标模式 $COORD_MODE，总日志 $LOG/eval.log，各任务日志在 $LOG"
     exit 0
 fi
 
-EXTRA="--seed $SEED --image-size $IMAGE_SIZE"
+EXTRA="--seed $SEED --image-size $IMAGE_SIZE --coord-mode $COORD_MODE"
 if [ "$MODE" = "fixed" ]; then
     EXTRA="$EXTRA --fixed-initial"
 fi

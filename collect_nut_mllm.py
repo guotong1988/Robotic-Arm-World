@@ -4,11 +4,12 @@
 NutAssemblySquare、NutAssemblyRound（固定一个）。方形螺母套方柱，圆形螺母套圆柱。
 
 螺母只有把手能抓。采集器内部按螺母朝向规划抓取 yaw，让两指横跨把手；
-抓取标签只带两指落点：target_1、target_2 贴在把手横杆两侧，两点的中点是抓取点，连线决定执行 yaw。
-两个落点都写在 frontview 图上；柱顶、松爪后的抬开这些单点步骤只写 target_1。
+抓取标签带两指落点：target_1、target_2 贴在把手横杆两侧，两点的中点是抓取点。
+pixel 模式由连线决定执行 yaw；XYZ 模式保留计划的安全 yaw，避免整数厘米量化改变短连线方向。
+pixel 落点写在 frontview 图上，XYZ 落点用机器人基座整数厘米；柱顶、松爪后的抬开这些单点步骤只写 target_1。
 抓的位置比把手中心再往外 1.2 厘米，免得指头压到螺母的环上。
 柱子 20 厘米高，抬起后螺母底部要高过柱顶。放的时候要对准柱子的是螺母中心，不是夹爪，
-所以往柱子去的几步带 align_point，是螺母中心的 frontview 像素；柱子的像素是柱顶中心。
+所以往柱子去的几步带 align_point；柱子的 target_1 是柱顶中心，坐标格式随 coord_mode。
 往柱子去的那一步还带 yaw，路上把螺母转到把手朝机器人，柱子在桌子远端，这样手臂不用伸直。
 螺母沿柱子往下套，到离桌面 3.5 厘米时松爪，再竖直抬开。
 
@@ -18,7 +19,7 @@ NutAssemblySquare、NutAssemblyRound（固定一个）。方形螺母套方柱�
     <image>
     把方形螺母套到方柱上。回答的 JSON 中，target_1、target_2 是夹住把手的两指落点的像素，都在正面相机图上，中点是抓取点；柱顶等单点步骤只写 target_1。
 
-输出例子（方形螺母还没抓住时，每个 subtask 都带 desc）：
+输出例子（默认 pixel 模式，方形螺母还没抓住时，每个 subtask 都带 desc）：
 
     {"subtasks": [{"type": "move_above", "desc": "移到方形螺母上方", "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip", "clearance": 0.1}, {"type": "move_down", "desc": "降到把手上方准备夹", "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住把手"}, {"type": "lift", "desc": "抬起方形螺母", "delta_z": 0.25, "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到方柱正上方", "target_1": "[300 250]", "target_kind": "peg", "clearance": 0.05, "yaw": 12, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "move_down", "desc": "把方形螺母套到方柱上", "target_1": "[300 250]", "target_kind": "peg", "offset_z": -0.165, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "open_gripper", "desc": "松爪放下螺母"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[300 250]", "target_kind": "peg", "clearance": 0.06, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
@@ -228,7 +229,12 @@ class NutTask:
         side = mat @ np.array([0.0, half, 0.0])
         return order_landings(env, center, (center + side, center - side))
 
-    def plan_desc(self):
+    def plan_desc(self, coord_mode="pixel"):
+        if coord_mode == "xyz":
+            return (
+                "抓取步骤的 target_1、target_2 是夹住螺母把手的两指落点，柱顶和 align_point 只写单点；"
+                "它们都是机器人基座 XYZ 整数厘米 [x y z]，两落点的中点是抓取点"
+            )
         return (
             "target_1、target_2 是夹住把手的两指落点的像素，都在正面相机图上；"
             "另一个落点被挡住时也根据把手形状和朝向补出它的像素，不写 mask。"
