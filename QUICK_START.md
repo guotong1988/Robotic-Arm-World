@@ -61,6 +61,8 @@ bash eval.sh fixed xyz --fg
 
 `eval.sh` 的 `random|fixed` 和 `pixel|xyz` 是两个独立参数。XYZ 的默认评测目录是 `data/eval_xyz` 或 `data/eval_fixed_xyz`，与 pixel 的 `data/eval`、`data/eval_fixed` 隔离。两个脚本也接受 `COORD_MODE=xyz` 环境变量；显式参数优先。
 
+两种模式的默认输出目录彼此隔离，也可用 `OUT` 覆盖。XYZ 数据不写 `target_kind`、`align_point_kind`、`pivot_kind`、`path_kind`，这些角色字段只在 pixel 模式用于选择深度量法。
+
 ## 步骤原语
 
 | 原语 | 参数 | 含义 |

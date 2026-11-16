@@ -2,7 +2,7 @@
 
 https://space.bilibili.com/447278957/lists
 
-本项目基于 robosuite + Panda 实现 VLM 驱动的单臂操作。模型根据单张 frontview RGB 和指令生成操作计划，再由控制器驱动机械臂执行。空间标签支持两种模式：默认 `pixel` 使用 2D 像素并结合深度恢复三维位置；`xyz` 直接预测机器人基座坐标系中的 XYZ 整数厘米，评测不经过像素反投影或深度定位。
+本项目基于 robosuite + Panda 实现 VLM 驱动的单臂操作。模型根据单张 frontview RGB 和指令生成操作计划，再由控制器驱动机械臂执行。空间标签支持两种模式：默认 `pixel` 使用 2D 像素并结合深度恢复三维位置；`xyz` 直接预测机器人基座坐标系中的 XYZ 整数厘米，评测不经过像素反投影或深度定位。最后通过逆运动学（IK）驱动机械臂执行操作。
 
 ```bash
 # 采集：默认输出分别为 mllm_data 和 mllm_data_xyz
@@ -13,9 +13,7 @@ bash collect.sh xyz --fg
 bash eval.sh random pixel --fg
 bash eval.sh random xyz --fg
 ```
-去掉 --fg 是后台评估。
-
-两种模式的默认输出目录彼此隔离，也可用 `OUT` 覆盖。XYZ 数据不写 `target_kind`、`align_point_kind`、`pivot_kind`、`path_kind`，这些角色字段只在 pixel 模式用于选择深度量法。
+去掉 --fg 是后台跑。
 
 采集、评测、步骤原语和坐标定位的说明见 [QUICK_START.md](QUICK_START.md)。
 
