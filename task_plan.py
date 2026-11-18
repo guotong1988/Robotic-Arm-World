@@ -83,6 +83,7 @@ WRIST_SAFE = 140.0
 # 朝向一次变化超过这个角度时分段插值。目标离当前朝向接近半圈时，
 # 控制器自己选的转向会随一点点误差翻到另一边，把手腕带到关节极限。
 ORI_STEP = 0.15
+SEVERE_POS_ERR = 0.15  # 超过 15cm 才重试或中止；较小的放置误差仍允许后续步骤恢复
 # 竖直朝下、两指沿世界 y 合拢的夹爪朝向。各列是夹爪 x、y、z 轴，x 是两指合拢方向。
 TOPDOWN = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
 SPATIAL = ("move_above", "move_down", "lift")
@@ -667,6 +668,30 @@ def _panda_wrist_yaw(env):
     return WRIST_CENTER - float(np.degrees(q7))
 
 
+def _topdown_flip(ori):
+    """竖直两指抓取的 yaw 加 180 度是同一抓法；侧抓等其他姿态不能这样翻转。"""
+    ori = np.asarray(ori, dtype=float)
+    if np.linalg.norm(ori[:2, 2]) > 1e-6 or abs(float(ori[2, 2]) + 1.0) > 1e-6:
+        return None
+    return rotation_z(np.pi) @ ori
+
+
+def _wrist_safe_ori(ori, wrist_yaw):
+    """在两个等效竖直朝向里，优先选当前 q7 能安全到达的分支。"""
+    ori = np.asarray(ori, dtype=float)
+    flipped = _topdown_flip(ori)
+    if flipped is None:
+        return ori
+    candidates = []
+    for target in (ori, flipped):
+        target_yaw = float(np.degrees(np.arctan2(-target[0, 0], target[1, 0])))
+        travel = (target_yaw - float(wrist_yaw) + 180.0) % 360.0 - 180.0
+        settled = float(wrist_yaw) + travel
+        excess = max(0.0, abs(settled - WRIST_CENTER) - WRIST_SAFE)
+        candidates.append(((excess, abs(travel)), target))
+    return min(candidates, key=lambda item: item[0])[1]
+
+
 def _grip_ori(first, second, current, wrist_yaw=None):
     """由落点连线确定 yaw；等价朝向先避开手腕限位，再选转动较小的一个。"""
     axis = np.asarray(second, dtype=float) - np.asarray(first, dtype=float)
@@ -674,16 +699,9 @@ def _grip_ori(first, second, current, wrist_yaw=None):
     axis /= np.linalg.norm(axis)
     yaw = float(np.degrees(np.arctan2(-axis[0], axis[1])))
     ori = topdown_ori(yaw)
-    flipped = topdown_ori(yaw + 180.0)
     if wrist_yaw is not None:
-        candidates = []
-        for target in (ori, flipped):
-            target_yaw = float(np.degrees(np.arctan2(-target[0, 0], target[1, 0])))
-            travel = (target_yaw - float(wrist_yaw) + 180.0) % 360.0 - 180.0
-            settled = float(wrist_yaw) + travel
-            excess = max(0.0, abs(settled - WRIST_CENTER) - WRIST_SAFE)
-            candidates.append(((excess, abs(travel)), target))
-        return min(candidates, key=lambda item: item[0])[1]
+        return _wrist_safe_ori(ori, wrist_yaw)
+    flipped = topdown_ori(yaw + 180.0)
     if float(np.dot(flipped[:, 0], current[:, 0])) > float(np.dot(ori[:, 0], current[:, 0])):
         return flipped
     return ori
@@ -753,7 +771,8 @@ def execute_plan(
         entry = {"type": kind}
         if kind in SPATIAL:
             if "target_ori" in step:
-                ori = np.asarray(step["target_ori"], dtype=float)
+                # XYZ 的绝对 RPY 也允许两指等效翻转，按当前手腕状态选安全分支。
+                ori = _wrist_safe_ori(step["target_ori"], _panda_wrist_yaw(env))
             elif "yaw" in step:
                 # 旧标签的明确 yaw 优先于双落点推导，它通常还考虑了手腕限位和后续搬运。
                 ori = topdown_ori(step["yaw"])
@@ -775,6 +794,24 @@ def execute_plan(
             else:
                 tol, limit, command = LIFT_TOL, LIFT_STEPS, 1.0
             obs, ok, err = goto(env, dest, ori, command, tol, limit, on_step)
+            if err is not None and err > SEVERE_POS_ERR:
+                flipped = _topdown_flip(ori)
+                if flipped is not None:
+                    # 只有失败后另一分支反而更适合当前手腕时才重试，否则直接中止。
+                    preferred = _wrist_safe_ori(flipped, _panda_wrist_yaw(env))
+                    if np.allclose(preferred, flipped):
+                        # 目标位置也要按新朝向重算，尤其是带 align_point 的搬运步骤。
+                        retry_dest = _dest_for(step, landmarks, matrices, grasp_point, grasp_ori, flipped)
+                        obs, ok, err = goto(env, retry_dest, flipped, command, tol, limit, on_step)
+                        ori, dest = flipped, retry_dest
+                        entry["yaw_flip_retry"] = True
+                        target_axis = np.asarray(ori, dtype=float)[:, 0]
+                        entry["target_pos"] = np.round(dest, 4).tolist()
+                        entry["target_yaw_deg"] = round(
+                            float(np.degrees(np.arctan2(-target_axis[0], target_axis[1]))), 2
+                        )
+                if err is not None and err > SEVERE_POS_ERR:
+                    entry["aborted"] = True
             arm = arm_controller(env)
             actual_axis = np.asarray(arm.ref_ori_mat, dtype=float)[:, 0]
             entry["actual_pos"] = np.round(arm.ref_pos, 4).tolist()
@@ -836,6 +873,8 @@ def execute_plan(
         trace.append(entry)
         if on_complete is not None:
             on_complete(index, step)
+        if entry.get("aborted"):
+            break
     return obs, trace
 
 
@@ -967,6 +1006,9 @@ def check_parser():
         wrist_yaw=-121.0,
     )
     assert np.allclose(safe, topdown_ori(35.0))
+    assert np.allclose(_wrist_safe_ori(topdown_ori(-145.0), -121.0), topdown_ori(35.0))
+    assert np.allclose(_topdown_flip(topdown_ori(35.0)), topdown_ori(215.0))
+    assert _topdown_flip(approach_ori([0.0, -1.0, 0.0])) is None
     pair_step["world"]["pixel_2"] = np.array([0.2, 0.0, 0.83])
     side_step = {"world": {"pixel": np.array([0.0, 0.0, 1.10]), "pixel_2": np.array([0.0, 0.0, 1.06])}}
     side_first, side_second = _side_grip_world(side_step, [], {})
