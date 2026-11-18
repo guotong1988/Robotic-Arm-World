@@ -29,6 +29,7 @@ from robosuite.utils.transform_utils import mat2quat
 from collect_lift_mllm import (
     CAMERAS,
     DEFAULT_CAMERA,
+    XYZ_POSE_SPEC,
     arm_controller,
     capture_camera_images,
     configure_lazy_camera,
@@ -41,12 +42,14 @@ from collect_lift_mllm import (
     move_until,
     panda_world_osc,
     project_world,
+    robot_base_pose,
     rotated_about_z,
     round_pixel,
     save_rgb,
     with_views,
     world_to_pixel_matrices,
 )
+from grip_ik import offset_fields, rpy_fields, rpy_rotation
 from mllm_dataset import attempt_stats, finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
 from task_plan import (
     LIFT_TOL,
@@ -56,7 +59,11 @@ from task_plan import (
     ParseError,
     REACH_TOL,
     STABILIZE_DURATION,
+    _grip_ori,
+    _panda_wrist_yaw,
     approach_ori,
+    axis_rotation,
+    direct_xyz_pose,
     execute_plan,
     format_plan,
     has_second_point,
@@ -116,9 +123,9 @@ def plan_desc(task, coord_mode="pixel"):
     if fn is not None:
         text = fn(coord_mode)
         if text:
-            return text
+            return text + ("。" + XYZ_POSE_SPEC if coord_mode == "xyz" else "")
     if coord_mode == "xyz":
-        return "target_1、align_point、pivot、path 都是机器人基座 XYZ 整数厘米 [x y z]，双落点步骤还写 target_2"
+        return "target_1、align_point、pivot、path 都是机器人基座 XYZ 整数厘米 [x y z]，双落点步骤还写 target_2。" + XYZ_POSE_SPEC
     return "target_1 是要对准的点在正面相机图上的像素"
 
 
@@ -148,7 +155,8 @@ def answer_spec(coord_mode="pixel"):
         spatial = (
             "target_1、target_2、align_point、pivot、path 都写机器人基座 XYZ，格式为整数厘米 \"[x y z]\"；"
             "不写 target_kind、align_point_kind、pivot_kind、path_kind。"
-            "move_above、move_down、lift、reach、turn、wipe 的其余数值字段沿用原定义。"
+            "move_above、move_down、lift 统一写 offset_z，是目标点沿 +z 偏移的整数厘米，move_above/lift 非负，move_down 可正负；"
+            "wipe 的 offset_z 也用整数厘米，duration 仍为秒。" + XYZ_POSE_SPEC
         )
         return lead + spatial
     views = "像素都写成 \"[x y]\"，x 向右、y 向下，原点在左上角。每个空间字段给 frontview 的像素：target_1 对应 image；align_point、pivot、path 同理。"
@@ -157,7 +165,7 @@ def answer_spec(coord_mode="pixel"):
 
 def coordinate_frame(coord_mode="pixel"):
     if coord_mode == "xyz":
-        return "subtasks 里的 target_1、target_2、pivot、align_point、path 是机器人基座 XYZ 整数厘米；points 里的 pos 是世界坐标，米"
+        return "subtasks 里的 target_1、target_2、pivot、align_point、path、offset_x/y/z 是机器人基座量，位置为整数厘米；RPY 为度，绝对/相对语义随步骤类型；points 里的 pos 是世界坐标，米"
     return "subtasks 里的 target_1、pivot、align_point、path 是 frontview 像素；points 里的 pos 是世界坐标，米"
 
 
@@ -233,15 +241,18 @@ def point_kind(task, name):
     return fn(name) if fn is not None else None
 
 
-def render_step(task, env, step, points, matrices, eef, eef_ori, current, coord_mode="pixel", grip_yaw=None):
+def render_step(
+    task, env, step, points, matrices, eef, eef_ori, current, coord_mode="pixel", grip_yaw=None, planned_ori=None
+):
     """抽象步骤写成这一帧的 subtask。current 表示正在做这一步，已经到位就返回 None。
 
     pixel 模式的空间字段写 frontview 像素，被挡住时也根据物体形状写出像素；
-    xyz 模式写机器人基座整数厘米。只有 pixel 写 *_kind，供评测选择深度量法。
+    xyz 模式写机器人基座整数厘米，move_above/move_down/lift 统一写整数厘米 offset_z，
+    reach 的三维偏移和 wipe.offset_z 也用整数厘米。只有 pixel 写 *_kind，供评测选择深度量法。
     任务实现 grip_points(env, name) 且 name 是夹爪落点时，写 target_1、target_2，
-    执行器取两点的中点。pixel 竖直抓取由两点连线推导 yaw；XYZ 可保留抽象计划
-    已避腕部限位的安全 yaw，避免短落点对量化改变朝向。Door 的 reach 始终由连线
-    和 approach 构造侧抓姿态，不写 yaw。每步带 desc，说明这一步做什么。
+    执行器取两点的中点。pixel 竖直抓取由两点连线推导 yaw；XYZ 写出基座绝对 RPY，
+    避免短落点对量化改变朝向。Door 的 reach 由连线和 approach 构造完整侧抓姿态。
+    每步带 desc，说明这一步做什么。
     """
 
     def put_views(out, key, name):
@@ -260,13 +271,23 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current, coord_
             return None
         if coord_mode == "xyz":
             out.update(grip_view_xyz(env, pair[0], pair[1]))
-            if kind != "reach" and grip_yaw is not None:
-                # 短落点对按厘米取整会放大角度误差；沿用抽象计划已避腕部限位的 yaw。
-                out["yaw"] = int(round(float(grip_yaw)))
         else:
             out.update(grip_view_pixels(pair[0], pair[1], matrices))
             out["target_kind"] = "grip"
         return pair
+
+    def put_xyz_pose(out, grip_pair=None):
+        planned_yaw = grip_yaw if grip_pair is not None else step.get("yaw")
+        inherited = np.asarray(eef_ori if planned_ori is None else planned_ori, dtype=float)
+        if planned_yaw is not None:
+            world_ori = topdown_ori(planned_yaw)
+        elif grip_pair is not None:
+            world_ori = _grip_ori(
+                grip_pair[0], grip_pair[1], inherited, wrist_yaw=_panda_wrist_yaw(env)
+            )
+        else:
+            world_ori = inherited
+        out.update(rpy_fields(robot_base_pose(env)[1].T @ world_ori))
 
     kind = step["type"]
     if kind in ("move_above", "move_down"):
@@ -279,13 +300,19 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current, coord_
                 out["target_kind"] = ref_kind
         if kind == "move_above":
             extra = float(step["clearance"])
-            out["clearance"] = round(extra, 2)
+            if coord_mode == "xyz":
+                out["offset_z"] = int(round(extra * 100))
+            else:
+                out["clearance"] = round(extra, 2)
             tol = MOVE_ABOVE_TOL
         else:
             extra = float(step["offset_z"])
-            out["offset_z"] = round(extra, 3)
+            out["offset_z"] = int(round(extra * 100)) if coord_mode == "xyz" else round(extra, 3)
             tol = PLACE_DOWN_TOL if extra >= 0.02 else MOVE_DOWN_TOL
-        if "yaw" in step and grip_pair is None:
+        if coord_mode == "xyz":
+            # 短落点对的量化不再影响姿态；保留抽象计划已避腕部限位的完整朝向。
+            put_xyz_pose(out, grip_pair)
+        elif "yaw" in step and grip_pair is None:
             out["yaw"] = int(round(float(step["yaw"])))
         if "align_point" in step:
             put_views(out, "align_point", step["align_point"])
@@ -306,16 +333,19 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current, coord_
             return None
         if delta < 0.005:
             return None
-        out = {
-            "type": "lift",
-            "desc": step_desc(task, env, step),
-            "delta_z": round(delta, 2),
-        }
-        if put_grip(out, step["ref"]) is None:
+        out = {"type": "lift", "desc": step_desc(task, env, step)}
+        if coord_mode == "xyz":
+            out["offset_z"] = int(round(delta * 100))
+        else:
+            out["delta_z"] = round(delta, 2)
+        grip_pair = put_grip(out, step["ref"])
+        if grip_pair is None:
             put_views(out, "target_1", step["ref"])
             ref_kind = point_kind(task, step["ref"]) if coord_mode == "pixel" else None
             if ref_kind is not None:
                 out["target_kind"] = ref_kind
+        if coord_mode == "xyz":
+            put_xyz_pose(out, grip_pair)
         return out
     if kind == "reach":
         approach = np.asarray(step["approach"], dtype=float)
@@ -326,11 +356,16 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current, coord_
             ref_kind = point_kind(task, step["ref"]) if coord_mode == "pixel" else None
             if ref_kind is not None:
                 out["target_kind"] = ref_kind
-        out["approach"] = _vector(approach)
-        out["standoff"] = round(float(step["standoff"]), 2)
+        ori = approach_ori(approach) if grip_pair is None else side_grip_ori(grip_pair[0], grip_pair[1], approach)
+        if coord_mode == "xyz":
+            base_mat = np.asarray(robot_base_pose(env)[1], dtype=float)
+            out.update(rpy_fields(base_mat.T @ ori))
+            out.update(offset_fields(base_mat.T @ (-approach * float(step["standoff"]))))
+        else:
+            out["approach"] = _vector(approach)
+            out["standoff"] = round(float(step["standoff"]), 2)
         if current:
             base = points[step["ref"]] if grip_pair is None else 0.5 * (grip_pair[0] + grip_pair[1])
-            ori = approach_ori(approach) if grip_pair is None else side_grip_ori(grip_pair[0], grip_pair[1], approach)
             goal = np.asarray(base, dtype=float) - approach * float(step["standoff"])
             if float(np.linalg.norm(eef - goal)) <= REACH_TOL and _ori_close(eef_ori, ori):
                 return None
@@ -341,8 +376,13 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current, coord_
             return None
         out = {"type": "turn", "desc": step_desc(task, env, step)}
         put_views(out, "pivot", step["pivot"])
-        out["axis"] = _vector(step["axis"])
-        out["angle"] = int(round(angle))
+        if coord_mode == "xyz":
+            base_mat = np.asarray(robot_base_pose(env)[1], dtype=float)
+            world_rot = axis_rotation(step["axis"], np.radians(angle))
+            out.update(rpy_fields(base_mat.T @ world_rot @ base_mat))
+        else:
+            out["axis"] = _vector(step["axis"])
+            out["angle"] = int(round(angle))
         pivot_kind = point_kind(task, step["pivot"]) if coord_mode == "pixel" else None
         if pivot_kind is not None:
             out["pivot_kind"] = pivot_kind
@@ -360,7 +400,10 @@ def render_step(task, env, step, points, matrices, eef, eef_ori, current, coord_
                 for name in names
             ],
         }
-        out["offset_z"] = round(float(step["offset_z"]), 3)
+        out["offset_z"] = (
+            int(round(float(step["offset_z"]) * 100)) if coord_mode == "xyz"
+            else round(float(step["offset_z"]), 3)
+        )
         path_kind = point_kind(task, names[0]) if coord_mode == "pixel" else None
         if path_kind is not None:
             out["path_kind"] = path_kind
@@ -377,6 +420,8 @@ def render_plan(task, env, plan, index, matrices, done, coord_mode="pixel"):
     points = task.points(env)
     eef, eef_ori = eef_pose(env)
     subtasks, mapping = [], []
+    planned_ori = np.asarray(eef_ori, dtype=float)
+    base_mat = np.asarray(robot_base_pose(env)[1], dtype=float) if coord_mode == "xyz" else None
     for k in range(int(index), len(plan)):
         ref = plan[k].get("ref")
         grip_yaw = next(
@@ -389,16 +434,24 @@ def render_plan(task, env, plan, index, matrices, done, coord_mode="pixel"):
         )
         step = render_step(
             task, env, plan[k], points, matrices, eef, eef_ori, current=(k == index), coord_mode=coord_mode,
-            grip_yaw=grip_yaw,
+            grip_yaw=grip_yaw, planned_ori=planned_ori,
         )
         if step is not None:
             subtasks.append(step)
             mapping.append(k)
+            if coord_mode == "xyz" and "roll" in step:
+                values = [step[key] for key in ("roll", "pitch", "yaw")]
+                rot = base_mat @ rpy_rotation(values)
+                if step["type"] == "turn":
+                    planned_ori = rot @ base_mat.T @ planned_ori
+                else:
+                    planned_ori = rot
     return subtasks, mapping
 
 
 def attach_execution_world(task, env, abstract, concrete):
     """采集执行直接用已有真值点；像素反投影只用于没有真值的模型评测。"""
+    direct_xyz_pose(env, concrete)
     points = task.points(env)
     world = {}
     ref = abstract.get("ref")

@@ -65,6 +65,7 @@ from collect_lift_mllm import (
     positions_from_obs,
     project_world,
     remaining_lift,
+    robot_base_pose,
     round_pixel,
     sample_start_pos,
     unproject_pixel,
@@ -72,8 +73,18 @@ from collect_lift_mllm import (
 )
 from depth_locate import make_views, recover_landings
 from eval_video import EvalVideo
-from grip_ik import GRIP_YAW, IKArm, choose_grasp, grasp_candidates, pad_offset, topdown_ori
-from task_plan import parse_base_xyz
+from grip_ik import (
+    GRIP_YAW,
+    IKArm,
+    choose_grasp,
+    closing_yaw,
+    grasp_candidates,
+    pad_offset,
+    rpy_fields,
+    rpy_rotation,
+    topdown_ori,
+)
+from task_plan import _xyz_length, parse_base_xyz, parse_rpy
 
 # 采集时悬停高度在 8 到 15 厘米之间随机，这里取中间附近的固定值。
 HOVER_CLEARANCE = 0.12
@@ -153,17 +164,24 @@ def normalize_subtasks(items, image_size, coord_mode="pixel"):
                 step["pixel"] = parse_pixel(value, image_size)
                 if "target_2" in item:
                     step["pixel_2"] = parse_pixel(item["target_2"], image_size)
-            if coord_mode == "xyz" and kind in ("move_above", "move_down") and "yaw" in item:
-                yaw = float(item["yaw"])
-                if not np.isfinite(yaw) or not -180.0 <= yaw <= 180.0:
-                    raise ValueError("yaw 超出范围：{}".format(yaw))
-                step["yaw"] = yaw
+            if coord_mode == "xyz":
+                rpy = parse_rpy(item, kind)
+                if rpy is not None:
+                    step["base_rpy"] = rpy
+                if rpy is None and kind in ("move_above", "move_down") and "yaw" in item:
+                    yaw = float(item["yaw"])
+                    if not np.isfinite(yaw) or not -180.0 <= yaw <= 180.0:
+                        raise ValueError("yaw 超出范围：{}".format(yaw))
+                    step["yaw"] = yaw
         if kind == "lift":
-            if "delta_z" not in item:
-                raise ValueError("lift 缺少 delta_z")
-            delta = float(item["delta_z"])
-            if not np.isfinite(delta) or not (0.0 <= delta <= 0.5):
-                raise ValueError("delta_z 超出范围：{}".format(delta))
+            if coord_mode == "xyz" and "offset_z" in item:
+                delta = _xyz_length(item["offset_z"], 0.0, 0.5, "offset_z")
+            else:
+                if "delta_z" not in item:
+                    raise ValueError("lift 缺少 delta_z")
+                delta = float(item["delta_z"])
+                if not np.isfinite(delta) or not (0.0 <= delta <= 0.5):
+                    raise ValueError("delta_z 超出范围：{}".format(delta))
             step["delta_z"] = round(delta, 4)
         elif kind == "stabilize":
             duration = float(item.get("duration", STABILIZE_DURATION))
@@ -202,14 +220,16 @@ def _plan_from_object(obj, image_size, coord_mode="pixel"):
     target = None
     target_2 = None
     yaw = None
+    base_rpy = None
     for step in steps:
         points = step.get("base", {}) if coord_mode == "xyz" else step
         if "pixel" in points:
             target = points["pixel"]
             target_2 = points.get("pixel_2")
             yaw = step.get("yaw")
+            base_rpy = step.get("base_rpy")
             break
-    return {"target": target, "target_2": target_2, "yaw": yaw, "subtasks": steps}
+    return {"target": target, "target_2": target_2, "yaw": yaw, "base_rpy": base_rpy, "subtasks": steps}
 
 
 def _parse_plan(text, image_size, coord_mode="pixel"):
@@ -545,11 +565,14 @@ def predict(
         gt_pixel_2, _ = project_world(gt_back, matrices[DEFAULT_CAMERA])
     started = time.perf_counter()
     if oracle:
+        rpy = None
         if coord_mode == "xyz":
             points = grip_view_xyz(env, gt_front, gt_back)
+            world_ori = topdown_ori(closing_yaw(axis))
+            rpy = rpy_fields(robot_base_pose(env)[1].T @ world_ori)
         else:
             points = grip_view_pixels(gt_front, gt_back, matrices)
-        text = format_answer(points, gt_cube, gt_eef, phase, above, delta_z, coord_mode=coord_mode)
+        text = format_answer(points, gt_cube, gt_eef, phase, above, delta_z, coord_mode=coord_mode, rpy=rpy)
     else:
         text = client.complete(images, instruction)
     print("episode {:02d} instruction: {}".format(episode, instruction), flush=True)
@@ -576,6 +599,9 @@ def predict(
             size,
             axis=axis,
         )
+    target_ori = None
+    if coord_mode == "xyz" and plan.get("base_rpy") is not None:
+        target_ori = robot_base_pose(env)[1] @ rpy_rotation(plan["base_rpy"])
     elapsed = time.perf_counter() - started
     return {
         "answer": text,
@@ -587,6 +613,7 @@ def predict(
             "target": 0.5 * (front + back),
             "subtasks": plan["subtasks"],
             "yaw": plan.get("yaw"),
+            "ori": target_ori,
         },
         "gt_cube_pos": gt_cube,
         "gt_eef_pos": gt_eef,
@@ -737,7 +764,11 @@ def run_episode(
             back_w = pred["plan"]["back"]
             try:
                 pose, ori, _yaw, _q = choose_grasp(
-                    arm.ik, grasp_candidates([front_w, back_w], finger_offset, yaw=pred["plan"].get("yaw"))
+                    arm.ik,
+                    grasp_candidates(
+                        [front_w, back_w], finger_offset,
+                        yaw=pred["plan"].get("yaw"), ori=pred["plan"].get("ori"),
+                    ),
                 )
             except ValueError as exc:
                 raise ParseError(str(exc)) from exc
@@ -1409,6 +1440,54 @@ def self_test():
     assert plan["subtasks"][3]["delta_z"] == 0.14
     assert plan["subtasks"][4]["duration"] == 0.5
     assert subtasks_match(plan, text)
+    xyz_text = format_answer(
+        {"target_1": "[10 -20 83]", "target_2": "[14 -20 83]"},
+        [-0.0974, 0.0752, 0.8216],
+        [-0.0840, 0.0895, 0.9939],
+        "initial",
+        False,
+        0.14,
+        coord_mode="xyz",
+        rpy={"roll": 180, "pitch": 0, "yaw": 135},
+    )
+    xyz_raw = json.loads(xyz_text)["subtasks"]
+    xyz_lift = next(step for step in xyz_raw if step["type"] == "lift")
+    assert xyz_lift["offset_z"] == 14 and isinstance(xyz_lift["offset_z"], int)
+    assert "delta_z" not in xyz_lift and all("target_kind" not in step for step in xyz_raw)
+    assert all(
+        all(key in step for key in ("roll", "pitch", "yaw"))
+        for step in xyz_raw if step["type"] in ("move_above", "move_down", "lift")
+    )
+    xyz_plan = parse_answer(xyz_text, coord_mode="xyz")
+    assert np.allclose(xyz_plan["target"], [0.10, -0.20, 0.83])
+    assert np.allclose(xyz_plan["base_rpy"], [180, 0, 135])
+    assert xyz_plan["subtasks"][3]["delta_z"] == 0.14
+    legacy_xyz = parse_answer(
+        '{"subtasks": [{"type": "lift", "target_1": "[10 -20 83]", "delta_z": 0.14}]}',
+        coord_mode="xyz",
+    )
+    assert legacy_xyz["subtasks"][0]["delta_z"] == 0.14
+    old_meter_xyz = parse_answer(
+        '{"subtasks": [{"type": "lift", "target_1": "[10 -20 83]", "offset_z": 0.14}]}',
+        coord_mode="xyz",
+    )
+    assert old_meter_xyz["subtasks"][0]["delta_z"] == 0.14
+    try:
+        parse_answer(
+            '{"subtasks": [{"type": "lift", "target_1": "[10 -20 83]", "offset_z": 1.5}]}',
+            coord_mode="xyz",
+        )
+        raise AssertionError("非整数且绝对值大于 1 的旧米制值应拒绝")
+    except ParseError:
+        pass
+    try:
+        parse_answer(
+            '{"subtasks": [{"type": "move_down", "target_1": "[10 -20 83]", "roll": 180, "yaw": 90}]}',
+            coord_mode="xyz",
+        )
+        raise AssertionError("RPY 缺字段时应拒绝")
+    except ParseError:
+        pass
     comma = '{"subtasks": [{"type": "move_down", "target": "[320, 180]"}]}'
     plan = parse_answer("```json\n" + comma + "\n```", image_size=512)
     assert np.allclose(plan["target"], [320.0, 180.0])

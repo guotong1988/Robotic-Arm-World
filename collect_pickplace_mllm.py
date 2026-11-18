@@ -7,7 +7,8 @@ PickPlaceMilk、PickPlaceBread、PickPlaceCereal、PickPlaceCan（固定一样�
 每样物品的步骤：移到物品上方、下降、合爪、抬过箱壁、移到对应格子上方、下降、松爪、抬开。
 全部放完后停住。麦片盒 10 厘米宽、3 厘米厚，只能沿窄边合拢；牛奶、面包选和最近邻居方向垂直的那条，
 免得手指碰到旁边的东西；易拉罐旁边有东西时同样按邻居选方向。采集器内部用 yaw 生成两指落点，
-pixel 标签不重复写 yaw，执行时由落点连线恢复；XYZ 标签保留计划的安全 yaw，避免短连线量化改变朝向。
+pixel 标签不重复写 yaw，执行时由落点连线恢复；XYZ 标签写计划姿态对应的基座绝对 RPY，避免短连线量化改变朝向。
+XYZ 的 move_above、move_down、lift 统一写整数厘米 offset_z，不再写 clearance、delta_z 或旧 topdown yaw。
 抓靠上的位置，两个指腹落点的中点已含抓取高度，所以 move_down 的 offset_z 为 0。
 四样都放时，先拿高窄、容易被碰倒的麦片盒，再依次拿离剩余物品最远的那样。采集全程监控尚未主动搬过的其他物品，
 被推走超过 2 厘米、高度变化超过 2.5 厘米或转动超过 25 度就整条丢弃，即使最后环境判成功也不保存。
@@ -22,6 +23,83 @@ pixel 标签不重复写 yaw，执行时由落点连线恢复；XYZ 标签保留
 连线决定 yaw，不再单独输出 yaw）：
 
     {"subtasks": [{"type": "move_above", "desc": "移到易拉罐上方", "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip", "clearance": 0.12}, {"type": "move_down", "desc": "降到易拉罐处准备夹", "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住易拉罐"}, {"type": "lift", "desc": "抬起易拉罐", "delta_z": 0.17, "target_1": "[180 290]", "target_2": "[196 288]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到格子正上方", "target_1": "[360 270]", "target_kind": "bin", "clearance": 0.22}, {"type": "move_down", "desc": "把易拉罐放进格子", "target_1": "[360 270]", "target_kind": "bin", "offset_z": 0.1}, {"type": "open_gripper", "desc": "松爪放下易拉罐"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[360 270]", "target_kind": "bin", "clearance": 0.22}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+
+XYZ 输出例子（同一个任务阶段；所有空间步骤写基座绝对 RPY）：
+
+    {
+      "subtasks": [
+        {
+          "type": "move_above",
+          "desc": "移到易拉罐上方",
+          "target_1": "[51 -2 -4]",
+          "target_2": "[51 -7 -4]",
+          "offset_z": 11,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -90
+        },
+        {
+          "type": "move_down",
+          "desc": "降到易拉罐处准备夹",
+          "target_1": "[51 -2 -4]",
+          "target_2": "[51 -7 -4]",
+          "offset_z": 0,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -90
+        },
+        {
+          "type": "close_gripper",
+          "desc": "合爪夹住易拉罐"
+        },
+        {
+          "type": "lift",
+          "desc": "抬起易拉罐过箱壁",
+          "offset_z": 16,
+          "target_1": "[51 -2 -4]",
+          "target_2": "[51 -7 -4]",
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -90
+        },
+        {
+          "type": "move_above",
+          "desc": "移到格子正上方",
+          "target_1": "[56 50 -11]",
+          "offset_z": 22,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -90
+        },
+        {
+          "type": "move_down",
+          "desc": "把易拉罐放进格子",
+          "target_1": "[56 50 -11]",
+          "offset_z": 10,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -90
+        },
+        {
+          "type": "open_gripper",
+          "desc": "松爪放下易拉罐"
+        },
+        {
+          "type": "move_above",
+          "desc": "向上抬开夹爪",
+          "target_1": "[56 50 -11]",
+          "offset_z": 22,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -90
+        },
+        {
+          "type": "stabilize",
+          "desc": "停在原地保持稳定",
+          "duration": 0.5
+        }
+      ]
+    }
 
 每条成功轨迹只存开局那一帧。左边箱子里的物品会换位置和朝向，
 右边格子里的半透明目标也会在格子内部挪开中心。中途画面不存。
@@ -51,6 +129,7 @@ from task_plan import DEFAULT_CLEARANCE
 ENVS = ("PickPlace", "PickPlaceSingle", "PickPlaceMilk", "PickPlaceBread", "PickPlaceCereal", "PickPlaceCan")
 OBJECT_CN = {"Milk": "牛奶", "Bread": "面包", "Cereal": "麦片盒", "Can": "易拉罐"}
 # 先验知识：哪条边夹得下、指尖停多深、要抬过多高的箱壁。只决定末端到哪、朝哪，不解关节角。
+# 仅用于采集生成示范轨迹；正常 eval 不得用这些先验替代模型预测、视觉定位或控制输入（--oracle 调试除外）。
 # 物品绕竖直轴的对称周期，度；None 表示圆柱，两指朝哪个方向合拢都行。
 YAW_PERIOD = {"Milk": 90.0, "Bread": 180.0, "Cereal": 180.0, "Can": None}
 # 两指能夹住的物品边长上限，米。夹爪最大张开约 8 厘米。

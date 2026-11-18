@@ -37,6 +37,7 @@ from collect_lift_mllm import (
 )
 from collect_common import order_landings_at
 from collect_stack_mllm import (
+    add_xyz_rpy,
     half_z,
     make_env,
     place_offset,
@@ -113,6 +114,7 @@ def reverse_plan(env, obs, offset, matrices, half, axis, camera_pos, coord_mode=
         cube_b, cube_a, eef, grip_pixels, pix_place, float(cube_b[2]), offset, False, False,
         coord_mode=coord_mode,
     )
+    add_xyz_rpy(env, steps, axis, coord_mode)
     # format_plan 直接返回模型输出格式的 JSON 文本，oracle 时喂给 parse_plan。
     return format_plan(steps)
 

@@ -13,18 +13,19 @@ pixel 评测用提问这一帧的深度图把像素换成世界坐标（depth_lo
 
 步骤：
 
-- move_above：到目标点上方，clearance 是相对物体中心再抬高多少，米
-- move_down：降到目标点，offset_z 是相对物体中心的高度，米。抓取是 0，放置要加上被抓物体的高度
+- move_above：到目标点上方；pixel 写 clearance（米），XYZ 写 offset_z（整数厘米）
+- move_down：降到目标点，offset_z 是相对物体中心的高度；pixel 用米，XYZ 用整数厘米。抓取是 0，放置要加上被抓物体的高度
 - close_gripper / open_gripper
-- lift：把目标点再抬高 delta_z，米，夹爪保持闭合
+- lift：把目标点再抬高；pixel 写 delta_z（米），XYZ 写 offset_z（整数厘米），夹爪保持闭合
 - stabilize：停住 duration 秒
-- reach：夹爪沿 approach（世界坐标方向）伸向目标，停在离它 standoff 米处。两指上下合拢；
-  Door 双落点的中点是抓取中心，target_1 在上、target_2 在下，连线与 approach 共同确定侧抓姿态
-- turn：夹爪连同手里的东西绕转轴转 angle 度。转轴过 pivot 空间点，方向是 axis，右手定则
-- wipe：贴着桌面依次走过 path 里的空间点，offset_z 是相对这些点再往下压多少，米
+- reach：pixel 沿 approach 伸向目标并停在 standoff 处；XYZ 用基座绝对 RPY 表示姿态，
+  用 offset_x/y/z（整数厘米）表示相对抓取中心的三维站位偏移。Door 双落点中点是抓取中心
+- turn：夹爪连同手里的东西绕 pivot 转动。pixel 写 axis/angle；XYZ 写基座坐标系下的相对 RPY
+- wipe：贴着桌面依次走过 path 里的空间点，offset_z 是相对这些点再往下压多少；pixel 用米，XYZ 用整数厘米
 
-move_above、move_down、lift 可以带 yaw：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转 yaw 度。
-竖直抓取的双落点目标通常不写 yaw，由两点水平连线推导；XYZ 整数厘米标签可带安全 yaw，避免短落点对取整改变朝向。Door reach 不走这条 yaw 路径。
+move_above、move_down、lift 在 pixel 下可以带 yaw：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转 yaw 度。
+竖直抓取的双落点目标通常不写 yaw，由两点水平连线推导；XYZ 新标签统一写基座绝对 roll/pitch/yaw，
+旋转矩阵固定为 Rz(yaw) Ry(pitch) Rx(roll)，角度为度。旧 XYZ 的安全 yaw 和 approach/axis 标签继续兼容。
 单点不带 yaw 时保持当前朝向。还可以带 align_point，是手里物体上某一点在提问那一帧的空间坐标。
 这时对准目标的是这个点，不是夹爪：合爪时该点相对夹爪的位置，按夹爪之后转过的角度一起转，
 再从目标里减掉。计划开头已经抓着东西时，用开头的夹爪位姿。
@@ -39,8 +40,9 @@ import json
 import re
 
 import numpy as np
-from robosuite.utils.transform_utils import axisangle2quat, mat2quat, quat2mat, quat_slerp
+from robosuite.utils.transform_utils import axisangle2quat, mat2quat, quat2axisangle, quat2mat, quat_slerp
 
+from grip_ik import rpy_rotation
 from collect_lift_mllm import (
     DEFAULT_CAMERA,
     STABILIZE_DURATION,
@@ -49,6 +51,7 @@ from collect_lift_mllm import (
     hold,
     move_until,
     project_world,
+    robot_base_pose,
     unproject_pixel,
 )
 
@@ -122,6 +125,21 @@ def _bounded(value, low, high, name):
     return value
 
 
+def _xyz_length(value, low, high, name):
+    """XYZ 新标签的整数值按厘米转米；非整数兼容旧米制标签。"""
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ParseError("{} 不是数字".format(name)) from exc
+    if not np.isfinite(value):
+        raise ParseError("{} 超出范围：{}".format(name, value))
+    if value.is_integer():
+        return _bounded(value / 100.0, low, high, name)
+    if abs(value) > 1.0:
+        raise ParseError("{} 的非整数米制旧值绝对值不能超过 1：{}".format(name, value))
+    return _bounded(value, low, high, name)
+
+
 def parse_pixel(value, image_size):
     """采集写的是 \"[x y]\"。也接受逗号和长度为 2 的数组。
     兼容旧数据里的 \"mask\" 和 null，返回 None；后续定位会拒绝无法使用的空间步骤。"""
@@ -165,6 +183,23 @@ def parse_base_xyz(value, name="target"):
     if np.any(np.abs(point[:2]) > 200.0) or not -200.0 <= point[2] <= 300.0:
         raise ParseError("{} 的基座 XYZ 超出范围：{}".format(name, point.tolist()))
     return point / 100.0
+
+
+def parse_rpy(item, kind):
+    """XYZ 的整数或浮点度 RPY；三个字段必须同时出现，返回 numpy 数组。"""
+    keys = ("roll", "pitch", "yaw")
+    present = [key in item for key in keys]
+    if not any(present):
+        return None
+    if kind in SPATIAL and present == [False, False, True]:
+        # 历史 XYZ 空间步骤允许只写 topdown yaw，不能当成残缺的新 RPY。
+        return None
+    if not all(present):
+        raise ParseError("{} 的 roll、pitch、yaw 必须同时写".format(kind))
+    values = []
+    for key, low, high in zip(keys, (-180.0, -90.0, -180.0), (180.0, 90.0, 180.0)):
+        values.append(_bounded(item[key], low, high, key))
+    return np.asarray(values, dtype=float)
 
 
 def parse_vector(value, name):
@@ -261,7 +296,11 @@ def _parse_subtasks(items, image_size, coord_mode="pixel"):
                 target_kind = _optional_kind(item, "target_kind")
                 if target_kind is not None:
                     step["pixel_kind"] = target_kind
-        if kind in SPATIAL and "yaw" in item:
+        rpy = parse_rpy(item, kind) if coord_mode == "xyz" and kind in SPATIAL else None
+        if rpy is not None:
+            step["base_rpy"] = rpy
+        if kind in SPATIAL and "yaw" in item and rpy is None:
+            # 新 RPY 的 yaw 是绝对姿态分量，不是旧 topdown 抓取角。
             step["yaw"] = _bounded(item["yaw"], -180.0, 180.0, "yaw")
         if kind in ("move_above", "move_down"):
             if "align_point" in item or "held" in item:
@@ -276,14 +315,43 @@ def _parse_subtasks(items, image_size, coord_mode="pixel"):
                     if align_point_kind is not None:
                         step["align_point_kind"] = align_point_kind
         if kind == "move_above":
-            step["clearance"] = _bounded(item.get("clearance", DEFAULT_CLEARANCE), 0.0, 0.4, "clearance")
+            if coord_mode == "xyz":
+                if "offset_z" in item:
+                    step["clearance"] = _xyz_length(item["offset_z"], 0.0, 0.4, "offset_z")
+                elif "clearance" in item:
+                    step["clearance"] = _bounded(item["clearance"], 0.0, 0.4, "clearance")
+                else:
+                    step["clearance"] = _xyz_length(12, 0.0, 0.4, "offset_z")
+            else:
+                step["clearance"] = _bounded(item.get("clearance", DEFAULT_CLEARANCE), 0.0, 0.4, "clearance")
         elif kind == "move_down":
-            step["offset_z"] = _bounded(item.get("offset_z", 0.0), -0.3, 0.4, "offset_z")
+            if coord_mode == "xyz":
+                step["offset_z"] = _xyz_length(item.get("offset_z", 0), -0.3, 0.4, "offset_z")
+            else:
+                step["offset_z"] = _bounded(item.get("offset_z", 0.0), -0.3, 0.4, "offset_z")
         elif kind == "lift":
-            step["delta_z"] = _bounded(_required(item, "delta_z", kind), 0.0, 0.5, "delta_z")
+            if coord_mode == "xyz":
+                if "offset_z" in item:
+                    step["delta_z"] = _xyz_length(item["offset_z"], 0.0, 0.5, "offset_z")
+                else:
+                    step["delta_z"] = _bounded(_required(item, "delta_z", kind), 0.0, 0.5, "delta_z")
+            else:
+                step["delta_z"] = _bounded(_required(item, "delta_z", kind), 0.0, 0.5, "delta_z")
         elif kind == "reach":
-            step["approach"] = parse_vector(_required(item, "approach", kind), "approach")
-            step["standoff"] = _bounded(item.get("standoff", 0.0), 0.0, 0.3, "standoff")
+            rpy = parse_rpy(item, kind) if coord_mode == "xyz" else None
+            if rpy is not None:
+                step["base_rpy"] = rpy
+                step["base_offset"] = np.asarray([
+                    _xyz_length(item.get(key, 0), -0.3, 0.3, key)
+                    for key in ("offset_x", "offset_y", "offset_z")
+                ])
+            else:
+                # 旧 XYZ 与 pixel 继续用世界方向 approach 和标量 standoff。
+                step["approach"] = parse_vector(_required(item, "approach", kind), "approach")
+                if coord_mode == "xyz":
+                    step["standoff"] = _xyz_length(item.get("standoff", 0), 0.0, 0.3, "standoff")
+                else:
+                    step["standoff"] = _bounded(item.get("standoff", 0.0), 0.0, 0.3, "standoff")
         elif kind == "turn":
             if not put_point("pivot", _required(item, "pivot", kind), "pivot"):
                 raise ParseError("turn 缺少可见的 pivot 像素")
@@ -291,8 +359,12 @@ def _parse_subtasks(items, image_size, coord_mode="pixel"):
                 pivot_kind = _optional_kind(item, "pivot_kind")
                 if pivot_kind is not None:
                     step["pivot_kind"] = pivot_kind
-            step["axis"] = parse_vector(_required(item, "axis", kind), "axis")
-            step["angle"] = _bounded(_required(item, "angle", kind), -180.0, 180.0, "angle")
+            rpy = parse_rpy(item, kind) if coord_mode == "xyz" else None
+            if rpy is not None:
+                step["base_rpy"] = rpy
+            else:
+                step["axis"] = parse_vector(_required(item, "axis", kind), "axis")
+                step["angle"] = _bounded(_required(item, "angle", kind), -180.0, 180.0, "angle")
         elif kind == "wipe":
             path = _required(item, "path", kind)
             if not isinstance(path, list) or not path:
@@ -306,7 +378,10 @@ def _parse_subtasks(items, image_size, coord_mode="pixel"):
                 path_kind = _optional_kind(item, "path_kind")
                 if path_kind is not None:
                     step["path_kind"] = path_kind
-            step["offset_z"] = _bounded(item.get("offset_z", -WIPE_PRESS), -0.05, 0.05, "offset_z")
+            if coord_mode == "xyz":
+                step["offset_z"] = _xyz_length(item.get("offset_z", -1), -0.05, 0.05, "offset_z")
+            else:
+                step["offset_z"] = _bounded(item.get("offset_z", -WIPE_PRESS), -0.05, 0.05, "offset_z")
         elif kind == "stabilize":
             step["duration"] = _bounded(item.get("duration", STABILIZE_DURATION), 0.0, 5.0, "duration")
         elif kind in GRIP:
@@ -357,8 +432,32 @@ def has_second_point(step):
     return "pixel_2" in step or "pixel_2" in step.get("base", {}) or "pixel_2" in step.get("world", {})
 
 
+def direct_xyz_pose(env, step):
+    """把 XYZ 新标签的基座 RPY 和三维偏移转成执行器使用的世界量。"""
+    if "base_rpy" not in step and "base_offset" not in step:
+        return
+    base_mat = np.asarray(robot_base_pose(env)[1], dtype=float)
+    if "base_rpy" in step:
+        rot = base_mat @ rpy_rotation(step["base_rpy"])
+        if step["type"] == "turn":
+            # 相对旋转从基座系换到世界系要做相似变换，再恢复成内部轴角。
+            delta = rot @ base_mat.T
+            axis_angle = np.asarray(quat2axisangle(mat2quat(delta)), dtype=float)
+            angle = float(np.linalg.norm(axis_angle))
+            if angle > 1e-9:
+                step["axis"] = axis_angle / angle
+                step["angle"] = float(np.degrees(angle))
+            else:
+                step["axis"] = np.array([0.0, 0.0, 1.0])
+                step["angle"] = 0.0
+        else:
+            step["target_ori"] = rot
+    if "base_offset" in step:
+        step["offset"] = base_mat @ np.asarray(step["base_offset"], dtype=float)
+
+
 def direct_xyz_points(env, subtasks):
-    """把基座 XYZ（内部为米）直接转成世界坐标，不读取图像、深度或物体真值。
+    """把基座 XYZ、RPY 和偏移直接转成世界量，不读取图像、深度或物体真值。
 
     返回与深度定位统计兼容的点记录；双落点额外保留中点和两指几何。
     """
@@ -377,6 +476,7 @@ def direct_xyz_points(env, subtasks):
             points.append(point)
 
     for step_index, step in enumerate(subtasks):
+        direct_xyz_pose(env, step)
         base = step.get("base")
         if not base:
             continue
@@ -652,8 +752,10 @@ def execute_plan(
         kind = step["type"]
         entry = {"type": kind}
         if kind in SPATIAL:
-            if "yaw" in step:
-                # 任务给了明确 yaw 时优先使用，它通常还考虑了手腕限位和后续搬运。
+            if "target_ori" in step:
+                ori = np.asarray(step["target_ori"], dtype=float)
+            elif "yaw" in step:
+                # 旧标签的明确 yaw 优先于双落点推导，它通常还考虑了手腕限位和后续搬运。
                 ori = topdown_ori(step["yaw"])
             elif has_second_point(step):
                 first, second = _grip_world(step, landmarks, matrices)
@@ -684,11 +786,19 @@ def execute_plan(
             if has_second_point(step):
                 first, second = _side_grip_world(step, landmarks, matrices)
                 target = 0.5 * (first + second)
-                ori = side_grip_ori(first, second, step["approach"])
             else:
                 target = step_point(step, "pixel", landmarks, matrices)
+            if "target_ori" in step:
+                # XYZ 新格式由完整 RPY 决定姿态，落点只提供中心和开度。
+                ori = np.asarray(step["target_ori"], dtype=float)
+            elif has_second_point(step):
+                ori = side_grip_ori(first, second, step["approach"])
+            else:
                 ori = approach_ori(step["approach"])
-            dest = clip_workspace(target - np.asarray(step["approach"]) * float(step["standoff"]))
+            if "offset" in step:
+                dest = clip_workspace(target + np.asarray(step["offset"], dtype=float))
+            else:
+                dest = clip_workspace(target - np.asarray(step["approach"]) * float(step["standoff"]))
             obs, ok, err = goto(env, dest, ori, grip, REACH_TOL, REACH_STEPS, on_step)
             anchor = dest
         elif kind == "turn":
@@ -772,20 +882,62 @@ def check_parser():
     assert others[2]["pivot_kind"] == "door_axis"
     assert len(others[3]["path"]) == 2
     xyz = parse_plan(format_plan([
-        {"type": "move_down", "target_1": "[10 -20 83]", "target_2": "[14 -20 83]"},
-        {"type": "lift", "target_1": "[10 -20 83]", "target_2": "[14 -20 83]", "delta_z": 0.1, "yaw": 45},
-        {"type": "move_above", "target_1": "[20 5 84]", "align_point": "[12 -20 83]"},
+        {"type": "move_down", "target_1": "[10 -20 83]", "target_2": "[14 -20 83]", "offset_z": -10},
+        {"type": "lift", "target_1": "[10 -20 83]", "target_2": "[14 -20 83]", "offset_z": 10.0, "yaw": 45},
+        {"type": "move_above", "target_1": "[20 5 84]", "align_point": "[12 -20 83]", "offset_z": 12},
+        {"type": "reach", "target_1": "[20 5 84]", "approach": [0, -1, 0], "standoff": 10},
         {"type": "turn", "pivot": "[30 0 90]", "axis": [0, 0, 1], "angle": 20},
-        {"type": "wipe", "path": ["[-5 2 82]", "[0 3 82]"]},
+        {"type": "wipe", "path": ["[-5 2 82]", "[0 3 82]"], "offset_z": -1},
     ]), coord_mode="xyz")["subtasks"]
     assert np.allclose(xyz[0]["base"]["pixel"], [0.10, -0.20, 0.83])
     assert np.allclose(xyz[0]["base"]["pixel_2"], [0.14, -0.20, 0.83])
     assert "pixel" not in xyz[0] and "pixel_kind" not in xyz[0]
-    assert xyz[1]["yaw"] == 45.0
+    assert xyz[0]["offset_z"] == -0.10
+    assert xyz[1]["delta_z"] == 0.10 and xyz[1]["yaw"] == 45.0
+    assert xyz[2]["clearance"] == 0.12
     assert np.allclose(xyz[2]["base"]["align_point"], [0.12, -0.20, 0.83])
-    assert np.allclose(xyz[3]["base"]["pivot"], [0.30, 0.0, 0.90])
-    assert len(xyz[4]["base"]["path"]) == 2
+    assert xyz[3]["standoff"] == 0.10
+    assert np.allclose(xyz[4]["base"]["pivot"], [0.30, 0.0, 0.90])
+    assert len(xyz[5]["base"]["path"]) == 2 and xyz[5]["offset_z"] == -0.01
     assert has_second_point(xyz[0]) and has_second_point(xyz[1]) and not has_second_point(xyz[2])
+    xyz_pose = parse_plan(format_plan([
+        {"type": "move_down", "target_1": "[10 -20 83]", "offset_z": 0,
+         "roll": 180, "pitch": 0, "yaw": 135},
+        {"type": "reach", "target_1": "[20 5 84]", "target_2": "[20 5 80]",
+         "roll": 90, "pitch": 0, "yaw": -30, "offset_x": 2, "offset_y": -3, "offset_z": 4},
+        {"type": "turn", "pivot": "[30 0 90]", "roll": 0, "pitch": 0, "yaw": 20},
+    ]), coord_mode="xyz")["subtasks"]
+    assert np.allclose(xyz_pose[0]["base_rpy"], [180, 0, 135]) and "yaw" not in xyz_pose[0]
+    assert np.allclose(xyz_pose[1]["base_offset"], [0.02, -0.03, 0.04])
+    assert np.allclose(xyz_pose[2]["base_rpy"], [0, 0, 20])
+    from unittest.mock import patch
+    base_mat = rotation_z(np.pi / 2.0)
+    with patch("task_plan.robot_base_pose", return_value=(np.zeros(3), base_mat)):
+        for step in xyz_pose:
+            direct_xyz_pose(None, step)
+    assert np.allclose(xyz_pose[0]["target_ori"], base_mat @ rpy_rotation([180, 0, 135]))
+    assert np.allclose(xyz_pose[1]["offset"], base_mat @ [0.02, -0.03, 0.04])
+    turn_delta = base_mat @ rpy_rotation([0, 0, 20]) @ base_mat.T
+    assert np.allclose(axis_rotation(xyz_pose[2]["axis"], np.radians(xyz_pose[2]["angle"])), turn_delta)
+    xyz_default = parse_plan(format_plan([
+        {"type": "move_above", "target_1": "[20 5 84]"},
+        {"type": "move_down", "target_1": "[20 5 84]"},
+        {"type": "reach", "target_1": "[20 5 84]", "approach": [0, -1, 0]},
+        {"type": "wipe", "path": ["[-5 2 82]"]},
+    ]), coord_mode="xyz")["subtasks"]
+    assert xyz_default[0]["clearance"] == DEFAULT_CLEARANCE
+    assert xyz_default[1]["offset_z"] == 0.0 and xyz_default[2]["standoff"] == 0.0
+    assert xyz_default[3]["offset_z"] == -WIPE_PRESS
+    legacy_xyz = parse_plan(format_plan([
+        {"type": "move_above", "target_1": "[20 5 84]", "clearance": 0.1},
+        {"type": "move_down", "target_1": "[20 5 84]", "offset_z": -0.095},
+        {"type": "lift", "target_1": "[20 5 84]", "delta_z": 0.1},
+        {"type": "reach", "target_1": "[20 5 84]", "approach": [0, -1, 0], "standoff": 0.1},
+        {"type": "wipe", "path": ["[-5 2 82]"], "offset_z": -0.01},
+    ]), coord_mode="xyz")["subtasks"]
+    assert legacy_xyz[0]["clearance"] == 0.1
+    assert legacy_xyz[1]["offset_z"] == -0.095 and legacy_xyz[2]["delta_z"] == 0.1
+    assert legacy_xyz[3]["standoff"] == 0.1 and legacy_xyz[4]["offset_z"] == -0.01
     aligned_step = {
         "type": "move_above",
         "world": {
@@ -799,6 +951,10 @@ def check_parser():
     )
     assert np.allclose(aligned_dest, [0.18, 0.05, 1.05])
     assert np.allclose(topdown_ori(0.0), TOPDOWN)
+    assert np.allclose(rpy_rotation([180, 0, 135]), topdown_ori(45.0))
+    assert np.allclose(rpy_rotation([10, 20, 30])[0, 2],
+                       np.sin(np.radians(20)) * np.cos(np.radians(10)) * np.cos(np.radians(30))
+                       + np.sin(np.radians(10)) * np.sin(np.radians(30)))
     pair_step = {"world": {"pixel": np.array([-0.02, 0.0, 0.83]), "pixel_2": np.array([0.02, 0.0, 0.83])}}
     first, second = _grip_world(pair_step, [], {})
     assert np.allclose(_grip_ori(first, second, topdown_ori(-90.0))[:, 0], [1.0, 0.0, 0.0])
@@ -815,6 +971,18 @@ def check_parser():
     side_step = {"world": {"pixel": np.array([0.0, 0.0, 1.10]), "pixel_2": np.array([0.0, 0.0, 1.06])}}
     side_first, side_second = _side_grip_world(side_step, [], {})
     assert np.allclose(side_grip_ori(side_first, side_second, [0.0, -1.0, 0.0]), approach_ori([0.0, -1.0, 0.0]))
+    for bad in (
+        format_plan([{"type": "move_down", "target_1": "[10 -20 83]", "offset_z": 1.5}]),
+        format_plan([{"type": "lift", "target_1": "[10 -20 83]", "offset_z": 12.5}]),
+        format_plan([{"type": "move_down", "target_1": "[10 -20 83]", "roll": 180, "yaw": 90}]),
+        format_plan([{"type": "turn", "pivot": "[30 0 90]", "roll": 0, "pitch": 100, "yaw": 20}]),
+    ):
+        try:
+            parse_plan(bad, coord_mode="xyz")
+        except ParseError:
+            pass
+        else:
+            raise AssertionError("非整数且绝对值大于 1 的旧米制值应被拒绝：{}".format(bad))
     for bad in (
         '{"subtasks": [{"type": "fly"}]}',
         '{"subtasks": [{"type": "wipe"}]}',

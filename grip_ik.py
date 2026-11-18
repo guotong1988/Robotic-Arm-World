@@ -15,7 +15,14 @@ choose_grasp 用逆运动学挑能解出来、离关节限位远、关节转动�
 import mujoco
 import numpy as np
 from robosuite.controllers import load_composite_controller_config
-from robosuite.utils.transform_utils import mat2quat, quat2axisangle, quat2mat, quat_slerp
+from robosuite.utils.transform_utils import (
+    axisangle2quat,
+    mat2euler,
+    mat2quat,
+    quat2axisangle,
+    quat2mat,
+    quat_slerp,
+)
 
 # 关节位置控制器的刚度。目标每步只挪 1 厘米左右，跟踪滞后一两个控制步。
 JOINT_KP = 150
@@ -74,6 +81,40 @@ def rotation_z(angle_rad):
 
 def topdown_ori(yaw_deg):
     return rotation_z(np.radians(float(yaw_deg))) @ TOPDOWN
+
+
+def rpy_rotation(values):
+    """基座坐标系的 roll/pitch/yaw（度）转旋转矩阵，固定为 Rz(yaw) Ry(pitch) Rx(roll)。"""
+    roll, pitch, yaw = np.radians(np.asarray(values, dtype=float).reshape(3))
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    return rz @ ry @ rx
+
+
+def rpy_fields(ori):
+    """旋转矩阵写成整数度 RPY；矩阵和欧拉角使用同一坐标系。"""
+    values = np.degrees(mat2euler(np.asarray(ori, dtype=float).reshape(3, 3)))
+    return {name: int(np.rint(value)) for name, value in zip(("roll", "pitch", "yaw"), values)}
+
+
+def axis_angle_rpy(axis, angle_deg):
+    """相对轴角旋转转成同坐标系下的相对 RPY，供 XYZ 的 turn 标签使用。"""
+    axis = np.asarray(axis, dtype=float).reshape(3)
+    angle = float(angle_deg)
+    if abs(angle) < 1e-9:
+        return {"roll": 0, "pitch": 0, "yaw": 0}
+    rot = quat2mat(axisangle2quat(axis / np.linalg.norm(axis) * np.radians(angle)))
+    return rpy_fields(rot)
+
+
+def offset_fields(offset):
+    """同坐标系的三维偏移（米）写成整数厘米标签。"""
+    values = np.asarray(offset, dtype=float).reshape(3)
+    return {name: int(np.rint(value * 100.0)) for name, value in zip(("offset_x", "offset_y", "offset_z"), values)}
 
 
 def box_contacts(center, half, rot, direction):
@@ -154,8 +195,8 @@ def landing_points(center, axis, half_width):
     return [center - axis * float(half_width), center + axis * float(half_width)]
 
 
-def grasp_candidates(points, offset, yaw=None):
-    """两个落点换成末端位姿；显式 yaw 可避免整数坐标取整改变合拢方向。"""
+def grasp_candidates(points, offset, yaw=None, ori=None):
+    """两个落点换成末端位姿；显式 yaw 或完整 ori 可避免整数坐标取整改变合拢方向。"""
     p1, p2 = [np.asarray(point, dtype=float).reshape(3) for point in points]
     axis = p2 - p1
     axis[2] = 0.0
@@ -163,6 +204,10 @@ def grasp_candidates(points, offset, yaw=None):
     if not np.isfinite(width) or width < MIN_GRIP_WIDTH or width > MAX_GRIP_WIDTH:
         raise ValueError("两个落点的水平间距 {:.3f} 米，夹爪夹不了".format(width))
     mid = 0.5 * (p1 + p2)
+    if ori is not None:
+        ori = np.asarray(ori, dtype=float).reshape(3, 3)
+        yaw = closing_yaw(ori[:, 0])
+        return [(mid - ori @ np.asarray(offset, dtype=float), ori, wrap_deg(yaw))]
     if yaw is None:
         yaw = closing_yaw(axis / width)
     out = []

@@ -42,6 +42,7 @@ from collect_lift_mllm import (
 from collect_common import order_landings_at
 from collect_stack_mllm import (
     TRANSPORT_DZ,
+    add_xyz_rpy,
     grip_step,
     half_z,
     make_env,
@@ -182,6 +183,7 @@ def unstack_plan(env, obs, offset, matrices, direction, half, axis, camera_pos, 
         {"clearance": round(float(DEFAULT_CLEARANCE), 2)}, coord_mode,
     ))
     steps.append({"type": "stabilize", "desc": "停在原地保持稳定", "duration": STABILIZE_DURATION})
+    add_xyz_rpy(env, steps, axis, coord_mode)
     # format_plan 直接返回模型输出格式的 JSON 文本，oracle 时喂给 parse_plan。
     return format_plan(steps)
 

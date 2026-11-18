@@ -5,12 +5,13 @@ NutAssemblySquare、NutAssemblyRound（固定一个）。方形螺母套方柱�
 
 螺母只有把手能抓。采集器内部按螺母朝向规划抓取 yaw，让两指横跨把手；
 抓取标签带两指落点：target_1、target_2 贴在把手横杆两侧，两点的中点是抓取点。
-pixel 模式由连线决定执行 yaw；XYZ 模式保留计划的安全 yaw，避免整数厘米量化改变短连线方向。
+pixel 模式由连线决定执行 yaw；XYZ 模式写计划姿态对应的基座绝对 RPY，避免整数厘米量化改变短连线方向。
 pixel 落点写在 frontview 图上，XYZ 落点用机器人基座整数厘米；柱顶、松爪后的抬开这些单点步骤只写 target_1。
+XYZ 的 move_above、move_down、lift 统一写整数厘米 offset_z 和 RPY，不再写 clearance、delta_z 或旧 topdown yaw。
 抓的位置比把手中心再往外 1.2 厘米，免得指头压到螺母的环上。
 柱子 20 厘米高，抬起后螺母底部要高过柱顶。放的时候要对准柱子的是螺母中心，不是夹爪，
 所以往柱子去的几步带 align_point；柱子的 target_1 是柱顶中心，坐标格式随 coord_mode。
-往柱子去的那一步还带 yaw，路上把螺母转到把手朝机器人，柱子在桌子远端，这样手臂不用伸直。
+往柱子去的那一步在 pixel 下带 yaw、在 XYZ 下带完整 RPY，路上把螺母转到把手朝机器人，柱子在桌子远端，这样手臂不用伸直。
 螺母沿柱子往下套，到离桌面 3.5 厘米时松爪，再竖直抬开。
 
 输入是一张 frontview RGB，对应样本的 image 字段；指令以一个 <image> 占位开头，
@@ -22,6 +23,86 @@ pixel 落点写在 frontview 图上，XYZ 落点用机器人基座整数厘米�
 输出例子（默认 pixel 模式，方形螺母还没抓住时，每个 subtask 都带 desc）：
 
     {"subtasks": [{"type": "move_above", "desc": "移到方形螺母上方", "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip", "clearance": 0.1}, {"type": "move_down", "desc": "降到把手上方准备夹", "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip", "offset_z": 0.0}, {"type": "close_gripper", "desc": "合爪夹住把手"}, {"type": "lift", "desc": "抬起方形螺母", "delta_z": 0.25, "target_1": "[238 305]", "target_2": "[250 302]", "target_kind": "grip"}, {"type": "move_above", "desc": "移到方柱正上方", "target_1": "[300 250]", "target_kind": "peg", "clearance": 0.05, "yaw": 12, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "move_down", "desc": "把方形螺母套到方柱上", "target_1": "[300 250]", "target_kind": "peg", "offset_z": -0.165, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "open_gripper", "desc": "松爪放下螺母"}, {"type": "move_above", "desc": "向上抬开夹爪", "target_1": "[300 250]", "target_kind": "peg", "clearance": 0.06, "align_point": "[248 308]", "align_point_kind": "nut"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+
+XYZ 输出例子（同一个任务阶段；所有空间步骤写基座绝对 RPY）：
+
+    {
+      "subtasks": [
+        {
+          "type": "move_above",
+          "desc": "移到方形螺母上方",
+          "target_1": "[56 4 -8]",
+          "target_2": "[54 4 -8]",
+          "offset_z": 10,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 175
+        },
+        {
+          "type": "move_down",
+          "desc": "降到把手上方准备夹",
+          "target_1": "[56 4 -8]",
+          "target_2": "[54 4 -8]",
+          "offset_z": 0,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 175
+        },
+        {
+          "type": "close_gripper",
+          "desc": "合爪夹住把手"
+        },
+        {
+          "type": "lift",
+          "desc": "抬起方形螺母",
+          "offset_z": 19,
+          "target_1": "[56 4 -8]",
+          "target_2": "[54 4 -8]",
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 175
+        },
+        {
+          "type": "move_above",
+          "desc": "移到方柱正上方",
+          "target_1": "[69 -6 4]",
+          "offset_z": 5,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 90,
+          "align_point": "[56 11 -8]"
+        },
+        {
+          "type": "move_down",
+          "desc": "把方形螺母套到方柱上",
+          "target_1": "[69 -6 4]",
+          "offset_z": -10,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 90,
+          "align_point": "[56 11 -8]"
+        },
+        {
+          "type": "open_gripper",
+          "desc": "松爪放下方形螺母"
+        },
+        {
+          "type": "move_above",
+          "desc": "向上抬开夹爪",
+          "target_1": "[69 -6 4]",
+          "offset_z": 6,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 90,
+          "align_point": "[56 11 -8]"
+        },
+        {
+          "type": "stabilize",
+          "desc": "停在原地保持稳定",
+          "duration": 0.5
+        }
+      ]
+    }
 
 每条高质量成功轨迹只存开局那一帧。除环境成功外，所有执行步骤都要到位，
 每个螺母开始套柱前的中心对准误差也不能超过 2.5 厘米，否则整条丢弃。
@@ -60,6 +141,7 @@ NUT_CN = {"SquareNut": "方形螺母", "RoundNut": "圆形螺母"}
 PEG_CN = {"SquareNut": "方柱", "RoundNut": "圆柱"}
 PEG_BODY = {"SquareNut": "peg1", "RoundNut": "peg2"}
 # 先验知识：只抓把手、套到多高、运输时把手朝哪。只决定末端位姿，不解关节角。
+# 仅用于采集生成示范轨迹；正常 eval 不得用这些先验替代模型预测、视觉定位或控制输入（--oracle 调试除外）。
 PEG_HALF_HEIGHT = 0.10
 GRASP_OUTWARD = 0.012
 HOVER_CLEARANCE = 0.10

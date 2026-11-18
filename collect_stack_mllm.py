@@ -11,7 +11,85 @@
 - 每个 subtask 带 desc。叠好后 subtasks 为空。
 
 默认 pixel 标签是 frontview 像素，评测用深度还原世界坐标；--coord-mode xyz 改用机器人基座
-XYZ 整数厘米并省略 *_kind，评测直接做基座到世界坐标转换。最后都交给 task_plan.execute_plan。
+XYZ 整数厘米并省略 *_kind，move_above/move_down/lift 统一写整数厘米 offset_z 和基座绝对 RPY，评测直接做基座到世界坐标与姿态转换。最后都交给 task_plan.execute_plan。
+
+XYZ 输出例子（红块还没抓住时）：
+
+    {
+      "subtasks": [
+        {
+          "type": "move_above",
+          "desc": "移到红块正上方",
+          "target_1": "[50 -8 -9]",
+          "target_2": "[46 -7 -9]",
+          "offset_z": 12,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -14
+        },
+        {
+          "type": "move_down",
+          "desc": "竖直降到红块处",
+          "target_1": "[50 -8 -9]",
+          "target_2": "[46 -7 -9]",
+          "offset_z": 0,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -14
+        },
+        {
+          "type": "close_gripper",
+          "desc": "合爪夹住红块"
+        },
+        {
+          "type": "lift",
+          "desc": "竖直抬起红块",
+          "target_1": "[50 -8 -9]",
+          "target_2": "[46 -7 -9]",
+          "offset_z": 10,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -14
+        },
+        {
+          "type": "move_above",
+          "desc": "移到绿块正上方",
+          "target_1": "[58 -10 -9]",
+          "offset_z": 12,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -14
+        },
+        {
+          "type": "move_down",
+          "desc": "把红块放到绿块上",
+          "target_1": "[58 -10 -9]",
+          "offset_z": 4,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -14
+        },
+        {
+          "type": "open_gripper",
+          "desc": "松爪放下红块"
+        },
+        {
+          "type": "move_above",
+          "desc": "向上抬开夹爪",
+          "target_1": "[58 -10 -9]",
+          "offset_z": 12,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": -14
+        },
+        {
+          "type": "stabilize",
+          "desc": "停在原地保持稳定",
+          "duration": 0.5
+        }
+      ]
+    }
+
 例如：python collect_stack_mllm.py --episodes 50 --out data/stack_mllm --coord-mode xyz
 """
 
@@ -30,7 +108,7 @@ from robosuite.utils.placement_samplers import UniformRandomSampler
 
 from mllm_dataset import attempt_stats, finish_image_staging, make_image_staging_dir, make_sample_id, publish_task
 from collect_common import order_landings_at
-from grip_ik import box_contacts, closing_yaw, topdown_ori
+from grip_ik import box_contacts, closing_yaw, rpy_fields, topdown_ori
 from collect_lift_mllm import (
     ABOVE_XY_TOL,
     CAMERAS,
@@ -40,6 +118,7 @@ from collect_lift_mllm import (
     START_X_RANGE,
     START_Y_RANGE,
     YAW_RANGE,
+    XYZ_POSE_SPEC,
     arm_controller,
     capture_camera_images,
     configure_lazy_camera,
@@ -53,6 +132,7 @@ from collect_lift_mllm import (
     move_until,
     panda_world_osc,
     project_world,
+    robot_base_pose,
     rotated_about_z,
     round_pixel,
     set_free_xyaw,
@@ -73,9 +153,21 @@ from task_plan import (
     format_plan,
 )
 
+
+def add_xyz_rpy(env, subtasks, axis, coord_mode):
+    """Stack 及其变体的所有空间步骤共用同一个基座绝对抓取姿态。"""
+    if coord_mode == "xyz":
+        world_ori = topdown_ori(closing_yaw(axis))
+        fields = rpy_fields(robot_base_pose(env)[1].T @ world_ori)
+        for step in subtasks:
+            if step["type"] in ("move_above", "move_down", "lift"):
+                step.update(fields)
+    return subtasks
+
 macros.IMAGE_CONVENTION = "opencv"
 
 # 先验知识：先抬高再横移，放下时再压一点。只决定末端高度，不解关节角。
+# 仅用于采集生成示范轨迹；正常 eval 不得用这些先验替代模型预测、视觉定位或控制输入（--oracle 调试除外）。
 # 抓起后先抬到这个高度，再横移到绿块上方，避免带着红块扫过绿块。
 TRANSPORT_DZ = 0.10
 # 红块中心放到绿块顶面之后再下压一点，让两块接触，指尖仍留在绿块上表面之上。
@@ -253,7 +345,8 @@ def plan_desc(coord_mode="pixel"):
     if coord_mode == "xyz":
         return (
             "抓红块的 target_1、target_2 是贴住红块两侧的两指落点，放绿块只写 target_1（绿块中心）；"
-            "它们都是机器人基座 XYZ 整数厘米 [x y z]，两落点的中点是抓取点，offset_z 是相对绿块中心的高度"
+            "它们都是机器人基座 XYZ 整数厘米 [x y z]，两落点的中点是抓取点；"
+            "move_above、move_down、lift 统一写 offset_z（整数厘米），放置时是相对绿块中心的高度。" + XYZ_POSE_SPEC
         )
     return (
         "抓红块的步骤里 target_1、target_2 是贴住红块两侧的两指落点的像素，都在正面相机图上；"
@@ -262,13 +355,26 @@ def plan_desc(coord_mode="pixel"):
     )
 
 
+def motion_params(kind, params, coord_mode):
+    """抽象计划的米制运动参数写成标签；XYZ 统一为整数厘米 offset_z。"""
+    if coord_mode != "xyz":
+        return params
+    if kind == "move_above":
+        value = params["clearance"]
+    elif kind == "lift":
+        value = params["delta_z"]
+    else:
+        value = params["offset_z"]
+    return {"offset_z": int(round(float(value) * 100))}
+
+
 def grip_step(kind, desc, pixels, params, coord_mode="pixel"):
     """抓红块步骤；XYZ 模式由双落点结构表达抓取，不再输出 target_kind。"""
     out = {"type": kind, "desc": desc}
     out.update(pixels)
     if coord_mode == "pixel":
         out["target_kind"] = "grip"
-    out.update(params)
+    out.update(motion_params(kind, params, coord_mode))
     return out
 
 
@@ -277,7 +383,7 @@ def place_step(kind, desc, pixel, params, coord_mode="pixel"):
     out = {"type": kind, "desc": desc, "target_1": pixel}
     if coord_mode == "pixel":
         out["target_kind"] = "cube_center"
-    out.update(params)
+    out.update(motion_params(kind, params, coord_mode))
     return out
 
 
@@ -345,6 +451,7 @@ def plan_for(env, obs, rest_z, offset, matrices, style, grasped, done, half, axi
     subtasks = remaining_subtasks(
         cube_a, cube_b, eef, grip_pixels, pix_b, rest_z, offset, grasped, done, coord_mode=coord_mode
     )
+    add_xyz_rpy(env, subtasks, axis, coord_mode)
     if done:
         instruction = style[2]
     elif grasped:
@@ -453,9 +560,9 @@ class DatasetWriter:
         if self.coord_mode == "xyz":
             pixels = (
                 "move_above、move_down、lift 的 target_1、target_2 都是机器人基座 XYZ 整数厘米，格式是 \"[x y z]\"；"
-                "不写 target_kind。"
+                "不写 target_kind。" + XYZ_POSE_SPEC
             )
-            frame = "target_1、target_2 是机器人基座 XYZ 整数厘米。cubeA_pos、cubeB_pos 是世界坐标，米"
+            frame = "target_1、target_2 是机器人基座 XYZ 整数厘米；RPY 是基座绝对姿态，度。cubeA_pos、cubeB_pos 是世界坐标，米"
             roles = "抓红块写两个夹爪落点，放绿块只写绿块中心；"
         else:
             pixels = (
@@ -467,6 +574,11 @@ class DatasetWriter:
                 "抓红块是两指贴住红块两侧的落点像素，两落点的中点是抓取位置，target_kind 是 grip；"
                 "放绿块的步骤只带 target_1，target_kind 是 cube_center（方块中心）。"
             )
+        motion = (
+            "move_above、move_down、lift 统一写 offset_z（整数厘米），放置时是相对方块中心的高度。" + XYZ_POSE_SPEC
+            if self.coord_mode == "xyz" else
+            "move_above 有 clearance（米），move_down 的 offset_z 是相对方块中心的高度（米），lift 有 delta_z（米）。"
+        )
         meta = {
             "env": "Stack",
             "robot": "Panda",
@@ -478,8 +590,7 @@ class DatasetWriter:
                 "answer": (
                     "JSON 字符串。subtasks 是从这一帧还要做的步骤，"
                     "每个 subtask 的 desc 用 20 字以内说明这一步做什么；各字段的含义跟在指令话术后面。"
-                    "抓红块的 move_above、move_down、lift 带 target_1、target_2，" + roles +
-                    "move_above 有 clearance（米），move_down 的 offset_z 是相对方块中心的高度（米），lift 有 delta_z（米）。"
+                    "抓红块的 move_above、move_down、lift 带 target_1、target_2，" + roles + motion +
                     "另外有 close_gripper、open_gripper、stabilize。叠好后 subtasks 为空。" + pixels
                 ),
             },
@@ -528,7 +639,10 @@ def collect_episode(env, writer, episode, style, rng):
             coord_mode=writer.coord_mode,
         )
         types = tuple(step["type"] for step in plan["subtasks"])
-        lifts = tuple(step["delta_z"] for step in plan["subtasks"] if step["type"] == "lift")
+        lifts = tuple(
+            step.get("offset_z", step.get("delta_z"))
+            for step in plan["subtasks"] if step["type"] == "lift"
+        )
         key = (phase, types, lifts)
         if state["last_step"] == state["step"] and state["last_key"] == key:
             return None

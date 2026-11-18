@@ -11,6 +11,7 @@ target_1 在把手横杆上表面，target_2 在下表面，两点中点是抓�
 turn 的 angle 写的是还要转的角度，按当前把手和门的角度算。往上翻而不是往下压，
 是因为这台 Panda 横着抓之后，手腕最后一个关节往这个方向还有余量。
 门打开（铰链角度超过 0.3 弧度）之后 subtasks 为空。
+XYZ 模式下空间点写机器人基座整数厘米；reach 写基座绝对 RPY 和 offset_x/y/z 三维偏移（整数厘米），turn 写绕 pivot 的基座相对 RPY。pixel 仍写 approach/standoff 和 axis/angle，standoff 为米。
 
 输入是一张 frontview RGB，对应样本的 image 字段；指令以一个 <image> 占位开头，
 话术后面带 answer 各字段的说明：
@@ -21,6 +22,62 @@ turn 的 angle 写的是还要转的角度，按当前把手和门的角度算�
 输出例子（把手还没转开时；每个 subtask 的 desc 说明这一步做什么）：
 
     {"subtasks": [{"type": "reach", "desc": "伸向目标点", "target_1": "[390 211]", "target_2": "[390 229]", "approach": [0.0, -1.0, 0.0], "standoff": 0.1, "target_kind": "grip"}, {"type": "reach", "desc": "伸向目标点", "target_1": "[390 211]", "target_2": "[390 229]", "approach": [0.0, -1.0, 0.0], "standoff": 0.0, "target_kind": "grip"}, {"type": "close_gripper", "desc": "合爪夹住"}, {"type": "turn", "desc": "绕转轴转动", "pivot": "[400 215]", "axis": [0.0, -1.0, 0.0], "angle": -83, "pivot_kind": "door_axis"}, {"type": "turn", "desc": "绕转轴转动", "pivot": "[430 240]", "axis": [0.0, 0.0, 1.0], "angle": 23, "pivot_kind": "door_axis"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+
+XYZ 输出例子（reach 写绝对 RPY 和三维偏移，turn 写相对 RPY）：
+
+    {
+      "subtasks": [
+        {
+          "type": "reach",
+          "desc": "伸向目标点",
+          "target_1": "[46 -24 18]",
+          "target_2": "[46 -24 14]",
+          "roll": 90,
+          "pitch": 90,
+          "yaw": 0,
+          "offset_x": 0,
+          "offset_y": 10,
+          "offset_z": 0
+        },
+        {
+          "type": "reach",
+          "desc": "伸向目标点",
+          "target_1": "[46 -24 18]",
+          "target_2": "[46 -24 14]",
+          "roll": 90,
+          "pitch": 90,
+          "yaw": 0,
+          "offset_x": 0,
+          "offset_y": 0,
+          "offset_z": 0
+        },
+        {
+          "type": "close_gripper",
+          "desc": "合爪夹住"
+        },
+        {
+          "type": "turn",
+          "desc": "绕转轴转动",
+          "pivot": "[56 -32 16]",
+          "roll": 0,
+          "pitch": 83,
+          "yaw": 0
+        },
+        {
+          "type": "turn",
+          "desc": "绕转轴转动",
+          "pivot": "[13 -32 16]",
+          "roll": 0,
+          "pitch": 0,
+          "yaw": 23
+        },
+        {
+          "type": "stabilize",
+          "desc": "停在原地保持稳定",
+          "duration": 0.5
+        }
+      ]
+    }
 
 每条成功轨迹只存开局那一帧。门在桌面上换位置，朝向在默认朝向附近偏一个角度。
 门锁和门扇仍从关上的状态开始。中途画面不存。
@@ -37,6 +94,7 @@ import numpy as np
 from collect_common import add_common_args, run_collection
 
 # 先验知识：锁舌转到约 -1.45 弧度才开，门拉开到 0.4 弧度；抓在把手靠外处，沿门板法向横着伸。不解关节角。
+# 仅用于采集生成示范轨迹；正常 eval 不得用这些先验替代模型预测、视觉定位或控制输入（--oracle 调试除外）。
 LATCH_GOAL = -1.45
 HINGE_GOAL = 0.40
 # 抓取点在把手根部到末端的这个比例处。把手碰撞盒的竖直半厚是 0.02 米。

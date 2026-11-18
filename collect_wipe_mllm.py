@@ -7,6 +7,7 @@ wipe 的 path 是还没擦掉的污渍，按曲线顺序每隔约 3 厘米取一
 偶尔会漏掉几点，这时从当前画面重新规划一遍，只擦剩下的。全部擦完后 subtasks 为空。
 
 Wipe 换的是擦板，没有夹爪，计划里不会出现 close_gripper、open_gripper。
+XYZ 的 move_above、move_down、lift、wipe 统一写整数厘米 offset_z，不再写 clearance 或 delta_z。
 
 输入是一张 frontview RGB，对应样本的 image 字段；指令以一个 <image> 占位开头，
 话术后面带 answer 各字段的说明：
@@ -17,6 +18,56 @@ Wipe 换的是擦板，没有夹爪，计划里不会出现 close_gripper、open
 输出例子（还没开始擦时；path 按曲线每隔约 3 厘米取点，这里只示意几个点）：
 
     {"subtasks": [{"type": "move_above", "desc": "移到目标点上方", "target_1": "[220 310]", "target_kind": "table", "clearance": 0.1, "yaw": 0}, {"type": "move_down", "desc": "降到目标点处", "target_1": "[220 310]", "target_kind": "table", "offset_z": 0.0}, {"type": "wipe", "desc": "沿路径擦拭桌面", "path": ["[220 310]", "[250 300]", "[280 292]", "[310 286]"], "offset_z": -0.01, "path_kind": "table"}, {"type": "lift", "desc": "竖直抬起物体", "delta_z": 0.1, "target_1": "[310 286]", "target_kind": "table"}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
+
+XYZ 输出例子（还没开始擦时；path 同样只示意几个点）：
+
+    {
+      "subtasks": [
+        {
+          "type": "move_above",
+          "desc": "移到目标点上方",
+          "target_1": "[37 10 -1]",
+          "offset_z": 10,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 90
+        },
+        {
+          "type": "move_down",
+          "desc": "降到目标点处",
+          "target_1": "[37 10 -1]",
+          "offset_z": 0,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 90
+        },
+        {
+          "type": "wipe",
+          "desc": "沿路径擦拭桌面",
+          "path": [
+            "[37 10 -1]",
+            "[40 10 -1]",
+            "[43 9 -1]",
+            "[45 7 -1]"
+          ],
+          "offset_z": -1
+        },
+        {
+          "type": "lift",
+          "desc": "竖直抬起物体",
+          "offset_z": 10,
+          "target_1": "[45 7 -1]",
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 90
+        },
+        {
+          "type": "stabilize",
+          "desc": "停在原地保持稳定",
+          "duration": 0.5
+        }
+      ]
+    }
 
 每条成功轨迹只存开局那一帧。污渍在桌面上换成横线、竖线、斜线、弧线或两段分开的痕迹，
 长短和位置每条都不一样。中途画面不存。
@@ -34,6 +85,7 @@ from collect_common import add_common_args, run_collection
 from task_plan import WIPE_PRESS
 
 # 先验知识：擦板初始偏了 7 度，第一步 yaw 固定为 0 把它摆平；污渍按约 3 厘米取点。不解关节角。
+# 仅用于采集生成示范轨迹；正常 eval 不得用这些先验替代模型预测、视觉定位或控制输入（--oracle 调试除外）。
 WAYPOINT_SPACING = 0.03
 HOVER_CLEARANCE = 0.10
 LIFT_HEIGHT = 0.10

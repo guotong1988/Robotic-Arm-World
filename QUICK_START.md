@@ -28,7 +28,9 @@
 每条样本的输入是一张 frontview RGB 加一条指令，图片字段为 `image`。frontview 使用统一的抬高、前移机位，所有任务共用同一套相机配置。指令以一个 `<image>` 占位开头，后接任务话术和字段说明（写在指令里，不写进 answer）。输出是只含 `subtasks` 的 JSON，每个 subtask 带一句 `desc`（20 字以内）说明这一步做什么。空间字段包括 `target_1`、`target_2`、`align_point`、`pivot` 和 `path`，有两种坐标格式：
 
 - `pixel`（默认）：格式是 `"[x y]"`（x 向右、y 向下，原点在左上角），所有点都在同一张 frontview 上。要抓的物体写两指落点，`target_kind` 为 `"grip"`，执行取两点的中点；其他 `*_kind` 字段用于选择深度量法。
-- `xyz`：格式是 `"[x y z]"`，使用机器人基座坐标系，单位为厘米，各轴分别四舍五入为整数。双落点的中点仍是抓取位置。模型直接给出三维位置，不输出深度，也不写 `target_kind`、`align_point_kind`、`pivot_kind`、`path_kind`；步骤类型、双落点结构和 `desc` 已提供所需任务语义，控制器不解析自然语言 `desc` 来决定动作。
+- `xyz`：格式是 `"[x y z]"`，使用机器人基座坐标系，单位为厘米，各轴分别四舍五入为整数。双落点的中点仍是抓取位置。`move_above`、`move_down`、`lift` 统一写整数厘米 `offset_z`（目标点沿 +z 的偏移，其中 `move_above` 和 `lift` 非负，`move_down` 可正负）以及 `roll`、`pitch`、`yaw`（度）；`reach` 写绝对 RPY 和整数厘米 `offset_x`、`offset_y`、`offset_z`，不再写 `approach`、`standoff`；`turn` 写绕 `pivot` 的相对 RPY，不再写 `axis`、`angle`。`wipe.offset_z` 也用整数厘米，`duration` 仍为秒。模型直接给出三维位姿，不输出深度，也不写 `target_kind`、`align_point_kind`、`pivot_kind`、`path_kind`；步骤类型、双落点结构和 `desc` 已提供所需任务语义，控制器不解析自然语言 `desc` 来决定动作。
+
+XYZ 的 RPY 都在机器人基座坐标系下，旋转矩阵固定为 \(R=R_z(yaw)R_y(pitch)R_x(roll)\)。`move_above`、`move_down`、`lift`、`reach` 是绝对末端姿态，`turn` 是相对旋转；`reach` 的执行位置为抓取中心加三维偏移。旧 XYZ 数据里的 topdown `yaw`、`approach`/`standoff`、`axis`/`angle` 仍可解析执行，不需要批量改写。
 
 `task_plan.py` 按这个列表做，它不认识具体任务；Lift 的评测不走这个执行器，见 Lift 一节。
 
@@ -67,23 +69,23 @@ bash eval.sh fixed xyz --fg
 
 | 原语 | 参数 | 含义 |
 | --- | --- | --- |
-| `move_above` | `clearance`，可选 `yaw`、`align_point` | 移到目标上方 |
-| `move_down` | `offset_z`，可选 `yaw`、`align_point` | 下降到目标 |
-| `lift` | `delta_z`，可选 `yaw` | 竖直抬起 |
+| `move_above` | pixel：`clearance`（米），可选 `yaw`、`align_point`；xyz：`offset_z`（整数厘米）、绝对 RPY、`align_point` | 移到目标上方 |
+| `move_down` | pixel：`offset_z`（米），可选 `yaw`、`align_point`；xyz：`offset_z`（整数厘米）、绝对 RPY、`align_point` | 下降到目标 |
+| `lift` | pixel：`delta_z`（米），可选 `yaw`；xyz：`offset_z`（整数厘米）、绝对 RPY | 竖直抬起 |
 | `close_gripper` | | 合爪 |
 | `open_gripper` | | 松爪 |
 | `stabilize` | | 停住 |
-| `reach` | `target_1`、`approach`、`standoff` | 夹爪沿 `approach`（世界坐标单位向量）伸向 `target_1`，停在 `standoff` 米处，两指上下合拢 |
-| `turn` | `pivot`、`axis`、`angle` | 夹爪连同手里的东西绕过 `pivot` 空间点、方向为 `axis` 的转轴转 `angle` 度 |
-| `wipe` | `path`、`offset_z` | 压着桌面依次走过 `path` 里的空间点，`offset_z` 是往下压的量 |
+| `reach` | pixel：`target_1`、`approach`、`standoff`；xyz：`target_1`、绝对 RPY、`offset_x/y/z` | pixel 沿世界方向伸向目标并停在标量距离处；xyz 到抓取中心加三维偏移的位置，两指上下合拢 |
+| `turn` | pixel：`pivot`、`axis`、`angle`；xyz：`pivot`、相对 RPY | 夹爪连同手里的东西绕 `pivot` 转动 |
+| `wipe` | `path`、`offset_z` | 压着桌面依次走过 `path` 里的空间点，`offset_z` 是往下压的量（pixel 为米，xyz 为整数厘米） |
 
-- `yaw`：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度，度。Nut 搬运到柱子上方、Wipe 初始朝向等单点步骤会保留。pixel 双落点抓取不写 `yaw`，由两点连线推导；XYZ 模式若抽象抓取计划已经给出避腕部限位的安全 `yaw`，会在同一引用的双落点抓取和抬升步骤中保留它，避免短落点连线按整数厘米量化后改变朝向。Stack、Lift 仍由双落点推导，Door 的 `reach` 侧抓不写 `yaw`。
+- `yaw`（pixel 与旧 XYZ）：夹爪竖直朝下，两指合拢方向从世界 y 轴绕竖直轴转过的角度，度。pixel 双落点抓取不写 `yaw`，由两点连线推导。新 XYZ 不再输出这个独立字段，而是用完整 RPY 保留计划已避腕部限位的姿态，避免短落点连线按整数厘米量化后改变朝向。
 - `align_point`：手里物体上要对准目标的那一点，坐标格式随 `coord_mode`。螺母要对准柱子的是螺母中心，不是夹爪。抓住后夹爪再转，这一点跟着一起转。
 - `target_kind: "grip"`（仅 pixel）：`target_1`、`target_2` 是两指合拢时贴在物体两侧的两个落点，不是同一个点的两个视图。Lift、Stack、PickPlace 的竖直抓取和 NutAssembly 的螺母把手都这样写；Stack 的 Unstack/Reverse 也复用这一格式。两点的中点是抓取位置，连线决定合拢方向和 yaw。被物体挡住的另一个落点按形状和朝向补出像素，不写 `"mask"`。XYZ 模式用相同的双落点结构，但不输出这个角色字段。
 
 ## 评测时的坐标换算
 
-XYZ 模式把模型输出的整数厘米解析为基座坐标（内部单位为米），再通过机器人基座位姿转换到 robosuite 世界坐标。它不创建深度视图，不调用 `depth_locate.py`，评测环境设置为 `camera_depths=False`；仿真物体真值只用于 `--oracle` 和事后误差统计。两个夹爪落点都直接由三维坐标得到，不需要先预测像素再恢复三维位置。
+XYZ 模式把模型输出的整数厘米解析为基座坐标（内部单位为米），再通过机器人基座位姿转换到 robosuite 世界坐标。绝对 RPY 转为世界目标姿态；`turn` 的基座相对旋转通过相似变换转为世界轴角后继续走原有圆弧轨迹，`reach` 的三维偏移也转到世界系。XYZ 不创建深度视图，不调用 `depth_locate.py`，评测环境设置为 `camera_depths=False`；仿真物体真值只用于 `--oracle` 和事后误差统计。两个夹爪落点都直接由三维坐标得到，不需要先预测像素再恢复三维位置。
 
 pixel 模式换世界坐标只用深度相机（`depth_locate.py`），仿真里的物体位置只用于事后统计误差，不进模型输入，也不参与控制。一个像素只定一条视线，还差一个数。标注点常被挡住或在物体内部，不能直接读该像素的深度，而是按像素在计划里的角色，从它周围的深度点量出标注点所在的平面，再取视线和平面的交点。角色优先看步骤里的 `target_kind`、`align_point_kind`、`pivot_kind`、`path_kind`；没写或不认识时，按任务名和步骤顺序推断。
 
@@ -108,7 +110,7 @@ pixel 模式换世界坐标只用深度相机（`depth_locate.py`），仿真里
 
 ## Lift
 
-夹爪不在方块正上方时，指令是先移到目标上方再抬剩余高度，计划从 `move_above` 开始；对准之后指令只写还要抬多少，计划从还没做的步骤开始。`lift.delta_z` 与指令里的剩余高度一致，最后一步是 `stabilize`（0.5 秒）。抓取步骤写两指落点对，采集时夹爪竖直朝下，并从方块局部 x/y 轴中选择更接近默认朝向的面法向作为合拢方向，使两个真实表面接触点的连线垂直于侧面。pixel 评测用这一帧的深度还原两个落点；XYZ 评测直接把两个基座坐标转换为世界坐标。随后按落点做逆运动学（`grip_ik.py`）：中点扣掉指腹相对末端的偏移得到要到的位置，两种相差 180 度的抓法里挑能解、离关节限位远的那个，用关节位置控制器跟踪。抬升高度用指令里的数字。采集本身仍用世界坐标 OSC 走出这条轨迹。
+夹爪不在方块正上方时，指令是先移到目标上方再抬剩余高度，计划从 `move_above` 开始；对准之后指令只写还要抬多少，计划从还没做的步骤开始。pixel 的 `lift.delta_z`（米）或 xyz 的 `lift.offset_z`（整数厘米）与指令里的剩余高度一致，最后一步是 `stabilize`（0.5 秒）。抓取步骤写两指落点对，采集时夹爪竖直朝下，并从方块局部 x/y 轴中选择更接近默认朝向的面法向作为合拢方向，使两个真实表面接触点的连线垂直于侧面。pixel 评测用这一帧的深度还原两个落点；XYZ 评测直接把两个基座坐标转换为世界坐标。随后按落点做逆运动学（`grip_ik.py`）：中点扣掉指腹相对末端的偏移得到要到的位置；pixel 和旧 XYZ 在两种相差 180 度的抓法里挑能解、离关节限位远的那个，新 XYZ 直接使用 RPY 对应的完整姿态，再用关节位置控制器跟踪。抬升高度用指令里的数字。采集本身仍用世界坐标 OSC 走出这条轨迹。
 
 ```
 ~/.pyenv/versions/3.11.13/bin/python3 collect_lift_mllm.py --episodes 50 --out data/lift_mllm
@@ -120,7 +122,7 @@ python3 eval_lift_mllm_vllm.py --oracle
 
 ## Stack
 
-红块还在桌上时，步骤是移到红块上方、下降、合爪、抬高、移到绿块上方、下降、松爪、抬开、停住。抓红块写两指落点对（pixel 的 `target_kind` 为 `grip`，合拢轴是开局保持的夹爪朝向），放绿块写绿块中心（pixel 的 `target_kind` 为 `cube_center`）加距离。XYZ 使用同样的步骤结构，但省略这些角色字段。已经抓住并且对准绿块时，前面的步骤不再写。评测保持开局朝向，走 `task_plan.execute_plan`。
+红块还在桌上时，步骤是移到红块上方、下降、合爪、抬高、移到绿块上方、下降、松爪、抬开、停住。抓红块写两指落点对（pixel 的 `target_kind` 为 `grip`，合拢轴是开局保持的夹爪朝向），放绿块写绿块中心（pixel 的 `target_kind` 为 `cube_center`）加距离。XYZ 使用同样的步骤结构，省略这些角色字段，并为所有空间步骤写开局抓取姿态对应的绝对 RPY。已经抓住并且对准绿块时，前面的步骤不再写。评测保持开局朝向，走 `task_plan.execute_plan`。
 
 ```
 ~/.pyenv/versions/3.11.13/bin/python3 collect_stack_mllm.py --episodes 50 --out data/stack_mllm
@@ -132,7 +134,7 @@ python3 eval_stack_mllm_vllm.py --oracle --episodes 20
 
 ## PickPlace
 
-`--env` 可选 `PickPlace`、`PickPlaceSingle`、`PickPlaceMilk`、`PickPlaceBread`、`PickPlaceCereal`、`PickPlaceCan`（默认）。四类物品的抓取步骤都写两指落点（pixel 的角色为 `grip`），中点包含顶面下 3 cm 的抓取高度；采集器内部仍用 `yaw` 选择长方物品的合拢方向。pixel 标签只写落点，由连线恢复朝向；XYZ 标签保留抽象计划已经选好的安全 `yaw`，避免量化短连线造成角度跳变。箱格放置仍写单个中心点（pixel 的角色为 `bin`）。
+`--env` 可选 `PickPlace`、`PickPlaceSingle`、`PickPlaceMilk`、`PickPlaceBread`、`PickPlaceCereal`、`PickPlaceCan`（默认）。四类物品的抓取步骤都写两指落点（pixel 的角色为 `grip`），中点包含顶面下 3 cm 的抓取高度；采集器内部仍用 `yaw` 选择长方物品的合拢方向。pixel 标签只写落点，由连线恢复朝向；XYZ 标签写抽象计划已选姿态的完整 RPY，避免量化短连线造成角度跳变。箱格放置仍写单个中心点（pixel 的角色为 `bin`）。
 
 ```
 ~/.pyenv/versions/3.11.13/bin/python3 collect_pickplace_mllm.py --env PickPlaceCan --episodes 50 --out data/mllm
@@ -142,7 +144,7 @@ python3 eval_pickplace_mllm_vllm.py --env PickPlaceCan --oracle --episodes 20
 
 ## NutAssembly
 
-`--env` 可选 `NutAssembly`、`NutAssemblySingle`、`NutAssemblySquare`（默认）、`NutAssemblyRound`。抓螺母把手写两指落点对；pixel 不重复写抓取 `yaw`，XYZ 则为抓取、下降和抬升保留同一个安全 `yaw`，避免整数厘米量化改变把手朝向。套柱子时用 `align_point` 对准螺母中心，柱顶是单点（pixel 的角色为 `peg`），搬运到柱子上方仍保留控制把手方向的 `yaw`。
+`--env` 可选 `NutAssembly`、`NutAssemblySingle`、`NutAssemblySquare`（默认）、`NutAssemblyRound`。抓螺母把手写两指落点对；pixel 不重复写抓取 `yaw`，XYZ 则为抓取、下降、抬升和搬运写同一个完整 RPY，避免整数厘米量化改变把手朝向。套柱子时用 `align_point` 对准螺母中心，柱顶是单点（pixel 的角色为 `peg`）。
 
 ```
 ~/.pyenv/versions/3.11.13/bin/python3 collect_nut_mllm.py --env NutAssemblySquare --episodes 50 --out data/mllm
@@ -152,7 +154,7 @@ python3 eval_nut_mllm_vllm.py --env NutAssembly --oracle --episodes 20
 
 ## Door
 
-用 `reach` 从侧面抓把手，先 `turn` 绕把手根部转开门锁，再 `turn` 绕铰链把门拉开。
+用 `reach` 从侧面抓把手，先 `turn` 绕把手根部转开门锁，再 `turn` 绕铰链把门拉开。XYZ 的 `reach` 用绝对 RPY 加三维偏移表达侧抓位姿，两个 `turn` 都用绕各自 `pivot` 的相对 RPY 表达。
 
 ```
 ~/.pyenv/versions/3.11.13/bin/python3 collect_door_mllm.py --episodes 50 --out data/mllm

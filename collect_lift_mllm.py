@@ -15,7 +15,7 @@ pixel 模式的两个落点都写在正面相机图上，x 向右、y 向下，�
 pixel 评测用 frontview 深度还原落点；XYZ 评测直接做基座到世界坐标转换，然后做逆运动学。
 
 每条抓取先定一个目标抬升高度。
-某一帧如果方块已经抬起了一段，指令和 lift 的 delta_z 写的都是剩下的高度。
+某一帧如果方块已经抬起了一段，指令和 lift 写的都是剩下的高度；pixel 用 delta_z（米），XYZ 用 offset_z（整数厘米）。
 例如目标 14 厘米、已经抬起 5 厘米，而且夹爪已在正上方，这一帧就是再抬起 9 厘米，
 计划里不再包含 move_above、move_down、close_gripper。夹爪还在侧面时，指令是
 「<image> 先移动到目标上方，再将方块向上抬起 14 厘米」，计划从 move_above 开始。
@@ -29,7 +29,51 @@ pixel 评测用 frontview 深度还原落点；XYZ 评测直接做基座到世�
 
     {"subtasks": [{"type": "move_above", "desc": "移到方块正上方", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip"}, {"type": "move_down", "desc": "竖直降到方块处", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip"}, {"type": "close_gripper", "desc": "合爪夹住方块"}, {"type": "lift", "desc": "竖直向上抬起方块", "target_1": "[282 311]", "target_2": "[302 311]", "target_kind": "grip", "delta_z": 0.14}, {"type": "stabilize", "desc": "停在原地保持稳定", "duration": 0.5}]}
 
---coord-mode xyz 时，上述落点改为 "[x y z]" 基座整数厘米，并省略 target_kind。
+--coord-mode xyz 时，上述落点改为 "[x y z]" 基座整数厘米，省略 target_kind，lift 改写整数厘米 offset_z；move_above、move_down、lift 都写基座绝对 roll、pitch、yaw（度），旋转顺序为 Rz(yaw) Ry(pitch) Rx(roll)。
+
+XYZ 输出例子（与上面的 pixel 例子对应）：
+
+    {
+      "subtasks": [
+        {
+          "type": "move_above",
+          "desc": "移到方块正上方",
+          "target_1": "[47 13 -9]",
+          "target_2": "[51 14 -9]",
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 14
+        },
+        {
+          "type": "move_down",
+          "desc": "竖直降到方块处",
+          "target_1": "[47 13 -9]",
+          "target_2": "[51 14 -9]",
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 14
+        },
+        {
+          "type": "close_gripper",
+          "desc": "合爪夹住方块"
+        },
+        {
+          "type": "lift",
+          "desc": "竖直向上抬起方块",
+          "target_1": "[47 13 -9]",
+          "target_2": "[51 14 -9]",
+          "offset_z": 14,
+          "roll": 180,
+          "pitch": 0,
+          "yaw": 14
+        },
+        {
+          "type": "stabilize",
+          "desc": "停在原地保持稳定",
+          "duration": 0.5
+        }
+      ]
+    }
 
 每条成功抓取只存开局那一帧（phase 为 initial），不存悬停、下降、合爪、上抬这些中途画面。
 泛化放在开局：方块抽到桌面的不同区域，朝向绕竖直轴随机转；抬升高度在低、中、高三档里抽。
@@ -68,7 +112,7 @@ from robosuite.utils.mjcf_utils import IMAGE_CONVENTION_MAPPING
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat2axisangle
 
-from grip_ik import GRIP_YAW, box_contacts, closing_yaw, grasp_eef, joint_position_config, pad_offset, topdown_ori
+from grip_ik import GRIP_YAW, box_contacts, closing_yaw, grasp_eef, joint_position_config, pad_offset, rpy_fields, topdown_ori
 
 # 存成正着的图。必须在创建环境之前设置，观测相机会按这个约定渲染。
 macros.IMAGE_CONVENTION = "opencv"
@@ -239,12 +283,18 @@ INSTRUCTION_STYLES = (
     ("m", "将方块抬高 {:.2f} 米。", "将方块再抬高 {:.2f} 米。"),
 )
 DONE_INSTRUCTION = "方块已经抬到目标高度。"
+# ABOVE_XY_TOL 和 GRASP_Z_TOL 是采集示范轨迹的规划先验；正常 eval 不得用它们替代模型预测或视觉定位（--oracle 调试除外）。
 # 夹爪末端和方块中心的水平距离小于这个值，算已经在正上方。
 ABOVE_XY_TOL = 0.03
 # 末端已经降到方块中心附近，就不必再写 move_down。
 GRASP_Z_TOL = 0.02
 # 抬完后停住的时间，写进 stabilize。
 STABILIZE_DURATION = 0.5
+XYZ_POSE_SPEC = (
+    "姿态统一写 roll、pitch、yaw（度），在机器人基座坐标系下按 Rz(yaw) Ry(pitch) Rx(roll) 组成旋转矩阵；"
+    "move_above、move_down、lift、reach 写绝对姿态，turn 写绕 pivot 的相对旋转。"
+    "reach 不写 approach/standoff，改写 offset_x、offset_y、offset_z（整数厘米），执行位置是抓取中心加这个三维偏移"
+)
 # 每个 subtask 的 desc：这一步做什么，20 字以内。
 STEP_DESC = {
     "move_above": "移到方块正上方",
@@ -480,7 +530,7 @@ def plan_desc(coord_mode="pixel"):
     if coord_mode == "xyz":
         return (
             "target_1、target_2 是两个夹爪落点的机器人基座 XYZ 坐标，格式为整数厘米 [x y z]；"
-            "两落点的中点是抓取位置，不需要 target_kind"
+            "两落点的中点是抓取位置，不需要 target_kind。" + XYZ_POSE_SPEC
         )
     return (
         "target_1 是夹爪1落点的像素，target_2 是夹爪2落点的像素，都在正面相机图上；"
@@ -488,7 +538,7 @@ def plan_desc(coord_mode="pixel"):
     )
 
 
-def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels, coord_mode="pixel"):
+def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels, coord_mode="pixel", rpy=None):
     """从当前画面接着做的步骤。已经做完的不再写入。空间标签写在要动位置的步骤上。"""
 
     def spatial(step):
@@ -496,6 +546,8 @@ def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels, coord_mode="pix
         step.update(pixels)
         if coord_mode == "pixel":
             step["target_kind"] = "grip"
+        elif rpy is not None:
+            step.update(rpy)
         return step
 
     subtasks = []
@@ -507,15 +559,18 @@ def build_subtasks(phase, above, eef_z, cube_z, delta_z, pixels, coord_mode="pix
         subtasks.append({"type": "close_gripper", "desc": STEP_DESC["close_gripper"]})
     if float(delta_z) >= 0.005:
         lift = spatial({"type": "lift"})
-        lift["delta_z"] = round(float(delta_z), 2)
+        if coord_mode == "xyz":
+            lift["offset_z"] = int(round(float(delta_z) * 100))
+        else:
+            lift["delta_z"] = round(float(delta_z), 2)
         subtasks.append(lift)
     if subtasks:
         subtasks.append({"type": "stabilize", "desc": STEP_DESC["stabilize"], "duration": STABILIZE_DURATION})
     return subtasks
 
 
-def format_answer(pixels, cube_pos, eef_pos, phase, above, delta_z, coord_mode="pixel"):
-    """MLLM 要生成的抓取计划。要动位置的步骤带两个夹爪落点，delta_z 是还要抬的高度。"""
+def format_answer(pixels, cube_pos, eef_pos, phase, above, delta_z, coord_mode="pixel", rpy=None):
+    """MLLM 要生成的抓取计划。XYZ 的空间步骤带基座绝对 RPY，lift 字段是还要抬的高度。"""
     plan = {
         "subtasks": build_subtasks(
             phase,
@@ -525,6 +580,7 @@ def format_answer(pixels, cube_pos, eef_pos, phase, above, delta_z, coord_mode="
             delta_z,
             pixels,
             coord_mode,
+            rpy=rpy,
         ),
     }
     return json.dumps(plan, ensure_ascii=False, separators=(", ", ": "))
@@ -566,7 +622,7 @@ class DatasetWriter:
         self.discarded = 0
         self.merged_count = 0
 
-    def add(self, episode, step, phase, obs, instruction, lift_height, target_lift, lifted, above):
+    def add(self, episode, step, phase, obs, instruction, lift_height, target_lift, lifted, above, ori=None):
         """先缓存在内存里，等这条轨迹成功了才写盘。"""
         cube_pos, eef_pos = positions_from_obs(obs)
         front, back = grip_landings(self.env)
@@ -595,7 +651,10 @@ class DatasetWriter:
             "grip_front": [round(float(value), 4) for value in front],
             "grip_back": [round(float(value), 4) for value in back],
             "eef_pos": eef_pos,
-            "answer": format_answer(pixels, cube_pos, eef_pos, phase, above, lift_height, self.coord_mode),
+            "answer": format_answer(
+                pixels, cube_pos, eef_pos, phase, above, lift_height, self.coord_mode,
+                rpy=rpy_fields(robot_base_pose(self.env)[1].T @ ori) if self.coord_mode == "xyz" and ori is not None else None,
+            ),
             "success": False,
         }
         if self.coord_mode == "pixel":
@@ -629,12 +688,14 @@ class DatasetWriter:
             "target_1 是朝向相机的落点，target_2 是方块背面的落点，挡住了也照写。" + desc_note
         )
         if self.coord_mode == "xyz":
-            pixels = "要动位置的步骤带 target_1 和 target_2，都是机器人基座 XYZ 整数厘米，形如 \"[x y z]\"；不写 target_kind。" + desc_note
-            frame = "target_1、target_2 是机器人基座坐标，整数厘米。grip_front、grip_back 是两个落点的世界坐标，米"
-            units = {"target_1": "centimeter", "target_2": "centimeter", "grip_front": "meter", "grip_back": "meter"}
+            pixels = "要动位置的步骤带 target_1 和 target_2，都是机器人基座 XYZ 整数厘米，形如 \"[x y z]\"；不写 target_kind。" + XYZ_POSE_SPEC + "。" + desc_note
+            frame = "target_1、target_2 是机器人基座坐标，整数厘米；RPY 是基座绝对姿态，度。grip_front、grip_back 是两个落点的世界坐标，米"
+            units = {"target_1": "centimeter", "target_2": "centimeter", "offset_z": "centimeter", "roll": "degree", "pitch": "degree", "yaw": "degree", "grip_front": "meter", "grip_back": "meter"}
+            motion = "lift（offset_z 为剩余抬升，整数厘米）"
         else:
             frame = "target_1、target_2 都是 frontview 像素。grip_front、grip_back 是两个落点的世界坐标，米"
-            units = {"target_1": "pixel", "target_2": "pixel", "grip_front": "meter", "grip_back": "meter"}
+            units = {"target_1": "pixel", "target_2": "pixel", "delta_z": "meter", "grip_front": "meter", "grip_back": "meter"}
+            motion = "lift（delta_z 为剩余抬升，米）"
         sources = {
             "cube_pos": "obs['cube_pos']，世界坐标，米",
             "grip_front": "方块所选侧面朝 frontview 的夹爪落点，世界坐标，米",
@@ -652,7 +713,7 @@ class DatasetWriter:
             "image_size": [self.image_size, self.image_size],
             "inputs": input_fields(),
             "output": {
-                "answer": "JSON 字符串。subtasks 按顺序可能包含 move_above、move_down、close_gripper、lift（delta_z 为剩余抬升，米）、stabilize（duration 0.5 秒），每个 subtask 的 desc 用 20 字以内说明这一步做什么。" + pixels + ("已经完成的步骤不写。抬到目标高度后 subtasks 为空。" if self.coord_mode == "xyz" else "各空间步骤还带 target_kind，固定为 grip（夹爪落点，不是方块中心）。已经完成的步骤不写。抬到目标高度后 subtasks 为空。"),
+                "answer": "JSON 字符串。subtasks 按顺序可能包含 move_above、move_down、close_gripper、" + motion + "、stabilize（duration 0.5 秒），每个 subtask 的 desc 用 20 字以内说明这一步做什么。" + pixels + ("已经完成的步骤不写。抬到目标高度后 subtasks 为空。" if self.coord_mode == "xyz" else "各空间步骤还带 target_kind，固定为 grip（夹爪落点，不是方块中心）。已经完成的步骤不写。抬到目标高度后 subtasks 为空。"),
             },
             "coord_mode": self.coord_mode,
             "coordinate_frame": frame,
@@ -766,6 +827,7 @@ def collect_episode(env, writer, episode, target_lift, style, rng):
             target_lift,
             lifted,
             above,
+            ori=hold_ori,
         )
         state["last_key"] = key
         state["last_step"] = state["step"]
