@@ -9,6 +9,9 @@ https://space.bilibili.com/447278957/lists
 bash collect.sh pixel --fg
 bash collect.sh xyz --fg
 
+# 微调VLM
+微调Qwen3.8-27B
+
 # 评测：random 也可换成 fixed
 bash eval.sh random pixel --fg
 bash eval.sh random xyz --fg
