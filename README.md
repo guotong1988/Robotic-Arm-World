@@ -47,14 +47,13 @@ bash eval.sh random xyz --fg
 | Stack | **20/20 = 100%** | 16/20 |
 | PickPlaceCan | **20/20 = 100%** | 20/20 |
 | PickPlaceBread | **20/20 = 100%** | 20/20 |
-| PickPlaceCereal | **20/20 = 100%** | 20/20 |
 | PickPlaceMilk | **20/20 = 100%** | 20/20 |
 | NutAssemblySquare | **20/20 = 100%** | 20/20 |
+| PickPlaceCereal | **19/20 = 95%** | 20/20 |
 | NutAssemblyRound | **19/20 = 95%** | 20/20 |
-| PickPlace（四物体） | **18/20 = 90%** | 17/20 |
+| PickPlace（四物体） | **18/20 = 90%** | 14/20 |
+| Wipe | **17/20 = 85%** | 25/26 |
 | NutAssembly（双螺母） | **16/20 = 80%** | 20/20 |
-| Wipe | **13/20 = 65%** | 29/32 |
 
-合计（12 个设置）：226/240 ≈ 94.2%
-
+合计（12 个设置）：229/240 ≈ 95.4%
 

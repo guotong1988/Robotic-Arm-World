@@ -70,7 +70,8 @@ XYZ 输出例子（还没开始擦时；path 同样只示意几个点）：
     }
 
 每条成功轨迹只存开局那一帧。污渍在桌面上换成横线、竖线、斜线、弧线或两段分开的痕迹，
-长短和位置每条都不一样。中途画面不存。
+长短和位置每条都不一样。约 30% 的开局是已经擦掉一部分的残局，图像只显示剩余污渍，
+标签也只规划剩余路径；残局包含在总采集条数内，不额外增加样本。中途画面不存。
 
 例如凑满 50 条成功擦拭再停，图片和样本写到 data/mllm：
 
@@ -89,6 +90,11 @@ from task_plan import WIPE_PRESS
 WAYPOINT_SPACING = 0.03
 HOVER_CLEARANCE = 0.10
 LIFT_HEIGHT = 0.10
+
+# 采集数据配比：残局保留 3～40 个连续污渍点，多数是没擦到的尾部，其余是中间或两段上的残片。
+RESIDUAL_INIT_PROB = 0.30
+RESIDUAL_MIN_LEFT = 3
+RESIDUAL_MAX_LEFT = 40
 
 
 def _stroke(rng, n, limit, along):
@@ -119,6 +125,18 @@ def _stroke(rng, n, limit, along):
         [center[0] + cosine * travel - sine * lateral, center[1] + sine * travel + cosine * lateral],
         axis=1,
     )
+
+
+def _residual_remaining(rng, n):
+    """留下一段非空残渍，同时至少预擦除一点；两段污渍的残片可以跨过段间边界。"""
+    high = min(n - 1, RESIDUAL_MAX_LEFT)
+    low = min(RESIDUAL_MIN_LEFT, high)
+    count = int(rng.integers(low, high + 1))
+    if rng.random() < 0.7:
+        start = n - count
+    else:
+        start = int(rng.integers(0, n - count + 1))
+    return set(range(start, start + count))
 
 
 def _dirt_path(rng, n, half):
@@ -161,16 +179,23 @@ class WipeTask:
         return {}
 
     def vary_initial(self, env, rng):
-        """覆盖环境自己撒下的污渍，改成一种选定的痕迹。点距和原来接近，擦板仍能顺着擦完。"""
+        """重摆污渍；部分开局预先隐藏一段以外的点，模拟第一轮后尚未擦完的残局。"""
         arena = env.model.mujoco_arena
         markers = arena.markers
         half = np.asarray(arena.table_half_size[:2], dtype=float)
         pts = _dirt_path(rng, len(markers), half)
-        for marker, xy in zip(markers, pts):
+        remaining = None
+        if rng.random() < RESIDUAL_INIT_PROB:
+            remaining = _residual_remaining(rng, len(markers))
+        env.wiped_markers = []
+        for k, (marker, xy) in enumerate(zip(markers, pts)):
             body_id = env.sim.model.body_name2id(marker.root_body)
             env.sim.model.body_pos[body_id] = np.array([xy[0], xy[1], arena.table_half_size[2]])
+            wiped = remaining is not None and k not in remaining
+            if wiped:
+                env.wiped_markers.append(marker)
             geom_id = env.sim.model.geom_name2id(marker.visual_geoms[0])
-            env.sim.model.geom_rgba[geom_id][3] = 1.0
+            env.sim.model.geom_rgba[geom_id][3] = 0.0 if wiped else 1.0
 
     def markers(self, env):
         model, data = env.sim.model, env.sim.data
@@ -236,7 +261,11 @@ class WipeTask:
         return start, float(rng.uniform(-np.pi / 2.0, np.pi / 2.0)), table[2] + 0.22
 
     def record_extra(self, env):
-        return {"wiped": len(env.wiped_markers), "num_markers": int(env.num_markers)}
+        return {
+            "wiped": len(env.wiped_markers),
+            "num_markers": int(env.num_markers),
+            "residual_initial": bool(env.wiped_markers),
+        }
 
     def episode_info(self, env):
         return {"wiped": len(env.wiped_markers)}
@@ -245,6 +274,8 @@ class WipeTask:
         return {
             "waypoint_spacing_m": WAYPOINT_SPACING,
             "press_m": WIPE_PRESS,
+            "residual_initial_probability": RESIDUAL_INIT_PROB,
+            "residual_remaining_markers": [RESIDUAL_MIN_LEFT, RESIDUAL_MAX_LEFT],
             "point_names": "dirtK 是第 K 个污渍点；path_first、path_last 是还没擦掉的污渍里按顺序的第一点和最后一点",
         }
 
